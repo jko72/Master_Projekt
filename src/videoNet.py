@@ -12,8 +12,7 @@ from torch.distributions import Categorical, Normal, MixtureSameFamily
 from utils_torch import make_angle_grids
 from prob import build_range_mixture_distribution, compute_nll_range_loss
 from prob import generate_point_clouds_from_mixture, visualize_mixture_pdfs
-#from model import RangeMixtureVideoModel
-from models.rangeMixtureSwinTrans import RangeMixtureSwinTransformerModel
+from models import build_model
 
 # Helper functions
 from helper.pointcloud_visualization import pointcloud_from_expected_range
@@ -25,7 +24,7 @@ import copy
 import open3d as o3d
 import argparse
 import yaml
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter #Visualisierug
 import time
 
 import threading
@@ -249,6 +248,9 @@ def main(args):
             cfg = yaml.safe_load(file)
         except yaml.YAMLError as exc:
             print(exc)
+    from models import build_model
+    name = cfg["model_params"].get("name", "swin")   # "swin" | "acc_m1" | "acc_m2"
+    model = build_model(name, cfg)
     
     base = args.data_dir  # parent directory
     all_seqs = make_sequences(base)
@@ -264,7 +266,7 @@ def main(args):
     # model definition
     # from torchvision baseline "Video Classification" models, see https://pytorch.org/vision/main/models.html#video-classification
     #model = RangeMixtureVideoModel(cfg)
-    model = RangeMixtureSwinTransformerModel(cfg)
+
     # load weights
     try:
         if os.path.isfile(cfg["train_params"]["pre_train_weights"]):    # throws TypeError if NoneType provided

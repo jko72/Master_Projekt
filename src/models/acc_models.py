@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 import sys
-from models.modules import ConvSC, Inception, TAUSubBlock
-from models.base import BasePredictionModel
+from models.acc_modules import ConvSC, Inception, TAUSubBlock
+from models.acc_base import BasePredictionModel
 import yaml
 
 def stride_generator(N, reverse=False):

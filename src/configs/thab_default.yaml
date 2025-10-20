@@ -1,4 +1,5 @@
 model_params: {
+  name: "acc_m1", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
   mdn_output_dim: 3,
   mdn_num_gaussians: 3, # 9
   input_horizon: 10,
