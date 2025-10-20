@@ -1,0 +1,10 @@
+tensorboard
+open3d==0.19.0
+termcolor
+tqdm
+opencv-python   # tested version opencv-python==4.11.0.86
+seaborn         # tested version seaborn==0.13.2 
+ouster-sdk==0.14.0
+numpy==1.26.4     
+# numpy > 2.26 requires python 3.11+
+# ouster-sdk requires numpy <2 and >1.19

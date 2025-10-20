@@ -1,0 +1,28 @@
+name: lidar_range
+services:
+  dev:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+      args:
+        - USER_ID=$USER_ID
+        - USER_NAME=$USER_NAME
+    image: miniconda3-py310_24.9.2-0-linux-x86_64_torch2.4.1
+    shm_size: 24G
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - DISPLAY=unix$DISPLAY
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    ports:
+      - "${SSH_PORT}:22"
+      - "${TENSORBOARD_PORT}:6006"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${REPOS_PATH}:/home/${USER_NAME}/workspace
+      - ${DATA_PATH}:/home/${USER_NAME}/workspace/data
+    entrypoint: /home/${USER_NAME}/workspace/docker/entrypoint.sh
+    working_dir: /home/${USER_NAME}/workspace
+    user: ${USER_ID}:${USER_ID}
+    runtime: nvidia
