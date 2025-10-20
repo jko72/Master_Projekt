@@ -1,0 +1,58 @@
+model_params: {
+  mdn_output_dim: 3,
+  mdn_num_gaussians: 3, # 9
+  input_horizon: 10,
+  forecast_horizon: 3,
+  dropout_prob: 0.3,
+  mdn_dropout_prob: 0.2,
+  grid_height: 64,
+  grid_width: 512,
+  grid_channels: 4,
+  preserve_ray_position: true,
+  with_attention: false
+}
+train_params: {
+  with_resume_train: false,
+  pre_train_weights: null, #"/home/devuser/workspace/LidarGaussianVideoView/logs/25-05-08_09-44-52/weights/model_epoch_22.pt",
+  auto_increment: true,
+  auto_increment_upper_bound: 2.e+4,
+  auto_increment_lower_bound: 5.e+3,
+  delta_t: 0.1,
+  num_total_epochs: 100,
+
+  # BATCH SIZE
+  batch_size: 2,
+
+  # LEARNING RATE
+  start_learning_rate: 5.e-4,
+  num_warmup_epochs: 5,
+  weight_decay: 1.e-4,        # typical: 1.e-2 -> 1.e-4
+  alpha_temperature_init: 0.25,
+
+  build_mixture_variance_epsilon: 1.e-5,
+  build_mixture_variance_mu: 1.e-5,
+  alpha_threshold: 0.2,
+  use_density_threshold: true,
+  density_threshold: 0.285,
+
+  output_horizons: [0, 10, 20],
+  confidence_levels: [0.95, 0.68],
+  final_learning_rate: 5.e-5,
+  clip_grad_norm: 5.0,
+  dataloader_num_workers: 2,  # 4
+  dataloader_prefetch: 2,
+  num_samples: 200,
+  cost_weight: 0.005,
+  
+  plot_batch_step: 5,
+  plot_time_vertically: True,
+
+  plot_epoch_step: 50,
+  auto_save_step: 2,
+  logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/logs",
+  tensorboard_log_interval: 10,
+
+  # LOGGING
+  plot_examples: true,  # visualize while training
+  with_save: true,     # logging with tensorboard and saves weights
+}
