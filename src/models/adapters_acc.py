@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from models.acc_models import Model1 as ACC_Model1
 from models.acc_models import Model2 as ACC_Model2
-from prob import build_range_mixture_distribution  # du nutzt das bereits im Swin-Modell
+from prob import build_range_mixture_distribution  # bereits im Swin-Modell
 
 def _xyz_to_range(xyz):  # [B, T, 3, H, W] -> [B, T, 1, H, W]
     r = torch.sqrt(torch.clamp(xyz[:, :, 0]**2 + xyz[:, :, 1]**2 + xyz[:, :, 2]**2, min=1e-9))
