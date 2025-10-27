@@ -458,15 +458,24 @@ def main(args):
             
             # build & compute 1D‐range loss
             # mixture, ok = build_range_mixture_distribution(cfg, output)
-            mixture, ok = model.build_mixture(cfg, output)
-            if not ok:
-                continue
-            loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to('cuda'))
-            
+            if cfg["model_params"].get("use_mdn", True):
+                mixture, ok = model.build_mixture(cfg, output)
+                if not ok:
+                    continue
+                loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to(args.device))
+            else:
+                # Direkte Range-Regression ohne Gaußparameter
+                loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
+                nll = loss_tensor.item()            
             # add batch's train loss to overall loss
             total_loss += nll
                 
-            mixture_cpu = mixture_to_cpu(mixture)
+                # Nur bei MDN aktiv – mixture existiert nur dann
+            if cfg["model_params"].get("use_mdn", True):
+                mixture_cpu = mixture_to_cpu(mixture)
+            else:
+                mixture_cpu = None
+
             #r_exp = mixture.mean
             # loss_occ = occlusion_penalty(r_exp, future_ranges)
             # loss_tensor = loss_tensor + loss_occ
@@ -515,12 +524,19 @@ def main(args):
                 # gather gt, mode, mean
                     # get gt
                 gt_all = future_ranges.detach().cpu().numpy()
-                    # get modes
-                modes_flat = estimate_mixture_modes(mixture, n_samples=cfg["train_params"]["num_samples"])  # [B*T*H*W]
-                modes_all = modes_flat.view(B, T, H, W).detach().cpu().numpy()
-                    # get mean
-                mean_flat = mixture.mean  # shape [B*T*H*W]
-                mean_all = mean_flat.view(B, T, H, W).detach().cpu().numpy()
+
+                    # --- Modellvorhersagen ---
+                if cfg["model_params"].get("use_mdn", True):
+                     # MDN aktiv → Mittelwert & Moden aus Mixture ziehen
+                    modes_flat = estimate_mixture_modes(mixture, n_samples=cfg["train_params"]["num_samples"])  # [B*T*H*W]
+                    modes_all = modes_flat.view(B, T, H, W).detach().cpu().numpy()
+
+                    mean_flat = mixture.mean  # shape [B*T*H*W]
+                    mean_all = mean_flat.view(B, T, H, W).detach().cpu().numpy()
+                else:
+                    # Direkte Range-Regression → Output selbst ist Mean & Mode
+                    modes_all = output.detach().cpu().numpy()
+                    mean_all  = output.detach().cpu().numpy()
 
                 # VISUALIZATION
                 b = 0   # which batch‐element to show
@@ -747,10 +763,15 @@ def main(args):
                 
                 # build & compute 1D‐range loss
                 # mixture, ok = build_range_mixture_distribution(cfg, output)
-                mixture, ok = model.build_mixture(cfg, output)
-                if not ok:
-                    continue
-                loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to('cuda'))
+                if cfg["model_params"].get("use_mdn", True):
+                    mixture, ok = model.build_mixture(cfg, output)
+                    if not ok:
+                        continue
+                    loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to(args.device))
+                else:
+                    # Direkte Range-Regression ohne Gaußparameter
+                    loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
+                    nll = loss_tensor.item()
                 
                 if cfg["train_params"]["with_save"]: 
                     if batch_idx % cfg["train_params"]["tensorboard_log_interval"] == 0:

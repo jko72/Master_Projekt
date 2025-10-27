@@ -43,8 +43,11 @@ def _ensure_acc_cfg_shape(cfg, F, H, W):
 
 class _AccToMDN_Base(nn.Module):
     """
-    Kapselt ACC-Modelle (Model1/Model2) und liefert MDN-kompatiblen Output [B,F,H,W,3K].
+    Adapter für ACC-Modelle (Model1/Model2)
+    Erzeugt MDN-kompatiblen Output oder reine Range-Regression
+    je nach cfg['model_params']['use_mdn']
     """
+
     def __init__(self, cfg, acc_core: nn.Module):
         super().__init__()
         mp = cfg["model_params"]
@@ -52,41 +55,55 @@ class _AccToMDN_Base(nn.Module):
         self.K = mp["mdn_num_gaussians"]
         self.H = mp["grid_height"]
         self.W = mp["grid_width"]
+        self.use_mdn = mp.get("use_mdn", True)  # 🔹 Schalter zwischen MDN und direkter Regression
+
         _ensure_acc_cfg_shape(cfg, self.F, self.H, self.W)
         self.acc = acc_core
 
-        # Globale, lernbare σ und α-Temperatur wie im Swin-Modell
-        init_log_sigma = cfg.get("train_params", {}).get("acc_sigma_init", -0.3)  # σ≈0.74 m
-        self.log_sigma = nn.Parameter(torch.tensor(init_log_sigma, dtype=torch.float32))
-        init_alpha_temp = cfg.get("train_params", {}).get("alpha_temperature_init", 0.25)
-        self.alpha_temp = nn.Parameter(torch.tensor(init_alpha_temp, dtype=torch.float32))
+        # Nur MDN-Parameter, wenn aktiv
+        if self.use_mdn:
+            init_log_sigma = cfg.get("train_params", {}).get("acc_sigma_init", -0.3)
+            self.log_sigma = nn.Parameter(torch.tensor(init_log_sigma, dtype=torch.float32))
+            init_alpha_temp = cfg.get("train_params", {}).get("alpha_temperature_init", 0.25)
+            self.alpha_temp = nn.Parameter(torch.tensor(init_alpha_temp, dtype=torch.float32))
 
-    def forward(self, hist_xyz):  # [B, T_in, 3, H, W]
+    def forward(self, hist_xyz):
+        """
+        hist_xyz: [B, T_in, 3, H, W]
+        Rückgabe: [B, F, H, W, 3K] (MDN) oder [B, F, H, W] (Regression)
+        """
         B, T_in, C, H, W = hist_xyz.shape
 
         # 1) XYZ -> Range-Sequenz
         rv_seq = _xyz_to_range(hist_xyz)         # [B, T_in, 1, H, W]
         rv_seq = _time_resample(rv_seq, self.F)  # [B, F, 1, H, W]
 
-        # 2) ACC-Modell aufrufen → Dict mit "rv" [B,F,H,W], "mask_logits" [B,F,H,W]
+        # 2) Modell aufrufen
         out = self.acc(rv_seq)
         mu = out["rv"]            # [B, F, H, W]
         mask_logits = out.get("mask_logits", None)
 
-        # 3) MDN-Parameter bauen: [B,F,H,W,3K] (μ, logσ, α-logits)
-        mu_k     = mu.unsqueeze(-1).repeat(1, 1, 1, 1, self.K)   # [B,F,H,W,K]
-        logsig_k = self.log_sigma.expand_as(mu_k)                # [B,F,H,W,K]
-        alpha_k  = torch.zeros_like(mu_k)                        # logits ~ uniform
+        # 3) Fall A: MDN aktiv
+        if self.use_mdn:
+            mu_k     = mu.unsqueeze(-1).repeat(1, 1, 1, 1, self.K)
+            logsig_k = self.log_sigma.expand_as(mu_k)
+            alpha_k  = torch.zeros_like(mu_k)
 
-        # Optionale α-Modulation durch Mask-Logits
-        if mask_logits is not None:
-            a = torch.tanh(mask_logits).unsqueeze(-1).expand_as(alpha_k)
-            alpha_k = alpha_k + 0.2 * a
+            if mask_logits is not None:
+                a = torch.tanh(mask_logits).unsqueeze(-1).expand_as(alpha_k)
+                alpha_k = alpha_k + 0.2 * a
 
-        packed = torch.cat([mu_k, logsig_k, alpha_k], dim=-1)    # [B,F,H,W,3K]
-        return packed
+            packed = torch.cat([mu_k, logsig_k, alpha_k], dim=-1)  # [B,F,H,W,3K]
+            return packed
+
+        # 4) Fall B: Nur Range-Regression (keine Gauß-Parameter)
+        else:
+            return mu  # [B,F,H,W]
 
     def build_mixture(self, cfg, output):
+        """Nur aktiv, wenn use_mdn=True"""
+        if not getattr(self, "use_mdn", True):
+            return None, True
         return build_range_mixture_distribution(cfg, output, self.alpha_temp)
 
 class AccurateM1Adapter(_AccToMDN_Base):
