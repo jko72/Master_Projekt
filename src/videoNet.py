@@ -486,19 +486,7 @@ def main(args):
             optimizer.zero_grad()
             loss_tensor.backward()
             optimizer.step()
-                    # Checkpoint speichern (nur alle 5 Epochen)
-            if cfg["train_params"]["with_save"] and (epoch + 1) % 5 == 0:
-                ckpt_dir = os.path.join(save_path, "weights")
-                os.makedirs(ckpt_dir, exist_ok=True)
-                ckpt_path = os.path.join(ckpt_dir, f"model_epoch_{epoch+1}.pt")
 
-                torch.save({
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                }, ckpt_path)
-
-                print(f"Saved model checkpoint at: {ckpt_path}")
             #scheduler.step()
             B, T, H, W = future_ranges.shape
             # if ok:
