@@ -6,6 +6,7 @@ __pycache__/
 
 # --- TensorBoard Logs / Trainingsausgaben ---
 logs/
+LidarGaussianVideoView/logs/
 *.log
 *.out
 events.out.tfevents.*
@@ -28,3 +29,5 @@ weights/
 # --- Docker-Builds ---
 docker/.env
 docker/user.env
+
+data/
