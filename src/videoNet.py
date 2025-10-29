@@ -13,6 +13,8 @@ from utils_torch import make_angle_grids
 from prob import build_range_mixture_distribution, compute_nll_range_loss
 from prob import generate_point_clouds_from_mixture, visualize_mixture_pdfs
 from models import build_model
+from models.loss import Loss
+
 
 # Helper functions
 from helper.pointcloud_visualization import pointcloud_from_expected_range
@@ -275,6 +277,8 @@ def main(args):
     except Exception as ex:
             print("no custom pretrained weights found, use default vanilla")
     model.to(args.device)
+    criterion = Loss(cfg)
+
     
     # Define optimizer
     #optimizer = optim.Adam(model.parameters(), lr=cfg["train_params"]["start_learning_rate"])
@@ -462,7 +466,13 @@ def main(args):
                 mixture, ok = model.build_mixture(cfg, output)
                 if not ok:
                     continue
-                loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to(args.device))
+                target = future_xyz.to(args.device)
+                loss_dict = criterion(output, target, mode="train", epoch_number=epoch)
+
+                loss_tensor = loss_dict["loss"]
+                nll = loss_dict["loss_range_view"]
+                valid_ratio = loss_dict["valid_ratio"]
+
             else:
                 # Direkte Range-Regression ohne Gaußparameter
                 loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
@@ -701,6 +711,15 @@ def main(args):
                     step = epoch * len(train_loader) + batch_idx
                     writer.add_scalar('Loss', nll, step)
                     writer.add_scalar('LR', optimizer.param_groups[0]['lr'], step)
+
+                    # Anteil gültiger Pixel
+                    try:
+                        if "loss_dict" in locals() and "valid_ratio" in loss_dict:
+                            writer.add_scalar('train/valid_pixel_ratio', loss_dict["valid_ratio"].item(), step)
+                        elif "valid_ratio" in locals():
+                            writer.add_scalar('train/valid_pixel_ratio', valid_ratio.item(), step)
+                    except Exception as e:
+                        print(f"[WARN] valid_pixel_ratio not logged: {e}")
                     
                     # Add distance losses
                     if not (batch_idx % cfg["train_params"]["plot_batch_step"] == 0):
@@ -755,7 +774,13 @@ def main(args):
                     mixture, ok = model.build_mixture(cfg, output)
                     if not ok:
                         continue
-                    loss_tensor, nll = compute_nll_range_loss(cfg, mixture, future_ranges.to(args.device))
+                    target = future_xyz.to(args.device)
+                    loss_dict = criterion(output, target, mode="val", epoch_number=epoch)
+
+                    loss_tensor = loss_dict["loss"]
+                    nll = loss_dict["loss_range_view"]
+                    valid_ratio = loss_dict["valid_ratio"]
+
                 else:
                     # Direkte Range-Regression ohne Gaußparameter
                     loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))

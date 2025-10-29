@@ -3,8 +3,33 @@ import torch
 import sys
 import random
 
-from utils.projection import projection
-from pyTorchChamferDistance.chamfer_distance import ChamferDistance
+#from utils.projection import projection
+try:
+    from utils.projection import projection
+except ModuleNotFoundError:
+    class projection:
+        def __init__(self, cfg=None):
+            print("[WARN] utils.projection not found – using dummy projection.")
+        def get_target_mask_from_range_view(self, range_view):
+            # Gibt Maske mit 1 für alle gültigen Pixel (alles aktiv)
+            return torch.ones_like(range_view, dtype=torch.float32)
+        def get_masked_range_view(self, output):
+            # Gibt Range-View direkt zurück
+            return output["rv"]
+        def get_valid_points_from_range_view(self, range_view):
+            # Dummy-Valid-Punkte (keine echte Projektion)
+            pts = torch.nonzero(range_view > 0, as_tuple=False).float()
+            return pts
+#from pyTorchChamferDistance.chamfer_distance import ChamferDistance
+try:
+    from pyTorchChamferDistance.chamfer_distance import ChamferDistance
+except ModuleNotFoundError:
+    class ChamferDistance:
+        def __init__(self):
+            print("[WARN] ChamferDistance module not found – using dummy placeholder.")
+        def __call__(self, x, y):
+            # Gibt Dummywerte zurück (0 statt echten Distanzwert)
+            return torch.zeros_like(x[..., 0]), torch.zeros_like(y[..., 0])
 
 device = torch.device('cuda')
 

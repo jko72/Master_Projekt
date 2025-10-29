@@ -6,8 +6,34 @@ import yaml
 import math
 import random
 
-from pyTorchChamferDistance.chamfer_distance import ChamferDistance
-from utils.projection import projection
+#from pyTorchChamferDistance.chamfer_distance import ChamferDistance
+try:
+    from pyTorchChamferDistance.chamfer_distance import ChamferDistance
+except ModuleNotFoundError:
+    class ChamferDistance:
+        def __init__(self):
+            print("[WARN] ChamferDistance module not found – using dummy placeholder.")
+        def __call__(self, x, y):
+            # Gibt Dummywerte zurück (0 statt echten Distanzwert)
+            return torch.zeros_like(x[..., 0]), torch.zeros_like(y[..., 0])
+
+#from utils.projection import projection
+try:
+    from utils.projection import projection
+except ModuleNotFoundError:
+    class projection:
+        def __init__(self, cfg=None):
+            print("[WARN] utils.projection not found – using dummy projection.")
+        def get_target_mask_from_range_view(self, range_view):
+            # Gibt Maske mit 1 für alle gültigen Pixel (alles aktiv)
+            return torch.ones_like(range_view, dtype=torch.float32)
+        def get_masked_range_view(self, output):
+            # Gibt Range-View direkt zurück
+            return output["rv"]
+        def get_valid_points_from_range_view(self, range_view):
+            # Dummy-Valid-Punkte (keine echte Projektion)
+            pts = torch.nonzero(range_view > 0, as_tuple=False).float()
+            return pts
 from models.chamfer import cham_dist
 
 def diff_div_reg(pred_y, batch_y, tau=0.1, eps=1e-12):
@@ -29,10 +55,16 @@ class Loss(nn.Module):
         """Init"""
         super().__init__()
         self.cfg = cfg
-        self.n_future_steps = self.cfg["MODEL"]["N_FUTURE_STEPS"]
-        self.loss_weight_cd = self.cfg["TRAIN"]["LOSS_WEIGHT_CHAMFER_DISTANCE"]
-        self.loss_weight_rv = self.cfg["TRAIN"]["LOSS_WEIGHT_RANGE_VIEW"]
-        self.loss_weight_mask = self.cfg["TRAIN"]["LOSS_WEIGHT_MASK"]
+        self.n_future_steps = self.cfg.get("MODEL", self.cfg.get("model_params", {})).get("N_FUTURE_STEPS", 3)
+
+        #  Unterstützt sowohl TRAIN als auch train_params (robust)
+        train_cfg = self.cfg.get("TRAIN", self.cfg.get("train_params", {}))
+
+        #  Sichere Zugriffsmethode mit Standardwerten
+        self.loss_weight_cd   = train_cfg.get("LOSS_WEIGHT_CHAMFER_DISTANCE", 0.0)
+        self.loss_weight_rv   = train_cfg.get("LOSS_WEIGHT_RANGE_VIEW", 1.0)
+        self.loss_weight_mask = train_cfg.get("LOSS_WEIGHT_MASK", 1.0)
+
         self.alpha  = 0.1
         self.loss_range = loss_range(self.cfg)
         self.chamfer_distance = cham_dist(self.cfg)
@@ -54,7 +86,7 @@ class Loss(nn.Module):
         target_range_image = target[:,:, 0, :, :]
 
         # Range view
-        loss_range_view, loss_range_timestep = self.loss_range(output, target_range_image)
+        loss_range_view, loss_range_timestep, valid_ratio = self.loss_range(output, target_range_image)
 
         # Mask
         loss_mask = self.loss_mask(output, target_range_image)
@@ -96,6 +128,7 @@ class Loss(nn.Module):
             "loss_range_view": loss_range_view.detach(),
             "loss_range_timestep": loss_range_timestep.detach(),
             "loss_mask": loss_mask.detach(),
+            "valid_ratio": valid_ratio.detach(),
         }
         return loss_dict
 
@@ -116,24 +149,56 @@ class loss_mask(nn.Module):
 
 
 class loss_range(nn.Module):
-    """L1 loss for range image prediction"""
+    """
+    L1-Loss für die Range-Vorhersage mit Maskierung:
+    Pixel mit Range == 0 oder == -1 werden ignoriert,
+    da sie keine gültigen LiDAR-Entfernungen repräsentieren.
+    """
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.loss = nn.L1Loss(reduction="mean")
+        # L1Loss mit 'none', damit wir pro Pixel den Fehler berechnen können
+        self.loss = nn.L1Loss(reduction="none")
 
     def forward(self, output, target_range_image):
-        # Do not count L1 loss for invalid GT points
-        gt_masked_output = output["rv"].clone()
-        # print(f"The shape of output {gt_masked_output.shape}")
-        # print(f"The shape of target {target_range_image.shape}")
-        gt_masked_output[target_range_image == -1.0] = -1.0
-        loss = self.loss(gt_masked_output, target_range_image)
-        timestep_loss = torch.zeros(target_range_image.shape[1])
+        """
+        Args:
+            output: dict mit 'rv' (predicted range view), [B, T, H, W]
+            target_range_image: Ground Truth ranges, [B, T, H, W]
+
+        Returns:
+            loss: gemittelter Loss über alle gültigen Pixel
+            timestep_loss: Loss pro Zeitschritt
+        """
+
+        # 1 Vorhersage kopieren, damit wir das Original nicht verändern
+        pred = output["rv"].clone()
+
+        # 2 Gültigkeitsmaske: Nur Pixel >0 und != -1 verwenden
+        valid_mask = (target_range_image > 0.0) & (target_range_image != -1.0)
+
+        # 3 Pixelweise L1-Differenz
+        pixelwise_loss = torch.abs(pred - target_range_image)
+
+        # 4 Maskieren: Nur gültige Pixel beibehalten
+        masked_loss = pixelwise_loss * valid_mask
+
+        # 5 Mittelwert nur über gültige Pixel
+        loss = masked_loss.sum() / (valid_mask.sum() + 1e-8)
+
+        # 6 Optional: Loss pro Zeitschritt (für Logging)
+        timestep_loss = torch.zeros(target_range_image.shape[1], device=pred.device)
         for i in range(target_range_image.shape[1]):
-            timestep_loss[i] = self.loss(gt_masked_output[:, i, :, :], target_range_image[:, i, :, :])
-        return loss, timestep_loss
+            valid_t = (target_range_image[:, i, :, :] > 0.0) & (target_range_image[:, i, :, :] != -1.0)
+            step_loss = torch.abs(pred[:, i, :, :] - target_range_image[:, i, :, :]) * valid_t
+            timestep_loss[i] = step_loss.sum() / (valid_t.sum() + 1e-8)
+        
+        # 7 Anteil gültiger Pixel (Monitoring)
+        total_pixels = target_range_image.numel()
+        valid_ratio = valid_mask.sum().float() / total_pixels
+
+        return loss, timestep_loss, valid_ratio
 
 
 class chamfer_distance(nn.Module):

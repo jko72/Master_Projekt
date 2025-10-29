@@ -57,4 +57,7 @@ train_params: {
   # LOGGING
   plot_examples: true,  # visualize while training
   with_save: true,     # logging with tensorboard and saves weights
+  LOSS_WEIGHT_CHAMFER_DISTANCE: 0.0,
+  LOSS_WEIGHT_RANGE_VIEW: 1.0,
+  LOSS_WEIGHT_MASK: 1.0,
 }
