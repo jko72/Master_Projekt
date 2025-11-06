@@ -172,7 +172,7 @@ class loss_range(nn.Module):
             timestep_loss: Loss pro Zeitschritt
         """
 
-        # 1 Vorhersage kopieren, damit wir das Original nicht verändern
+        # 1 Vorhersage kopieren, damit das Original nicht verändert wird
         pred = output["rv"].clone()
 
         # 2 Gültigkeitsmaske: Nur Pixel >0 und != -1 verwenden
