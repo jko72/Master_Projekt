@@ -785,16 +785,55 @@ def main(args):
                     # Direkte Range-Regression ohne Gaußparameter
                     loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
                     nll = loss_tensor.item()
-                
-                if cfg["train_params"]["with_save"]: 
-                    if batch_idx % cfg["train_params"]["tensorboard_log_interval"] == 0:
+
+                # =============================================================
+                # Logge nur alle N Batches (Loss + ACC-Metriken synchron)
+                # =============================================================
+                if batch_idx % cfg["train_params"]["tensorboard_log_interval"] == 0:
+                    step = epoch * len(train_loader) + batch_idx
+                    # --- Loss ---
+                    if cfg["train_params"]["with_save"]:
+                        writer.add_scalar('Loss/Validation', float(nll), step)
+
+                    # === NEU: ACC-Range-Metriken berechnen & (optional) in TensorBoard loggen ===
+                    # Ziel-Range braucht Form [B,T,1,H,W]
+                    future_for_metrics = future_ranges
+                    if future_for_metrics.ndim == 4:
+                        future_for_metrics = future_for_metrics.unsqueeze(2)
+                    future_for_metrics = future_for_metrics.to(args.device)
+
+                    # output kann dict (mit 'rv') ODER Tensor sein
+                    if isinstance(output, dict) and ("rv" in output):
+                        out_for_metrics = output
+                    elif torch.is_tensor(output):
+                        out_for_metrics = {"rv": output}
+                    else:
+                        out_for_metrics = None  # sollte nicht passieren
+
+                    if out_for_metrics is not None:
                         step = epoch * len(train_loader) + batch_idx
-                        writer.add_scalar('Loss/Validation', nll, step)
+                        if cfg["train_params"]["with_save"]:
+                            model.compute_and_log_metrics(
+                                output=out_for_metrics,
+                                future=future_for_metrics,
+                                writer=writer,
+                                global_step=step,
+                                prefix="val"
+                            )
+                        else:
+                            # ohne Writer: nur berechnen (kein Log)
+                            _ = model.compute_and_log_metrics(
+                                output=out_for_metrics,
+                                future=future_for_metrics,
+                                writer=None,
+                                prefix="val"
+                            )
+                    # === ENDE NEU ===
                 
-                print(f"inference took {curr_time} ms.\tloss: {nll}\t@Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}")
+                print(f"inference took {curr_time} ms.\tloss: {float(nll):.6f}\t@Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}")
                 
                 # add batch's validation loss to overall loss
-                total_loss_val += nll
+                total_loss_val += float(nll)
             
             # average loss caluclation
             avg_loss_val = total_loss_val / len(val_loader)

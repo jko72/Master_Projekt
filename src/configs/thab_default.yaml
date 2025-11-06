@@ -1,5 +1,5 @@
 model_params: {
-  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
+  name: "acc_m1", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
   use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
   mdn_num_gaussians: 3, # 9

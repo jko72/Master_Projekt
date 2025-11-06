@@ -6,6 +6,11 @@ from models.acc_models import Model1 as ACC_Model1
 from models.acc_models import Model2 as ACC_Model2
 from prob import build_range_mixture_distribution  # bereits im Swin-Modell
 
+# BasePredictionModel importieren (Pfad ggf. anpassen, falls anderes Package-Layout)
+
+from models.acc_base import BasePredictionModel
+
+
 def _xyz_to_range(xyz):  # [B, T, 3, H, W] -> [B, T, 1, H, W]
     r = torch.sqrt(torch.clamp(xyz[:, :, 0]**2 + xyz[:, :, 1]**2 + xyz[:, :, 2]**2, min=1e-9))
     return r.unsqueeze(2)
@@ -41,15 +46,16 @@ def _ensure_acc_cfg_shape(cfg, F, H, W):
     cfg["MODEL"].setdefault("N_CHANNELS_PER_GROUP", 2)
     cfg.setdefault("TRAIN", {"LR": 1e-3, "LR_EPOCH": 100000, "LR_DECAY": 1.0})
 
-class _AccToMDN_Base(nn.Module):
+# CHANGE: von nn.Module -> BasePredictionModel erben
+class _AccToMDN_Base(BasePredictionModel):
     """
     Adapter für ACC-Modelle (Model1/Model2)
     Erzeugt MDN-kompatiblen Output oder reine Range-Regression
     je nach cfg['model_params']['use_mdn']
     """
-
     def __init__(self, cfg, acc_core: nn.Module):
-        super().__init__()
+        # NEW: BasePredictionModel initialisieren (legt u.a. Buffers & Meta an)
+        super().__init__(cfg)
         mp = cfg["model_params"]
         self.F = mp["forecast_horizon"]
         self.K = mp["mdn_num_gaussians"]
@@ -78,7 +84,7 @@ class _AccToMDN_Base(nn.Module):
         rv_seq = _xyz_to_range(hist_xyz)         # [B, T_in, 1, H, W]
         rv_seq = _time_resample(rv_seq, self.F)  # [B, F, 1, H, W]
 
-        # 2) Modell aufrufen
+        # 2) ACC-Core aufrufen
         out = self.acc(rv_seq)
         mu = out["rv"]            # [B, F, H, W]
         mask_logits = out.get("mask_logits", None)
