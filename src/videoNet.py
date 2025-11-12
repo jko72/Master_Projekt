@@ -268,19 +268,22 @@ def main(args):
     # --- NEU: globales Seeding & Determinismus ---
     seed = cfg.get('train_params', {}).get('random_seed', None)
     deterministic = cfg.get('train_params', {}).get('deterministic', False)
-
+    cudnn_benchmark = cfg.get('train_params', {}).get('cudnn_benchmark', False)
+    
     if seed is not None:
         os.environ["PYTHONHASHSEED"] = str(seed)
-        import random, numpy as np, torch
+        import random
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
     if deterministic:
-        import torch
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+        torch.backends.cudnn.deterministic = False
 
     # NEU: Ausgabe der aktiven Einstellungen
     print_training_env_info(cfg)
