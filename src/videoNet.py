@@ -242,6 +242,20 @@ def estimate_mixture_modes(mixture, n_samples=500):
     #outputs_mode = torch.gather(samples, dim=0, index=mode_idx.unsqueeze(0)).squeeze(0)
     return outputs_mode
 
+def print_training_env_info(cfg):
+    import torch
+    tp = cfg.get("train_params", {})
+    seed = tp.get("random_seed", None)
+    deterministic = tp.get("deterministic", False)
+    shuffle_train = tp.get("shuffle_train", True)
+
+    print("\n===== TRAINING ENVIRONMENT INFO =====")
+    print(f"Random Seed:          {seed if seed is not None else 'None (random each run)'}")
+    print(f"Deterministic Mode:   {'ON' if deterministic else 'OFF'}")
+    print(f"Train Shuffle:        {'ON' if shuffle_train else 'OFF'}")
+    print(f"CuDNN benchmark:      {torch.backends.cudnn.benchmark}")
+    print(f"CuDNN deterministic:  {torch.backends.cudnn.deterministic}")
+    print("=====================================\n")
 
 def main(args):
     global show_pc_flag, show_pdf_flag, show_ray_flag
@@ -250,6 +264,27 @@ def main(args):
             cfg = yaml.safe_load(file)
         except yaml.YAMLError as exc:
             print(exc)
+
+    # --- NEU: globales Seeding & Determinismus ---
+    seed = cfg.get('train_params', {}).get('random_seed', None)
+    deterministic = cfg.get('train_params', {}).get('deterministic', False)
+
+    if seed is not None:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        import random, numpy as np, torch
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        import torch
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+    # NEU: Ausgabe der aktiven Einstellungen
+    print_training_env_info(cfg)
+
     from models import build_model
     name = cfg["model_params"].get("name", "swin")   # "swin" | "acc_m1" | "acc_m2"
     model = build_model(name, cfg)

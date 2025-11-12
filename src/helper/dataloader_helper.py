@@ -1,8 +1,26 @@
-import os
+import os, random
 from helper.egoMotion_compensation_calib import parse_calibration, parse_poses
 from dataloader import RandomWindowSeqDataset
 import torch
 from torch.utils.data import DataLoader
+import numpy as np
+
+# ---- Worker seeding (top-level, picklable) ----
+WORKER_BASE_SEED = None
+
+def set_worker_seed_base(s: int | None):
+    global WORKER_BASE_SEED
+    WORKER_BASE_SEED = None if s is None else int(s)
+
+def worker_init_fn(worker_id: int):
+    import random, numpy as np, torch
+    base = 0 if WORKER_BASE_SEED is None else WORKER_BASE_SEED
+    seed = base + worker_id
+    random.seed(seed)
+    # modulo, damit der seed im gültigen Bereich für numpy liegt
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+
 
 def make_sequences(base_dir):
     """
@@ -67,6 +85,33 @@ def build_dataloaders(seqs, cfg, device,
     """
     idx_map = {s['seq_id']: i for i, s in enumerate(seqs)}
 
+    # --- optionale Config-Parameter lesen ---
+    seed = cfg.get('train_params', {}).get('random_seed', None)
+    deterministic = cfg.get('train_params', {}).get('deterministic', False)
+    shuffle_train = cfg.get('train_params', {}).get('shuffle_train', True)
+    # setze Basis-Seed für Worker (top-level global)
+    set_worker_seed_base(seed)
+
+    g = None
+    worker_init_fn = None
+    if seed is not None:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        g = torch.Generator()
+        g.manual_seed(seed)
+        wi_fn = worker_init_fn # Alias auf Top Level Funktion
+    else:
+        set_worker_seed_base(None)
+        wi_fn = None
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
     if split_type == 'rotary':
         loaders = []
         for holdout in idx_map:
@@ -79,9 +124,13 @@ def build_dataloaders(seqs, cfg, device,
             loader_train = DataLoader(
                 ds_train,
                 batch_size=cfg['train_params']['batch_size'],
-                shuffle=True,
+                shuffle=shuffle_train,
                 num_workers=cfg['train_params']['dataloader_num_workers'],
-                multiprocessing_context=torch.multiprocessing.get_context('spawn')
+                multiprocessing_context=torch.multiprocessing.get_context('spawn'),
+                generator=g,                    # NEU
+                worker_init_fn=wi_fn,  # Neu, Alias
+                persistent_workers=(cfg['train_params']['dataloader_num_workers'] > 0),
+                drop_last=True
             )
             loader_val = DataLoader(
                 ds_val,
@@ -106,9 +155,13 @@ def build_dataloaders(seqs, cfg, device,
         loader_train = DataLoader(
             ds_train,
             batch_size=cfg['train_params']['batch_size'],
-            shuffle=True,
+            shuffle=shuffle_train,
             num_workers=cfg['train_params']['dataloader_num_workers'],
-            multiprocessing_context=torch.multiprocessing.get_context('spawn')
+            multiprocessing_context=torch.multiprocessing.get_context('spawn'),
+            generator=g,                    # NEU
+            worker_init_fn=wi_fn,  # NEU, Alias
+            persistent_workers=(cfg['train_params']['dataloader_num_workers'] > 0),
+            drop_last=True
         )
         loader_val = DataLoader(
             ds_val,
