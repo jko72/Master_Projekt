@@ -269,7 +269,7 @@ def main(args):
     seed = cfg.get('train_params', {}).get('random_seed', None)
     deterministic = cfg.get('train_params', {}).get('deterministic', False)
     cudnn_benchmark = cfg.get('train_params', {}).get('cudnn_benchmark', False)
-    
+
     if seed is not None:
         os.environ["PYTHONHASHSEED"] = str(seed)
         import random
@@ -747,6 +747,18 @@ def main(args):
             if cfg["train_params"]["with_save"]:
                 if batch_idx % cfg["train_params"]["tensorboard_log_interval"] == 0:
                     step = epoch * len(train_loader) + batch_idx
+
+                    # ===== PAPER-METRICS: TRAINING LOSSES =====
+                    # Nur loggen, wenn loss_dict existiert (use_mdn=True & build_mixture ok)
+                    if "loss_dict" in locals() and isinstance(loss_dict, dict):
+                        if "loss" in loss_dict:
+                            writer.add_scalar("train/loss_total", loss_dict["loss"].item(), step)
+                        if "loss_range_view" in loss_dict:
+                            writer.add_scalar("train/range_view_loss", loss_dict["loss_range_view"].item(), step)
+                        if "mean_chamfer_distance" in loss_dict:
+                            writer.add_scalar("train/chamfer_distance_loss", loss_dict["mean_chamfer_distance"].item(), step)
+                    # ===== END PAPER-METRICS: TRAINING LOSSES =====
+
                     writer.add_scalar('Loss', nll, step)
                     writer.add_scalar('LR', optimizer.param_groups[0]['lr'], step)
 
@@ -797,6 +809,13 @@ def main(args):
                 torch.save(model.state_dict(), os.path.join(save_path, "weights", f"model_epoch_{epoch}.pt"))
         
         # --- Validation Loop ---
+        # ===== PAPER-METRICS: VALIDATION ACCUMULATORS =====
+        val_rv_sum = 0.0          # Summe Range-View-Loss über Val-Batches
+        val_cd_sum = 0.0          # Summe Chamfer-Distanzen
+        val_mask_sum = 0.0        # Summe Masken-Loss
+        val_batch_count = 0       # Anzahl Val-Batches
+        # ===== END PAPER-METRICS: VALIDATION ACCUMULATORS =====
+
         with torch.no_grad():
             for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(tqdm(iterable=val_loader, total=len(val_loader))):
                 # model's forward gives "output" of shape [B,T,H,W,3K]
@@ -818,6 +837,23 @@ def main(args):
                     loss_tensor = loss_dict["loss"]
                     nll = loss_dict["loss_range_view"]
                     valid_ratio = loss_dict["valid_ratio"]
+
+                    # ===== PAPER-METRICS: UPDATE VALIDATION SUMS =====
+                    if isinstance(loss_dict, dict):
+                        val_batch_count += 1
+
+                        # Range-View-Loss (L1) aufsummieren
+                        if "loss_range_view" in loss_dict:
+                            val_rv_sum += float(loss_dict["loss_range_view"])
+
+                        # Chamfer Distance (mittlere Chamfer-L1) aufsummieren
+                        if "mean_chamfer_distance" in loss_dict:
+                            val_cd_sum += float(loss_dict["mean_chamfer_distance"])
+
+                        # Masken-Loss (optional, falls vorhanden)
+                        if "loss_mask" in loss_dict:
+                            val_mask_sum += float(loss_dict["loss_mask"])
+                    # ===== END PAPER-METRICS: UPDATE VALIDATION SUMS =====
 
                 else:
                     # Direkte Range-Regression ohne Gaußparameter
@@ -876,6 +912,20 @@ def main(args):
             # average loss caluclation
             avg_loss_val = total_loss_val / len(val_loader)
             print(f"Epoch {epoch + 1}/{cfg['train_params']['num_total_epochs']}, Average Validation Loss: {avg_loss_val}")
+
+            # ===== PAPER-METRICS: LOG VALIDATION EPOCH MEANS =====
+            if cfg["train_params"]["with_save"] and val_batch_count > 0:
+                rv_mean = val_rv_sum / val_batch_count
+                writer.add_scalar("val/range_view_metric_L1", rv_mean, epoch)
+
+                if val_cd_sum > 0.0:
+                    cd_mean = val_cd_sum / val_batch_count
+                    writer.add_scalar("val/chamfer_distance_metric_L1", cd_mean, epoch)
+
+                if val_mask_sum > 0.0:
+                    mask_mean = val_mask_sum / val_batch_count
+                    writer.add_scalar("val/loss_mask", mask_mean, epoch)
+            # ===== END PAPER-METRICS: LOG VALIDATION EPOCH MEANS =====
         
         if cfg["train_params"]["with_save"]:
             writer.add_scalar('Loss/Validation/Epoch', avg_loss_val, epoch)

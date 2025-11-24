@@ -209,6 +209,15 @@ class BasePredictionModel(pl.LightningModule):
         # Falls kein Writer: nur zurückgeben
         if writer is None:
             return m
+        
+        step = 0 if global_step is None else global_step
+
+        # ------------------------------
+        # Paper-Style Metrik-Name
+        # (Range-View L1 = MAE über gültige Pixel)
+        # ------------------------------
+        writer.add_scalar(f"{prefix}/range_view_metric_L1",
+                          m["mae_mean"].item(), step)
 
         # Scalars
         writer.add_scalar(f"{prefix}/mae_mean",  m["mae_mean"].item(),  global_step or 0)
