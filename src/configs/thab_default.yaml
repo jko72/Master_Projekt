@@ -59,6 +59,8 @@ train_params: {
   auto_save_step: 5,
   logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/logs",
   tensorboard_log_interval: 10,
+  compute_chamfer_metric: true,   # Chamfer-Logging an/aus
+  chamfer_metric_interval: 30,     # nur jedes X. Val-Batch Chamfer berechnen
 
   # LOGGING
   plot_examples: true,  # visualize while training
@@ -67,3 +69,9 @@ train_params: {
   LOSS_WEIGHT_RANGE_VIEW: 1.0,
   LOSS_WEIGHT_MASK: 1.0,
 }
+
+TEST: {
+  ...
+  N_DOWNSAMPLED_POINTS_CD: 20000  # z.B. 20k Punkte für Chamfer (Performance)
+}
+

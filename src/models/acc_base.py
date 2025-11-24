@@ -241,21 +241,21 @@ class BasePredictionModel(pl.LightningModule):
         writer.add_scalar(f"{prefix}/valid_ratio/mean", m["valid_ratio_mean"].item(), global_step or 0)
 
         # Optionale Beispiel-Images (Batch 0, t=0)
-        try:
-            b = 0
-            pred_img = pred_rv[b, 0].detach().clamp_min(0)
-            gt_img   = gt_rv[b, 0].detach().clamp_min(0)
-            err_img  = (pred_img - gt_img).abs()
+        #try:
+            #b = 0
+            #pred_img = pred_rv[b, 0].detach().clamp_min(0)
+            #gt_img   = gt_rv[b, 0].detach().clamp_min(0)
+            #err_img  = (pred_img - gt_img).abs()
 
-            def _norm(x):
-                mx = x.max().clamp_min(1e-6)
-                return (x / mx).unsqueeze(0)  # [1,H,W]
+            #def _norm(x):
+                #mx = x.max().clamp_min(1e-6)
+                #return (x / mx).unsqueeze(0)  # [1,H,W]
 
-            writer.add_image(f"{prefix}_vis/example/pred_t0", _norm(pred_img), global_step or 0)
-            writer.add_image(f"{prefix}_vis/example/gt_t0",   _norm(gt_img),   global_step or 0)
-            writer.add_image(f"{prefix}_vis/example/err_t0",  _norm(err_img),  global_step or 0)
-        except Exception as e:
-            print(f"[{prefix.upper()} VIS] skipping image log:", repr(e))
+            #writer.add_image(f"{prefix}_vis/example/pred_t0", _norm(pred_img), global_step or 0)
+            #writer.add_image(f"{prefix}_vis/example/gt_t0",   _norm(gt_img),   global_step or 0)
+            #writer.add_image(f"{prefix}_vis/example/err_t0",  _norm(err_img),  global_step or 0)
+        #except Exception as e:
+            #print(f"[{prefix.upper()} VIS] skipping image log:", repr(e))
 
         return m
 

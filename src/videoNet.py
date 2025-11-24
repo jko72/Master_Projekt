@@ -14,6 +14,7 @@ from prob import build_range_mixture_distribution, compute_nll_range_loss
 from prob import generate_point_clouds_from_mixture, visualize_mixture_pdfs
 from models import build_model
 from models.loss import Loss
+from models.chamfer import cham_dist  # NEU: Chamfer-Metrik
 
 
 # Helper functions
@@ -316,6 +317,8 @@ def main(args):
             print("no custom pretrained weights found, use default vanilla")
     model.to(args.device)
     criterion = Loss(cfg)
+    # NEU: Chamfer-Metrik (nur als Metrik, nicht im Trainings-Loss)
+    chamfer_metric = cham_dist(cfg)
 
     
     # Define optimizer
@@ -903,6 +906,66 @@ def main(args):
                                 prefix="val"
                             )
                     # === ENDE NEU ===
+
+                    # === Chamfer-Metrik (optional, wie im Paper) ===========
+                    compute_cd = cfg["train_params"].get("compute_chamfer_metric", False)
+                    cd_interval = cfg["train_params"].get("chamfer_metric_interval", 10)
+
+                    # Nur falls aktiviert + nur alle cd_interval-Batches
+                    if compute_cd and (batch_idx % cd_interval == 0):
+                        # a) Output für Chamfer vorbereiten:
+                        #    - ACC-Modelle liefern Dict mit "rv" + "mask_logits"
+                        #    - sonst Dummy-mask_logits verwenden
+                        if isinstance(output, dict) and ("rv" in output):
+                            if "mask_logits" in output:
+                                out_for_cd = output
+                            else:
+                                out_for_cd = {
+                                    "rv": output["rv"],
+                                    "mask_logits": torch.zeros_like(output["rv"]),
+                                }
+                        elif torch.is_tensor(output):
+                            out_for_cd = {
+                                "rv": output,
+                                "mask_logits": torch.zeros_like(output),
+                            }
+                        else:
+                            out_for_cd = None
+
+                        if out_for_cd is not None:
+                            # b) Target für Chamfer: [B,T,4,H,W] = [range, x, y, z]
+                            target_for_cd = torch.cat(
+                                [
+                                    future_ranges.unsqueeze(2).to(args.device),  # [B,T,1,H,W]
+                                    future_xyz.to(args.device),                 # [B,T,3,H,W]
+                                ],
+                                dim=2,
+                            )  # -> [B,T,4,H,W]
+
+                            # c) Downsampling-Parameter (aus TEST-Config, fallback -1 = kein Downsampling)
+                            n_ds = cfg.get("TEST", {}).get("N_DOWNSAMPLED_POINTS_CD", -1)
+
+                            cd_dict, cd_tensor = chamfer_metric(
+                                out_for_cd,      # erwartet "rv" und "mask_logits"
+                                target_for_cd,
+                                n_ds,            # n_samples / n_downsampled_points
+                            )
+                            # cd_tensor: [T, B] – Chamfer pro Zeitschritt & Batch
+                            cd_mean = cd_tensor.mean().item()
+
+                            if cfg["train_params"]["with_save"]:
+                                # globaler Chamfer-Wert
+                                writer.add_scalar(
+                                    "val/chamfer_distance/mean", cd_mean, step
+                                )
+
+                                # optional: pro Zukunfts-Horizont (t0, t1, ...)
+                                for t_idx, cd_val in cd_dict.items():
+                                    writer.add_scalar(
+                                        f"val/chamfer_distance/t{t_idx}",
+                                        cd_val.item(),
+                                        step,
+                                    )
                 
                 print(f"inference took {curr_time} ms.\tloss: {float(nll):.6f}\t@Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}")
                 
