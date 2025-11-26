@@ -34,6 +34,7 @@ import threading
 import multiprocessing as mp
 
 import matplotlib
+import math
 #matplotlib.use('TkAgg')   # or 'Qt5Agg' if you have Qt
 import matplotlib.pyplot as plt
 import open3d as o3d
@@ -264,7 +265,8 @@ def main(args):
         try:
             cfg = yaml.safe_load(file)
         except yaml.YAMLError as exc:
-            print(exc)
+            print("[ERROR] Could not load config:", exc)
+            return
 
     # --- NEU: globales Seeding & Determinismus ---
     seed = cfg.get('train_params', {}).get('random_seed', None)
@@ -292,17 +294,57 @@ def main(args):
     from models import build_model
     name = cfg["model_params"].get("name", "swin")   # "swin" | "acc_m1" | "acc_m2"
     model = build_model(name, cfg)
-    
+
     base = args.data_dir  # parent directory
     all_seqs = make_sequences(base)
-    # Prepare rotary splits
-    rotary_loaders = build_dataloaders(
-        all_seqs,
-        cfg,
-        args.dataloader_device,
-        split_type='rotary' # zu predefined umändern und unten den scheduler der auskommentiert ist dann verwenden. test dataset ist 0006
-    )  # list of (holdout_id, train_loader, val_loader)
-    n_splits = len(rotary_loaders)
+
+    # --- Split-Config aus YAML lesen ---
+    data_cfg = cfg.get("data_params", {})
+    split_type = data_cfg.get("split_type", "rotary")
+    predefined_splits = data_cfg.get("predefined_splits", None)
+
+    if split_type == "rotary":
+        rotary_loaders = build_dataloaders(
+            all_seqs,
+            cfg,
+            args.dataloader_device,
+            split_type='rotary'
+        )  # list of (holdout_id, train_loader, val_loader)
+        n_splits = len(rotary_loaders)
+
+        # Für Scheduler: min. Länge aller Trainingsloader
+        steps_per_epoch = min(len(tl) for (_, tl, _) in rotary_loaders)
+
+        print(f"[DATA] Using ROTARY split with {n_splits} folds.")
+
+    elif split_type == "predefined":
+        # Splits müssen in data_params.predefined_splits vorhanden sein
+        if predefined_splits is None:
+            raise ValueError(
+                "split_type='predefined', aber data_params.predefined_splits fehlt in der Config!"
+            )
+
+        loaders = build_dataloaders(
+            all_seqs,
+            cfg,
+            args.dataloader_device,
+            split_type='predefined',
+            predefined_splits=predefined_splits
+        )
+
+        # Kann (train, val) oder (train, val, test) zurückgeben
+        if len(loaders) == 3:
+            train_loader, val_loader, test_loader = loaders
+            print(f"[DATA] Using PREDEFINED split with TRAIN/VAL/TEST.")
+        else:
+            train_loader, val_loader = loaders
+            test_loader = None
+            print(f"[DATA] Using PREDEFINED split with TRAIN/VAL.")
+
+        steps_per_epoch = len(train_loader)
+
+    else:
+        raise ValueError(f"Unknown split_type: {split_type}")
 
     # model definition
     # from torchvision baseline "Video Classification" models, see https://pytorch.org/vision/main/models.html#video-classification
@@ -326,55 +368,41 @@ def main(args):
     
     # Optimizer: AdamW with decoupled weight decay, 
     # see https://yassin01.medium.com/adam-vs-adamw-understanding-weight-decay-and-its-impact-on-model-performance-b7414f0af8a1
+
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=cfg["train_params"].get("start_learning_rate", 1e-3),
-        weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
+    model.parameters(),
+    lr=cfg["train_params"].get("learning_rate", 
+                               cfg["train_params"].get("start_learning_rate", 5e-4)),
+    weight_decay=cfg["train_params"].get("weight_decay", 1e-4)
     )
-    # num_epochs = cfg["train_params"].get("num_epochs", 50)
-    # steps_per_epoch = len(dataloader_train)
-    # total_steps = max(1, num_epochs * steps_per_epoch)
+    
+    # ------------------------------------------------------------
+    # Per-Batch Scheduler: Warmup + Cosine Decay (LambdaLR)
+    # ------------------------------------------------------------
+    num_epochs = cfg["train_params"].get("num_total_epochs",
+                                        cfg["train_params"].get("num_epochs", 50))
 
-    # warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
-    # warmup_steps = max(1, warmup_epochs * steps_per_epoch)
+    # Zahl der Training-Batches pro Epoch aus Rotary-Splits
+    #steps_per_epoch = min(len(tl) for (_, tl, _) in rotary_loaders)
+    total_steps = max(1, num_epochs * steps_per_epoch)
 
-    # base_lr = optimizer.param_groups[0]["lr"]
-    # eta_min = cfg["train_params"].get("learning_rate_min", 5e-6)
-    # warmup_start = 0.3  # start at 30% of base LR
+    warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
+    warmup_steps = max(1, warmup_epochs * steps_per_epoch)
 
-    # def lr_lambda(global_step: int):
-    #     if global_step < warmup_steps:  # linear warmup (per-iter)
-    #         return warmup_start + (1.0 - warmup_start) * (global_step / warmup_steps)
-    #     # cosine decay to eta_min
-    #     t = (global_step - warmup_steps) / max(1, total_steps - warmup_steps)
-    #     cos = 0.5 * (1 + math.cos(math.pi * t))
-    #     return (eta_min / base_lr) + (1 - eta_min / base_lr) * cos
+    base_lr = optimizer.param_groups[0]["lr"]
+    eta_min = cfg["train_params"].get("learning_rate_min", 5e-6)
+    warmup_start = 0.3  # 30% des Start-LR
 
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    def lr_lambda(step: int):
+        # 1) Warmup linear
+        if step < warmup_steps:
+            return warmup_start + (1.0 - warmup_start) * (step / warmup_steps)
+        # 2) Cosine Decay
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cos = 0.5 * (1 + math.cos(math.pi * t))
+        return (eta_min / base_lr) + (1 - eta_min / base_lr) * cos
 
-    # Linear warm-up over first N epochs
-    num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 5)
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,   # start at 10% of base LR
-        end_factor=1.0,     # ramp to 100% of base LR
-        total_iters=num_warmup_epochs
-    )
-    #Cosine annealing with restarts thereafter
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=15,           # first restart after T_0 epochs
-        T_mult=1,         # no increase in cycle length
-        eta_min=1e-6      # floor LR
-    )  
-    #Chain them: warm-up then cosine restarts
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[num_warmup_epochs]
-    ) 
-
-    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # TensorBoard
     if cfg["train_params"]["with_save"]:
@@ -473,12 +501,26 @@ def main(args):
     # else:
     #     train_loader, val_loader = result
     # print("Predefined split loaders ready.")
-    
+        global_step = 0  # falls noch nicht vorher definiert
+
     for epoch in range(cfg["train_params"]["num_total_epochs"]):
-        # Select split based on epoch (round-robin)
-        split_idx = epoch % n_splits
-        holdout_id, train_loader, val_loader = rotary_loaders[split_idx]
-        print(f"Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}, training on sequence {holdout_id}")
+
+        if split_type == "rotary":
+            # Leave-one-out pro Epoch
+            split_idx = epoch % n_splits
+            holdout_id, train_loader, val_loader = rotary_loaders[split_idx]
+            print(
+                f"Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}, "
+                f"training on sequence {holdout_id} (ROTARY split)"
+            )
+        else:
+            # PREDEFINED: immer gleiche Loader
+            holdout_id = None
+            
+            print(
+            f"\nEpoch {epoch+1}/{cfg['train_params']['num_total_epochs']} - "
+            f"TRAIN on {predefined_splits['train']}  |  VAL on {predefined_splits['val']}"
+            )
 
         total_loss = 0.0
         total_loss_val = 0.0
@@ -537,8 +579,8 @@ def main(args):
             optimizer.zero_grad()
             loss_tensor.backward()
             optimizer.step()
+            scheduler.step()
 
-            #scheduler.step()
             B, T, H, W = future_ranges.shape
             # if ok:
             #     phi_grid, theta_grid = make_angle_grids(H, W, theta_range=[-np.pi/8, np.pi/8])
@@ -994,7 +1036,7 @@ def main(args):
             writer.add_scalar('Loss/Validation/Epoch', avg_loss_val, epoch)
             
         # Update learning rate scheduler
-        scheduler.step()
+        # scheduler.step()
         # scheduler.step(avg_loss_val)  # using ReduceLROnPlateau
         
             

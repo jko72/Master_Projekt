@@ -13,6 +13,15 @@ model_params: {
   preserve_ray_position: true,
   with_attention: false
 }
+data_params: {
+  split_type: "predefined",   # "rotary" oder "predefined"
+
+  predefined_splits: {
+    train: ["0000", "0001", "0002", "0003", "0005", "0007", "0008"],
+    val:   ["0004"],
+    test:  ["0006"]
+  }
+}
 train_params: {
   with_resume_train: false,
   pre_train_weights: null, #"/home/koehlbrandt/workspace/LiDARSensorForecaster/LidarGaussianVideoView/logs/25-10-29_12-07-24/weights/model_final.pt",
@@ -20,7 +29,7 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 1, # Test: 1, Standard: 8 bis 12, 
+  num_total_epochs: 15, # Test: 1, Standard: 8 bis 12, 
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
@@ -45,7 +54,7 @@ train_params: {
 
   output_horizons: [0, 10, 20], #Vorhersage für 3s [0, 10, 20, 30]
   confidence_levels: [0.95, 0.68],
-  final_learning_rate: 5.e-5,
+  learning_rate_min: 5.e-6, # Finale Learningrate, 5.e-5
   clip_grad_norm: 5.0,
   dataloader_num_workers: 2,  # 4
   dataloader_prefetch: 2,
@@ -59,7 +68,7 @@ train_params: {
   auto_save_step: 5,
   logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/logs",
   tensorboard_log_interval: 10,
-  compute_chamfer_metric: true,   # Chamfer-Logging an/aus
+  compute_chamfer_metric: false,   # Chamfer-Logging an/aus
   chamfer_metric_interval: 30,     # nur jedes X. Val-Batch Chamfer berechnen
 
   # LOGGING
@@ -68,10 +77,5 @@ train_params: {
   LOSS_WEIGHT_CHAMFER_DISTANCE: 0.0,
   LOSS_WEIGHT_RANGE_VIEW: 1.0,
   LOSS_WEIGHT_MASK: 1.0,
-}
-
-TEST: {
-  ...
-  N_DOWNSAMPLED_POINTS_CD: 20000  # z.B. 20k Punkte für Chamfer (Performance)
 }
 
