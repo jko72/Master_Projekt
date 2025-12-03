@@ -74,22 +74,32 @@ def compute_range_metrics(pred_rv: torch.Tensor,
         else:
             bin_maes[key] = torch.tensor(0.0, device=device)
 
-    # Zeitliche Stabilität
+    # Zeitliche Stabilität: TV, Geschwindigkeit, Beschleunigung
     if T >= 2:
-        dt = (pred_rv[:,1:] - pred_rv[:,:-1]).abs()
-        valid_t = (valid[:,1:] & valid[:,:-1]).float()
+        # erste Ableitung (Geschwindigkeit)
+        dt = (pred_rv[:, 1:] - pred_rv[:, :-1]).abs()        # [B,T-1,H,W]
+        valid_t = (valid[:, 1:] & valid[:, :-1]).float()     # [B,T-1,H,W]
         tv_time = _masked_mean(dt, valid_t)
 
-        v_pred = pred_rv[:,1:] - pred_rv[:,:-1]
-        v_gt   = gt_rv[:,1:]   - gt_rv[:,:-1]
+        v_pred = pred_rv[:, 1:] - pred_rv[:, :-1]            # [B,T-1,H,W]
+        v_gt   = gt_rv[:, 1:]   - gt_rv[:, :-1]              # [B,T-1,H,W]
         vel_mae = _masked_mean((v_pred - v_gt).abs(), valid_t)
 
-        acc_mae = torch.tensor(0.0, device=device)
+        # zweite Ableitung (Beschleunigung) nur, wenn mindestens 3 Zeitpunkte vorhanden
         if T >= 3:
-            a_pred = v_pred[:,1:] - v_pred[:,:-1]
-            a_gt   = v_gt[:,1:]   - v_gt[:,:-1]
-            valid_a = (valid[:,2:] & valid[:,1:] & valid[:,:-1]).float()
+            a_pred = v_pred[:, 1:] - v_pred[:, :-1]          # [B,T-2,H,W]
+            a_gt   = v_gt[:, 1:]   - v_gt[:, :-1]            # [B,T-2,H,W]
+
+            # Maske für 3 aufeinanderfolgende gültige Zeitpunkte:
+            # valid0 -> t=0..T-3, valid1 -> t=1..T-2, valid2 -> t=2..T-1
+            valid0 = valid[:, :-2]
+            valid1 = valid[:, 1:-1]
+            valid2 = valid[:, 2:]
+            valid_a = (valid0 & valid1 & valid2).float()     # [B,T-2,H,W]
+
             acc_mae = _masked_mean((a_pred - a_gt).abs(), valid_a)
+        else:
+            acc_mae = torch.tensor(0.0, device=device)
     else:
         tv_time = torch.tensor(0.0, device=device)
         vel_mae = torch.tensor(0.0, device=device)
@@ -98,11 +108,17 @@ def compute_range_metrics(pred_rv: torch.Tensor,
     valid_ratio_mean = valid.float().mean()
 
     return {
-        "mae_mean": mae_mean, "rmse_mean": rmse_mean, "logrmse_mean": logrmse_mean,
-        "mae_t": mae_t, "rmse_t": rmse_t,
-        "tv_time": tv_time, "vel_mae": vel_mae, "acc_mae": acc_mae,
+        "mae_mean": mae_mean,
+        "rmse_mean": rmse_mean,
+        "logrmse_mean": logrmse_mean,
+        "mae_t": mae_t,
+        "rmse_t": rmse_t,
+        "tv_time": tv_time,
+        "vel_mae": vel_mae,
+        "acc_mae": acc_mae,
         "valid_ratio_mean": valid_ratio_mean,
-        **accs, **bin_maes
+        **accs,
+        **bin_maes,
     }
 
 # --- Optional Fallbacks für fehlende Pakete ---

@@ -1,10 +1,10 @@
 model_params: {
-  name: "acc_m1", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
+  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
   use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
   mdn_num_gaussians: 3, # 9
-  input_horizon: 10,
-  forecast_horizon: 3, # auf 4 erhöhen für vorhersage auf 3s
+  input_horizon: 5, # voher 10
+  forecast_horizon: 5, #  auf 4 erhöhen für vorhersage auf 3s, vorher 3
   dropout_prob: 0.3,
   mdn_dropout_prob: 0.2,
   grid_height: 64, #64
@@ -29,7 +29,7 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 15, # Test: 1, Standard: 8 bis 12, 
+  num_total_epochs: 1, # Test: 1, Standard: 8 bis 12, 
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
@@ -52,7 +52,7 @@ train_params: {
   use_density_threshold: true,
   density_threshold: 0.285,
 
-  output_horizons: [0, 10, 20], #Vorhersage für 3s [0, 10, 20, 30]
+  output_horizons: [1, 2, 3, 4, 5], #Vorhersage für 3s [0, 10, 20, 30]
   confidence_levels: [0.95, 0.68],
   learning_rate_min: 5.e-6, # Finale Learningrate, 5.e-5
   clip_grad_norm: 5.0,
