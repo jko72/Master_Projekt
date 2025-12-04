@@ -19,7 +19,7 @@ except ModuleNotFoundError:
 
 #from utils.projection import projection
 try:
-    from utils.projection import projection
+    from models.projection import projection
 except ModuleNotFoundError:
     class projection:
         def __init__(self, cfg=None):

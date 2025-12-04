@@ -5,7 +5,7 @@ import random
 
 #from utils.projection import projection
 try:
-    from utils.projection import projection
+    from models.projection import projection
 except ModuleNotFoundError:
     class projection:
         def __init__(self, cfg=None):
@@ -20,7 +20,6 @@ except ModuleNotFoundError:
             # Dummy-Valid-Punkte (keine echte Projektion)
             pts = torch.nonzero(range_view > 0, as_tuple=False).float()
             return pts
-#from pyTorchChamferDistance.chamfer_distance import ChamferDistance
 try:
     from pyTorchChamferDistance.chamfer_distance import ChamferDistance
 except ModuleNotFoundError:

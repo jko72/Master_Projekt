@@ -10,6 +10,9 @@ model_params: {
   grid_height: 64, #64
   grid_width: 512, #512
   grid_channels: 8,
+  FOV_UP: 3,
+  FOV_DOWN: -25,
+  MASK_THRESHOLD: 0.5,
   preserve_ray_position: true,
   with_attention: false
 }
@@ -68,8 +71,8 @@ train_params: {
   auto_save_step: 5,
   logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/logs",
   tensorboard_log_interval: 10,
-  compute_chamfer_metric: false,   # Chamfer-Logging an/aus
-  chamfer_metric_interval: 30,     # nur jedes X. Val-Batch Chamfer berechnen
+  compute_chamfer_metric: true,   # Chamfer-Logging an/aus
+  chamfer_metric_interval: 10,     # nur jedes X. Val-Batch Chamfer berechnen
 
   # LOGGING
   plot_examples: true,  # visualize while training
