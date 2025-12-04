@@ -1038,7 +1038,130 @@ def main(args):
         # Update learning rate scheduler
         # scheduler.step()
         # scheduler.step(avg_loss_val)  # using ReduceLROnPlateau
-        
+
+    # ----------------------------------------------------
+    # Finaler Test-Loop (nur einmal am Ende des Trainings)
+    # ----------------------------------------------------
+    if split_type == "predefined" and 'test_loader' in locals() and test_loader is not None:
+        print("\n===== RUN FINAL EVALUATION ON TEST SET =====")
+        model.eval()
+        last_epoch_idx = cfg["train_params"]["num_total_epochs"] - 1
+
+        test_loss_sum = 0.0
+        test_nll_sum = 0.0
+        test_batches = 0
+
+        # Aggregatoren für Range-View-Metriken (ACC)
+        metrics_sums = {
+            "mae_mean": 0.0,
+            "rmse_mean": 0.0,
+            "logrmse_mean": 0.0,
+            "acc_0.1_mean": 0.0,
+            "acc_0.2_mean": 0.0,
+            "acc_0.5_mean": 0.0,
+            "tv_time": 0.0,
+            "vel_mae": 0.0,
+            "acc_mae": 0.0,
+            "valid_ratio_mean": 0.0,
+        }
+
+        with torch.no_grad():
+            for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(
+                    tqdm(test_loader, total=len(test_loader))):
+
+                # hist_xyz: [B, T_in, 3/4, H, W]
+                # future_xyz: [B, T_out, 3, H, W]
+                # future_ranges: [B, T_out, H, W]
+                hist_xyz = hist_xyz.to(args.device)
+                future_xyz = future_xyz.to(args.device)
+                future_ranges = future_ranges.to(args.device)
+
+                # ACC-Modelle erwarten nur xyz (3 Kanäle)
+                if hist_xyz.shape[2] == 4:
+                    hist_xyz = hist_xyz[:, :, :3, :, :]
+
+                # Vorwärtsdurchlauf
+                start_time = time.perf_counter()
+                output = model(hist_xyz)
+                curr_time = (time.perf_counter() - start_time) * 1000.0  # ms
+
+                # -------- Loss-Berechnung (wie im Validation-Loop) --------
+                if cfg["model_params"].get("use_mdn", True):
+                    mixture, ok = model.build_mixture(cfg, output)
+                    if not ok:
+                        continue
+
+                    target = future_xyz  # Loss arbeitet auf xyz
+                    loss_dict = criterion(output, target, mode="test", epoch_number=last_epoch_idx)
+                    loss_tensor = loss_dict["loss"]
+                    nll = loss_dict.get("loss_range_view", loss_tensor).item()
+                else:
+                    # Direkte Range-Regression ohne Gaußparameter
+                    loss_tensor = torch.nn.functional.l1_loss(
+                        output, future_ranges.to(args.device)
+                    )
+                    nll = loss_tensor.item()
+
+                test_loss_sum += loss_tensor.item()
+                test_nll_sum += nll
+                test_batches += 1
+
+                # ---------------- ACC-Range-Metriken berechnen ----------------
+                # Ziel-Range braucht Form [B,T,1,H,W]
+                future_for_metrics = future_ranges
+                if future_for_metrics.ndim == 4:
+                    future_for_metrics = future_for_metrics.unsqueeze(2)
+                future_for_metrics = future_for_metrics.to(args.device)
+
+                # output kann dict (mit 'rv') ODER Tensor sein
+                if isinstance(output, dict) and ("rv" in output):
+                    out_for_metrics = output
+                elif torch.is_tensor(output):
+                    out_for_metrics = {"rv": output}
+                else:
+                    out_for_metrics = None  # sollte nicht passieren
+
+                if out_for_metrics is not None:
+                    # Kein Writer -> gibt dict m zurück
+                    m = model.compute_and_log_metrics(
+                        output=out_for_metrics,
+                        future=future_for_metrics,
+                        writer=None,
+                        prefix="test"
+                    )
+                    # Wichtige Metriken aufsummieren
+                    for k in metrics_sums.keys():
+                        if k in m:
+                            metrics_sums[k] += float(m[k])
+
+        if test_batches > 0:
+            test_loss_mean = test_loss_sum / test_batches
+            test_nll_mean = test_nll_sum / test_batches
+            metrics_mean = {k: v / test_batches for k, v in metrics_sums.items()}
+        else:
+            test_loss_mean = float("nan")
+            test_nll_mean = float("nan")
+            metrics_mean = {k: float("nan") for k in metrics_sums.keys()}
+
+        # ---------- Optional: alles einmal in TensorBoard loggen ----------
+        if cfg["train_params"].get("with_save", False):
+            # x-Achse: "letzter Step" – hier einfach gesamte Train-Steps
+            final_step = cfg["train_params"]["num_total_epochs"] * len(train_loader)
+
+            writer.add_scalar("test/loss", test_loss_mean, final_step)
+            writer.add_scalar("test/nll",  test_nll_mean,  final_step)
+
+            # gleiche Tags wie bei val/train, aber mit Prefix "test"
+            writer.add_scalar("test/mae_mean",         metrics_mean["mae_mean"], final_step)
+            writer.add_scalar("test/rmse_mean",        metrics_mean["rmse_mean"], final_step)
+            writer.add_scalar("test/logrmse_mean",     metrics_mean["logrmse_mean"], final_step)
+            writer.add_scalar("test/acc_0.1_mean",     metrics_mean["acc_0.1_mean"], final_step)
+            writer.add_scalar("test/acc_0.2_mean",     metrics_mean["acc_0.2_mean"], final_step)
+            writer.add_scalar("test/acc_0.5_mean",     metrics_mean["acc_0.5_mean"], final_step)
+            writer.add_scalar("test/tv_time",          metrics_mean["tv_time"], final_step)
+            writer.add_scalar("test/vel_mae",          metrics_mean["vel_mae"], final_step)
+            writer.add_scalar("test/acc_mae",          metrics_mean["acc_mae"], final_step)
+            writer.add_scalar("test/valid_ratio_mean", metrics_mean["valid_ratio_mean"], final_step)    
             
     if cfg["train_params"]["with_save"]:
         torch.save(model.state_dict(), os.path.join(save_path, "weights", "model_final.pt"))
