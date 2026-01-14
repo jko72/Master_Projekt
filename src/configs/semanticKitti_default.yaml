@@ -1,4 +1,4 @@
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticTHAB/sequences
+dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
 
 model_params: {
   name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
@@ -11,20 +11,24 @@ model_params: {
   mdn_dropout_prob: 0.2,
   grid_height: 64, #64
   grid_width: 512, #512
+
+  org_grid_height: 64, #64
+  org_grid_width: 2048, #512
+
   grid_channels: 8,
   FOV_UP: 11.25,
   FOV_DOWN: -11.25,
   MASK_THRESHOLD: 0.5,
-  preserve_ray_position: true,
+  preserve_ray_position: false, #true
   with_attention: true
 }
 data_params: {
   split_type: "predefined",   # "rotary" oder "predefined"
 
   predefined_splits: {
-    train: ["0000", "0001", "0002", "0003", "0005", "0007", "0008"],
-    val:   ["0004"],
-    test:  ["0006"]
+    train: ["00", "01", "02", "03", "04", "05", "06", "07", "09", "10"],
+    val:   ["08"],
+    test:  []
   }
 }
 train_params: {

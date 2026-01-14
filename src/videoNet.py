@@ -295,8 +295,7 @@ def main(args):
     name = cfg["model_params"].get("name", "swin")   # "swin" | "acc_m1" | "acc_m2"
     model = build_model(name, cfg)
 
-    base = args.data_dir  # parent directory
-    all_seqs = make_sequences(base)
+    all_seqs = make_sequences(cfg["dataset_path"])
 
     # --- Split-Config aus YAML lesen ---
     data_cfg = cfg.get("data_params", {})
@@ -413,7 +412,7 @@ def main(args):
         writer = SummaryWriter(save_path)
         #save_path ="/home/devuser/workspace/LidarGaussianVideoView/logs"
         # save current training config file
-        with open(os.path.join(save_path, "thab_default.yaml"), "w") as file:
+        with open(os.path.join(save_path, "config.yaml"), "w") as file:
             yaml.safe_dump(
                 cfg, 
                 file,
@@ -524,11 +523,19 @@ def main(args):
 
         total_loss = 0.0
         total_loss_val = 0.0
+        t_prev = time.perf_counter()
         # --- Training Loop ---
         for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(tqdm(iterable=train_loader, total=len(train_loader))):
             # hist_xyz      = [B, T_in,     3,  H, W], [B, T_in,     4,  H, W]
             # future_xyz    = [B, T_out,    3,  H, W]
             # future_ranges = [B, T_out,        H, W]
+            t_now = time.perf_counter()
+            dt_wait = t_now - t_prev
+            if batch_idx in (0, 1, 2, 5, 10, 20, 50, 100):
+                print(f"[DL WAIT] batch={batch_idx} wait={dt_wait:.3f}s")
+            #if batch_idx % 50 == 0:
+            #    print(f"[DL WAIT] batch={batch_idx} wait={dt_wait:.3f}s")
+            t_prev = time.perf_counter()
         
             model.train()
             #model.eval()
@@ -1178,15 +1185,9 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/devuser/workspace/data/datasets/SemanticTHAB/sequences"
-    )
-    
-    parser.add_argument(
         "--cfg_path",
         type=str,
-        default="/home/devuser/workspace/src/configs/thab_default.yaml"
+        default="/home/devuser/workspace/src/configs/semanticKitti_default.yaml" # thab_default  semanticKitti_default
     )
     
     parser.add_argument(
@@ -1198,7 +1199,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataloader_device",
         type=str,
-        default="cuda"   # cpu or cuda
+        default="cpu"   # cpu or cuda
     )
     
     args = parser.parse_args()

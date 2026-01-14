@@ -16,10 +16,14 @@ class RandomWindowSeqDataset(Dataset):
         self.seqs          = sequences
         self.history       = cfg['model_params']['input_horizon']
         self.future_offs   = cfg['train_params']['output_horizons']
-        self.max_off       = max(self.future_offs)
+        self.max_off       = max(self.future_offs)  # offset in frames
         self.device        = device
+
         self.out_H         = cfg['model_params']['grid_height']
         self.out_W         = cfg['model_params']['grid_width']
+        self.org_H         = cfg['model_params'].get('org_grid_height', 64)
+        self.org_W         = cfg['model_params'].get('org_grid_width', 512)
+
         self.with_projection = cfg['model_params']['preserve_ray_position']
         self.theta_range = theta_range
 
@@ -38,24 +42,44 @@ class RandomWindowSeqDataset(Dataset):
         s_id, start = self.windows[idx]
         seq_paths = self.seqs[s_id]['paths']
         seq_poses = self.seqs[s_id]['poses']  # list of numpy 4×4
-        T, H_org, W_org = self.history, 128, 2048   # TODO: no hard encoding
+        T, H_org, W_org = self.history, self.org_H, self.org_W
 
         # --- 1) load & stack history xyz ---
         hist_xyz = []
         for j in range(start, start+T):
             pc_path, _ = seq_paths[j]
             # the (x, y, z, intensity) are stored in binary
-            xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1,4)
-            pts = xyzi[:, :-1].reshape(H_org, W_org, 3)  # [H_org=128, W_org=2048, 3]
-            xyz = torch.from_numpy(pts).permute(2, 0, 1).to(self.device)
+            #xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1,4)
+            #pts = torch.from_numpy(xyzi[:, :3]).to(self.device)  # (N,3)
+            #pts = xyzi[:, :-1] # last dim dorpped only xyz relevant
+            #pts = xyzi[:, :-1].reshape(H_org, W_org, 3)
+            #xyz = torch.from_numpy(pts).permute(2, 0, 1).to(self.device)
             
             # project image to target sensor configuration (self.out_H: #layers, self.out_W: #horizontal laser positions)
-            xyz = spherical_projection(
-                xyz, self.out_H, self.out_W,
-                theta_range=self.theta_range,
-                device=self.device
-            )
+            # xyz = spherical_projection(
+            #     xyz, self.out_H, self.out_W,
+            #     theta_range=self.theta_range,
+            #     device=self.device
+            # )   # TODO: use new numpy version and exchange torch tensor xyz with xyzi
             
+            #xyz = spherical_projection(
+            #    pts, self.out_H, self.out_W,
+            #    theta_range=self.theta_range,
+            #    #device=self.device
+            #)
+            xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1, 4)
+            pc_np = xyzi[:, :3].astype(np.float32)   # NumPy, CPU
+
+            pj_img, _, _, _ = spherical_projection(
+                pc_np,
+                height=self.out_H,
+                width=self.out_W,
+                theta_range=self.theta_range
+            )  # NumPy!
+
+            xyz = torch.from_numpy(pj_img).permute(2,0,1).to(self.device)
+
+
             hist_xyz.append(xyz)
         hist_xyz = torch.stack(hist_xyz, dim=0)  # [T,3,H,W]
         # mask, where projected points/pixels are out of scope
@@ -94,7 +118,7 @@ class RandomWindowSeqDataset(Dataset):
             hist_pc = spherical_projection(
                 hist_pc, self.out_H, self.out_W,
                 theta_range=self.theta_range,
-                device=self.device
+                #device=self.device
             )                                                         # [T,3,out_H,out_W]
 
         # --- 4) align & project futures, plus range images ---
@@ -102,16 +126,29 @@ class RandomWindowSeqDataset(Dataset):
         for off in self.future_offs:
             j = start + T - 1 + off
             pc_path, _ = seq_paths[j]
-            xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1,4)
-            pts = xyzi[:, :-1].reshape(H_org, W_org, 3)  # [H_org=128, W_org=2048, 3]
-            xyz = torch.from_numpy(pts).permute(2, 0, 1).to(self.device)
+            #xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1,4)
+            #pts = torch.from_numpy(xyzi[:, :3]).to(self.device)  # (N,3)
+            #pts = xyzi[:, :-1].reshape(H_org, W_org, 3)  # [H_org=128, W_org=2048, 3]
+            #xyz = torch.from_numpy(pts).permute(2, 0, 1).to(self.device)
             
             # project image to target sensor configuration (self.out_H: #layers, self.out_W: #horizontal laser positions)
-            xyz = spherical_projection(
-                xyz, self.out_H, self.out_W,
-                theta_range=self.theta_range,
-                device=self.device
-            )
+            #xyz = spherical_projection(
+            #    xyz, self.out_H, self.out_W,
+            #    theta_range=self.theta_range,
+            #    #device=self.device
+            #)
+            xyzi = np.fromfile(pc_path, dtype=np.float32).reshape(-1, 4)
+            pc_np = xyzi[:, :3].astype(np.float32)   # NumPy, CPU
+
+            pj_img, _, _, _ = spherical_projection(
+                pc_np,
+                height=self.out_H,
+                width=self.out_W,
+                theta_range=self.theta_range
+            )  # NumPy!
+
+            xyz = torch.from_numpy(pj_img).permute(2,0,1).to(self.device)
+
             # mask, where projected points/pixels are out of scope
             mask = (xyz == 0).all(dim=0, keepdim=True)
             H, W = xyz.shape[-2:]
@@ -141,7 +178,7 @@ class RandomWindowSeqDataset(Dataset):
                 future_pc = spherical_projection(
                     future_pc, self.out_H, self.out_W,
                     theta_range=self.theta_range,
-                    device=self.device
+                    #device=self.device
                 )
             future_xyzs.append(future_pc)                       # [3,out_H,out_W]
             future_ranges.append(torch.norm(future_pc, dim=0)) # [out_H,out_W]

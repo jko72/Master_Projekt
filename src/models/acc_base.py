@@ -232,29 +232,29 @@ class BasePredictionModel(pl.LightningModule):
         # Paper-Style Metrik-Name
         # (Range-View L1 = MAE über gültige Pixel)
         # ------------------------------
-        writer.add_scalar(f"{prefix}/range_view_metric_L1",
+        writer.add_scalar(f"paper/{prefix}/range_view_metric_L1",
                           m["mae_mean"].item(), step)
 
         # Scalars
-        writer.add_scalar(f"{prefix}/mae_mean",  m["mae_mean"].item(),  global_step or 0)
-        writer.add_scalar(f"{prefix}/rmse_mean", m["rmse_mean"].item(), global_step or 0)
-        writer.add_scalar(f"{prefix}/logrmse_mean", m["logrmse_mean"].item(), global_step or 0)
+        writer.add_scalar(f"metrics/{prefix}/mae_mean",  m["mae_mean"].item(),  step)
+        writer.add_scalar(f"metrics/{prefix}/rmse_mean", m["rmse_mean"].item(), step)
+        writer.add_scalar(f"metrics/{prefix}/logrmse_mean", m["logrmse_mean"].item(), step)
 
-        for t in range(m["mae_t"].numel()):
-            writer.add_scalar(f"{prefix}/mae_t/step_{t}",  m["mae_t"][t].item(),  global_step or 0)
-            writer.add_scalar(f"{prefix}/rmse_t/step_{t}", m["rmse_t"][t].item(), global_step or 0)
+        #for t in range(m["mae_t"].numel()):
+        #    writer.add_scalar(f"metrics/{prefix}/mae_t/step_{t}",  m["mae_t"][t].item(),  step)
+        #    writer.add_scalar(f"metrics/{prefix}/rmse_t/step_{t}", m["rmse_t"][t].item(), step)
 
-        for thr in (0.1, 0.2, 0.5):
-            writer.add_scalar(f"{prefix}/acc_{thr}_mean", m[f"acc_{thr}_mean"].item(), global_step or 0)
+        #for thr in (0.1, 0.2, 0.5):
+        #    writer.add_scalar(f"metrics/{prefix}/acc_{thr}_mean", m[f"acc_{thr}_mean"].item(), step)
 
         for k, v in m.items():
             if k.startswith("mae_bin_"):
-                writer.add_scalar(f"{prefix}/{k}", v.item(), global_step or 0)
+                writer.add_scalar(f"metrics/{prefix}/{k}", v.item(), step)
 
-        writer.add_scalar(f"{prefix}/tv_time", m["tv_time"].item(), global_step or 0)
-        writer.add_scalar(f"{prefix}/vel_mae", m["vel_mae"].item(), global_step or 0)
-        writer.add_scalar(f"{prefix}/acc_mae", m["acc_mae"].item(), global_step or 0)
-        writer.add_scalar(f"{prefix}/valid_ratio/mean", m["valid_ratio_mean"].item(), global_step or 0)
+        writer.add_scalar(f"metrics/{prefix}/tv_time", m["tv_time"].item(), step)
+        writer.add_scalar(f"metrics/{prefix}/vel_mae", m["vel_mae"].item(), step)
+        writer.add_scalar(f"metrics/{prefix}/acc_mae", m["acc_mae"].item(), step)
+        writer.add_scalar(f"metrics/{prefix}/valid_ratio/mean", m["valid_ratio_mean"].item(), step)
 
         # Optionale Beispiel-Images (Batch 0, t=0)
         #try:

@@ -42,7 +42,10 @@ def parse_poses(filename, calibration):
     
     poses = []
     
-    Tr = calibration["Tr"]  # extrinsic calibration matrix from velodyne to camera
+    if calibration != None:
+        Tr = calibration["Tr"]  # extrinsic calibration matrix from velodyne to camera
+    else:
+        Tr = np.eye(4, dtype=np.float64)
     for line in poses_file.split('\n'):
         if not line.strip():    # removes leading and trailing whitespace -> if empty skip
             continue
