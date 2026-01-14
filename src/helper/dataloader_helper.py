@@ -141,7 +141,7 @@ def build_dataloaders(seqs, cfg, device,
                 ds_val,
                 batch_size=cfg['train_params']['batch_size'],
                 shuffle=False,
-                num_workers=0,
+                num_workers=cfg['train_params']['batch_size'],
                 pin_memory=pin_memory
             )
             loaders.append((holdout, loader_train, loader_val))
@@ -164,7 +164,7 @@ def build_dataloaders(seqs, cfg, device,
             ds_val,
             batch_size=cfg['train_params']['batch_size'],
             shuffle=False,
-            num_workers=0,
+            num_workers=cfg['train_params']['batch_size'],
             pin_memory=pin_memory
         )
 

@@ -350,12 +350,114 @@ def main(args):
     #model = RangeMixtureVideoModel(cfg)
 
     # load weights
-    try:
-        if os.path.isfile(cfg["train_params"]["pre_train_weights"]):    # throws TypeError if NoneType provided
-            weights = torch.load(cfg["train_params"]["pre_train_weights"])
-            model.load_state_dict(weights)
-    except Exception as ex:
-            print("no custom pretrained weights found, use default vanilla")
+    # ---- Load pretrained weights (.pt or .ckpt) --------------------------------
+    pre_path = cfg["train_params"].get("pre_train_weights", None)
+
+    if pre_path:
+        try:
+            if os.path.isfile(pre_path):
+                print(f"[CKPT] Loading pretrained weights from: {pre_path}")
+
+                ckpt = torch.load(pre_path, map_location="cpu")
+
+                # 1) get raw state_dict
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    state = ckpt["state_dict"]          # Lightning .ckpt
+                    print(f"[CKPT] Detected Lightning checkpoint with {len(state)} tensors.")
+                elif isinstance(ckpt, dict):
+                    state = ckpt                        # plain state_dict saved as dict
+                    print(f"[CKPT] Detected plain state_dict with {len(state)} tensors.")
+                else:
+                    raise TypeError(f"Unexpected checkpoint type: {type(ckpt)}")
+
+                # 2) strip common prefixes (model. / module.)
+                clean_state = {}
+                for k, v in state.items():
+                    # strip lightning / ddp prefixes
+                    if k.startswith("model."):
+                        k = k[len("model."):]
+                    if k.startswith("module."):
+                        k = k[len("module."):]
+    
+                    # IMPORTANT: map ACC core weights into adapter
+                    # Checkpoint: enc.enc.*  -> Model: acc.enc.enc.*
+                    if k.startswith("enc."):
+                        k = "acc." + k
+                    elif k.startswith("hid."):
+                        k = "acc." + k
+                    clean_state[k] = v
+
+                # 3) drop keys with incompatible shapes (PyTorch would crash otherwise)
+                model_state = model.state_dict()
+                filtered_state = {}
+                skipped = []
+                for k, v in clean_state.items():
+                    if k in model_state and model_state[k].shape != v.shape:
+                        skipped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+                        continue
+                    filtered_state[k] = v
+
+                if skipped:
+                    print("[CKPT] Skipping keys due to shape mismatch:")
+                    for k, s_ckpt, s_model in skipped:
+                        print(f"  - {k}: ckpt{s_ckpt} -> model{s_model}")
+
+                missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+                print(f"[CKPT] Load done  Missing: {len(missing)} | Unexpected: {len(unexpected)}")
+
+                # optional: print a few names to sanity-check
+                if missing:
+                    print("[CKPT] Example missing keys:", missing[:10])
+                if unexpected:
+                    print("[CKPT] Example unexpected keys:", unexpected[:10])
+            else:
+                print(f"[CKPT] pre_train_weights path not found: {pre_path}")
+        except Exception as ex:
+            print(f"[CKPT] Failed to load pretrained weights: {ex}")
+    else:
+        print("[CKPT] No pretrained weights set (pre_train_weights is None).")
+    # ---------------------------------------------------------------------------
+
+    # pre_path = cfg["train_params"].get("pre_train_weights", None)
+
+    # if pre_path and os.path.isfile(pre_path):
+    #     print(f"[CKPT] Loading pretrained weights from: {pre_path}")
+    #     ckpt = torch.load(pre_path, map_location="cpu")
+
+    #     if isinstance(ckpt, dict) and "state_dict" in ckpt:
+    #         state = ckpt["state_dict"]
+    #         print("[CKPT] Detected PyTorch-Lightning checkpoint (using 'state_dict').")
+    #     elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+    #         state = ckpt["model_state_dict"]
+    #         print("[CKPT] Using 'model_state_dict'.")
+    #     else:
+    #         state = ckpt
+    #         print("[CKPT] Using checkpoint as plain state_dict.")
+
+    #     clean_state = {}
+    #     for k, v in state.items():
+    #         if k.startswith("model."):
+    #             k = k[len("model."):]
+    #         if k.startswith("module."):
+    #             k = k[len("module."):]
+    #         clean_state[k] = v
+
+    #     missing, unexpected = model.load_state_dict(clean_state, strict=False)
+
+    #     print(f"[CKPT] Loaded weights  Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
+    #     if missing:
+    #         print(f"[CKPT] Example missing: {missing[:10]}")
+    #     if unexpected:
+    #         print(f"[CKPT] Example unexpected: {unexpected[:10]}")
+    # else:
+    #     print("[CKPT] No pretrained weights set/found -> training from scratch")        
+
+    # try:
+    #     if os.path.isfile(cfg["train_params"]["pre_train_weights"]):    # throws TypeError if NoneType provided
+    #         weights = torch.load(cfg["train_params"]["pre_train_weights"])
+    #         model.load_state_dict(weights)
+    # except Exception as ex:
+    #         print("no custom pretrained weights found, use default vanilla")
     model.to(args.device)
     criterion = Loss(cfg)
     # NEU: Chamfer-Metrik (nur als Metrik, nicht im Trainings-Loss)
@@ -524,8 +626,16 @@ def main(args):
         total_loss = 0.0
         total_loss_val = 0.0
         t_prev = time.perf_counter()
+        #batch = next(iter(train_loader))
+        #hist_xyzd, future_xyz, future_ranges = batch
+
+        #print("hist_xyzd:", hist_xyzd.shape)        # erwartet [B, T, C, H, W] torch.Size([8, 10, 4, 64, 512]
+        #print("future_xyz:", future_xyz.shape)      # [B, F, 3, H, W] torch.Size([8, 5, 3, 64, 512]
+        #print("future_ranges:", future_ranges.shape)# [B, F, H, W] torch.Size([8, 5, 64, 512]
+        #print("C (input channels) =", hist_xyzd.shape[2]) #C (input channels) = 4
+
         # --- Training Loop ---
-        for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(tqdm(iterable=train_loader, total=len(train_loader))):
+        for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(tqdm(iterable=train_loader, total=len(train_loader))):
             # hist_xyz      = [B, T_in,     3,  H, W], [B, T_in,     4,  H, W]
             # future_xyz    = [B, T_out,    3,  H, W]
             # future_ranges = [B, T_out,        H, W]
@@ -541,13 +651,17 @@ def main(args):
             #model.eval()
             
             # model's forward gives "output" of shape [B,T,H,W,3K]
-            hist_xyz = hist_xyz.to(args.device)
-            # Entfernt den 4. Kanal aus Dataloader - ACC Modelle erwarten nur xyz
-            if hist_xyz.shape[2] == 4:
-                hist_xyz = hist_xyz[:, :, :3, :, :]
+            hist_xyzd = hist_xyzd.to(args.device)
+            # Range-only input: take range channel (index 3) -> [B, T, 1, H, W]
+            if hist_xyzd.shape[2] == 4:
+                hist_in = hist_xyzd[:, :, 3:4, :, :]
+            elif hist_xyzd.shape[2] == 1:
+                hist_in = hist_xyzd
+            else:
+                raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
             
             start_time = time.perf_counter()    # fractional time in seconds
-            output = model(hist_xyz)
+            output = model(hist_in)
             curr_time = (time.perf_counter() - start_time) * 1000   # elapsed time in ms
             
             # build & compute 1D‐range loss
@@ -869,12 +983,18 @@ def main(args):
         # ===== END PAPER-METRICS: VALIDATION ACCUMULATORS =====
 
         with torch.no_grad():
-            for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(tqdm(iterable=val_loader, total=len(val_loader))):
+            for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(tqdm(iterable=val_loader, total=len(val_loader))):
                 # model's forward gives "output" of shape [B,T,H,W,3K]
-                hist_xyz = hist_xyz.to(args.device)
-                
+                hist_xyzd = hist_xyzd.to(args.device)
+                # Range-only input: take range channel (index 3)
+                if hist_xyzd.shape[2] == 4:
+                    hist_in = hist_xyzd[:, :, 3:4, :, :]   # [B,T,1,H,W]
+                elif hist_xyzd.shape[2] == 1:
+                    hist_in = hist_xyzd
+                else:
+                    raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
                 start_time = time.perf_counter()    # fractional time in seconds
-                output = model(hist_xyz)
+                output = model(hist_in)
                 curr_time = (time.perf_counter() - start_time) * 1000   # elapsed time in ms
                 
                 # build & compute 1D‐range loss
@@ -1073,23 +1193,27 @@ def main(args):
         }
 
         with torch.no_grad():
-            for batch_idx, (hist_xyz, future_xyz, future_ranges) in enumerate(
+            for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(
                     tqdm(test_loader, total=len(test_loader))):
 
                 # hist_xyz: [B, T_in, 3/4, H, W]
                 # future_xyz: [B, T_out, 3, H, W]
                 # future_ranges: [B, T_out, H, W]
-                hist_xyz = hist_xyz.to(args.device)
+                hist_xyzd = hist_xyzd.to(args.device)
                 future_xyz = future_xyz.to(args.device)
                 future_ranges = future_ranges.to(args.device)
 
-                # ACC-Modelle erwarten nur xyz (3 Kanäle)
-                if hist_xyz.shape[2] == 4:
-                    hist_xyz = hist_xyz[:, :, :3, :, :]
+                # Range-only input: take range channel (index 3)
+                if hist_xyzd.shape[2] == 4:
+                    hist_in = hist_xyzd[:, :, 3:4, :, :]   # [B,T,1,H,W]
+                elif hist_xyzd.shape[2] == 1:
+                    hist_in = hist_xyzd
+                else:
+                    raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
 
                 # Vorwärtsdurchlauf
                 start_time = time.perf_counter()
-                output = model(hist_xyz)
+                output = model(hist_in)
                 curr_time = (time.perf_counter() - start_time) * 1000.0  # ms
 
                 # -------- Loss-Berechnung (wie im Validation-Loop) --------

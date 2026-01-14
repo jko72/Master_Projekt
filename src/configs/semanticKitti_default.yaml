@@ -33,7 +33,7 @@ data_params: {
 }
 train_params: {
   with_resume_train: false,
-  pre_train_weights: null, #"/home/koehlbrandt/workspace/LiDARSensorForecaster/LidarGaussianVideoView/logs/25-10-29_12-07-24/weights/model_final.pt",
+  pre_train_weights: "/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt",
   auto_increment: true,
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
@@ -65,7 +65,7 @@ train_params: {
   confidence_levels: [0.95, 0.68],
   learning_rate_min: 5.e-6, # Finale Learningrate, 5.e-5
   clip_grad_norm: 5.0,
-  dataloader_num_workers: 2,  # 4
+  dataloader_num_workers: 4,  # 4
   dataloader_prefetch: 2,
   num_samples: 200,
   cost_weight: 0.005,

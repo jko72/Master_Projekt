@@ -11,9 +11,33 @@ from prob import build_range_mixture_distribution  # bereits im Swin-Modell
 from models.acc_base import BasePredictionModel
 
 
-def _xyz_to_range(xyz):  # [B, T, 3, H, W] -> [B, T, 1, H, W]
-    r = torch.sqrt(torch.clamp(xyz[:, :, 0]**2 + xyz[:, :, 1]**2 + xyz[:, :, 2]**2, min=1e-9))
-    return r.unsqueeze(2)
+def _xyz_to_range(xyz):
+    """
+    Accepts either:
+      - xyz:   [B, T, 3, H, W]  (x,y,z)
+      - range: [B, T, 1, H, W]  (already range)
+    Returns:
+      - range: [B, T, 1, H, W]
+    """
+    if xyz.dim() != 5:
+        raise ValueError(f"_xyz_to_range expects 5D tensor [B,T,C,H,W], got {xyz.shape}")
+
+    C = xyz.shape[2]
+
+    # already range-only
+    if C == 1:
+        return xyz
+
+    # xyz -> range
+    if C >= 3:
+        r = torch.sqrt(torch.clamp(
+            xyz[:, :, 0]**2 + xyz[:, :, 1]**2 + xyz[:, :, 2]**2,
+            min=1e-9
+        ))
+        return r.unsqueeze(2)
+
+    raise ValueError(f"_xyz_to_range got unsupported channel size C={C}, shape={xyz.shape}")
+
 
 def _time_resample(x, target_frames):  # [B, T_in, C, H, W] -> [B, target_frames, C, H, W]
     B, T, C, H, W = x.shape
