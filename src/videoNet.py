@@ -381,11 +381,15 @@ def main(args):
     
                     # IMPORTANT: map ACC core weights into adapter
                     # Checkpoint: enc.enc.*  -> Model: acc.enc.enc.*
-                    if k.startswith("enc."):
+                    if k.startswith(("enc.", "hid.", "dec.")):
                         k = "acc." + k
-                    elif k.startswith("hid."):
-                        k = "acc." + k
+
                     clean_state[k] = v
+
+                    if k == "mean":
+                        clean_state["acc.mean"] = v
+                    elif k == "std":
+                        clean_state["acc.std"] = v
 
                 # 3) drop keys with incompatible shapes (PyTorch would crash otherwise)
                 model_state = model.state_dict()
@@ -981,7 +985,7 @@ def main(args):
         val_mask_sum = 0.0        # Summe Masken-Loss
         val_batch_count = 0       # Anzahl Val-Batches
         # ===== END PAPER-METRICS: VALIDATION ACCUMULATORS =====
-
+        model.eval()
         with torch.no_grad():
             for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(tqdm(iterable=val_loader, total=len(val_loader))):
                 # model's forward gives "output" of shape [B,T,H,W,3K]
@@ -993,10 +997,48 @@ def main(args):
                     hist_in = hist_xyzd
                 else:
                     raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+                # Paper-KITTI Normalisierung (nur Range-Kanal)
+                # range_mean = 10.839
+                # range_std  = 9.314
+
+                # hist_in = (hist_in - range_mean) / (range_std + 1e-8)
+
+                # target = future_xyz.to(args.device).clone()
+
+                # x_mean, x_std = 0.005, 11.521
+                # y_mean, y_std = 0.494, 8.262
+                # z_mean, z_std = -1.13, 0.828
+
+                # target[:, :, 0] = (target[:, :, 0] - x_mean) / (x_std + 1e-8)
+                # target[:, :, 1] = (target[:, :, 1] - y_mean) / (y_std + 1e-8)
+                # target[:, :, 2] = (target[:, :, 2] - z_mean) / (z_std + 1e-8)
+
+                if batch_idx == 0:
+                    print(
+                        "[DEBUG VAL hist_in] "
+                        f"shape={tuple(hist_in.shape)} | "
+                        f"min={hist_in.min().item():.4f} | "
+                        f"max={hist_in.max().item():.4f} | "
+                        f"mean={hist_in.mean().item():.4f} | "
+                        f"std={hist_in.std().item():.4f}"
+                    )
+
+
                 start_time = time.perf_counter()    # fractional time in seconds
                 output = model(hist_in)
                 curr_time = (time.perf_counter() - start_time) * 1000   # elapsed time in ms
-                
+                if batch_idx == 0:
+                    fr = future_ranges.to(args.device)
+                    print(f"[DEBUG VAL future_ranges_m] min={fr.min().item():.4f} max={fr.max().item():.4f} mean={fr.mean().item():.4f} std={fr.std().item():.4f}")
+                    print(f"[DEBUG VAL output_m]       min={output.min().item():.4f} max={output.max().item():.4f} mean={output.mean().item():.4f} std={output.std().item():.4f}")
+
+                    print("[DEBUG] gt_mean:", future_ranges.to(args.device).mean().item())
+                    print("[DEBUG] out_mean:", output.mean().item())
+
+                    print("hist invalid ratio:", (hist_xyzd[:, :, 3] == -1).float().mean().item())
+                    print("fut  invalid ratio:", (future_ranges == -1).float().mean().item())
+
+
                 # build & compute 1D‐range loss
                 # mixture, ok = build_range_mixture_distribution(cfg, output)
                 if cfg["model_params"].get("use_mdn", True):
@@ -1027,10 +1069,25 @@ def main(args):
                             val_mask_sum += float(loss_dict["loss_mask"])
                     # ===== END PAPER-METRICS: UPDATE VALIDATION SUMS =====
 
+                # else:
+                #     # Direkte Range-Regression ohne Gaußparameter
+                #     future_ranges_n = (future_ranges.to(args.device) - range_mean) / (range_std + 1e-8)
+                #     loss_tensor = torch.nn.functional.l1_loss(output, future_ranges_n)
+                #     nll = loss_tensor.item()
                 else:
-                    # Direkte Range-Regression ohne Gaußparameter
-                    loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
+                    fr = future_ranges.to(args.device)  # [B,F,H,W]
+
+                    print("[DBG] fr min/max:", fr.min().item(), fr.max().item())
+                    print("[DBG] ratio -1:", (fr == -1.0).float().mean().item())
+                    print("[DBG] ratio  0:", (fr ==  0.0).float().mean().item())
+                    print("[DBG] ratio >0:", (fr  >  0.0).float().mean().item())
+
+                    valid = (fr != -1.0)
+                    diff = (output - fr).abs()
+
+                    loss_tensor = (diff * valid).sum() / (valid.sum().clamp_min(1e-8))
                     nll = loss_tensor.item()
+
 
                 # =============================================================
                 # Logge nur alle N Batches (Loss + ACC-Metriken synchron)

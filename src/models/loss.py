@@ -55,7 +55,7 @@ class Loss(nn.Module):
         """Init"""
         super().__init__()
         self.cfg = cfg
-        self.n_future_steps = self.cfg.get("MODEL", self.cfg.get("model_params", {})).get("N_FUTURE_STEPS", 3)
+        self.n_future_steps = self.cfg.get("MODEL", self.cfg.get("model_params", {})).get("forecast_horizon", 3)
 
         #  Unterstützt sowohl TRAIN als auch train_params (robust)
         train_cfg = self.cfg.get("TRAIN", self.cfg.get("train_params", {}))
@@ -175,8 +175,8 @@ class loss_range(nn.Module):
         # 1 Vorhersage kopieren, damit das Original nicht verändert wird
         pred = output["rv"].clone()
 
-        # 2 Gültigkeitsmaske: Nur Pixel >0 und != -1 verwenden
-        valid_mask = (target_range_image > 0.0) & (target_range_image != -1.0)
+        # 2 Gültigkeitsmaske: != -1 verwenden
+        valid_mask = (target_range_image != -1.0)
 
         # 3 Pixelweise L1-Differenz
         pixelwise_loss = torch.abs(pred - target_range_image)
@@ -190,7 +190,7 @@ class loss_range(nn.Module):
         # 6 Optional: Loss pro Zeitschritt (für Logging)
         timestep_loss = torch.zeros(target_range_image.shape[1], device=pred.device)
         for i in range(target_range_image.shape[1]):
-            valid_t = (target_range_image[:, i, :, :] > 0.0) & (target_range_image[:, i, :, :] != -1.0)
+            valid_t = (target_range_image[:, i, :, :] != -1.0)
             step_loss = torch.abs(pred[:, i, :, :] - target_range_image[:, i, :, :]) * valid_t
             timestep_loss[i] = step_loss.sum() / (valid_t.sum() + 1e-8)
         
