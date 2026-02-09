@@ -663,6 +663,49 @@ def main(args):
                 hist_in = hist_xyzd
             else:
                 raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+            # ===================== DEBUG: preserve_ray sanity checks =====================
+            if batch_idx == 0:
+                hx = hist_xyzd.to(args.device)
+                fr = future_ranges.to(args.device)
+
+                # hist range channel (bei dir Kanal 3)
+                h_range = hx[:, :, 3, :, :]  # [B,P,H,W]
+                h_invalid = (h_range == -1.0)
+                fr_invalid = (fr == -1.0)
+
+                print("\n[DBG PRESERVE_RAY] ---- SANITY ----")
+                print("[DBG] hist_range invalid ratio:", h_invalid.float().mean().item())
+                print("[DBG] future_range invalid ratio:", fr_invalid.float().mean().item())
+
+                # per-time invalid ratio
+                per_t = []
+                for t in range(fr.shape[1]):
+                    per_t.append(fr_invalid[:, t].float().mean().item())
+                print("[DBG] future invalid ratio per t:", [f"{x:.3f}" for x in per_t])
+
+                # check: are there any zeros? (should be ~0 if you strictly use -1 for invalid)
+                print("[DBG] future ratio == 0:", (fr == 0.0).float().mean().item())
+
+                # range stats only on valid pixels
+                valid_fr = fr[~fr_invalid]
+                valid_h  = h_range[~h_invalid]
+
+                if valid_fr.numel() > 0:
+                    print("[DBG] future valid mean/std/min/max:",
+                        valid_fr.mean().item(), valid_fr.std().item(),
+                        valid_fr.min().item(), valid_fr.max().item())
+                else:
+                    print("[DBG] future valid: EMPTY (all invalid!) -> pipeline broken")
+
+                if valid_h.numel() > 0:
+                    print("[DBG] hist valid mean/std/min/max:",
+                        valid_h.mean().item(), valid_h.std().item(),
+                        valid_h.min().item(), valid_h.max().item())
+                else:
+                    print("[DBG] hist valid: EMPTY (all invalid!) -> pipeline broken")
+
+                print("[DBG PRESERVE_RAY] --------------\n")
+            # =================== END DEBUG: preserve_ray sanity checks ===================
             
             start_time = time.perf_counter()    # fractional time in seconds
             output = model(hist_in)
@@ -984,6 +1027,8 @@ def main(args):
         val_cd_sum = 0.0          # Summe Chamfer-Distanzen
         val_mask_sum = 0.0        # Summe Masken-Loss
         val_batch_count = 0       # Anzahl Val-Batches
+        val_abs_sum = 0.0     # Sum |pred-gt| über alle gültigen Pixel der ganzen Val-Epoche
+        val_valid_sum = 0.0   # Sum gültige Pixel der ganzen Val-Epoche
         # ===== END PAPER-METRICS: VALIDATION ACCUMULATORS =====
         model.eval()
         with torch.no_grad():
@@ -1087,7 +1132,10 @@ def main(args):
 
                     loss_tensor = (diff * valid).sum() / (valid.sum().clamp_min(1e-8))
                     nll = loss_tensor.item()
-
+                    # --- Epoch-Accumulator (pixel-gewichtet, glättet Zickzack) ---
+                    # Wichtig: float() damit Summen stabil sind
+                    val_abs_sum   += (diff * valid).sum().detach().item()
+                    val_valid_sum += valid.sum().detach().item()
 
                 # =============================================================
                 # Logge nur alle N Batches (Loss + ACC-Metriken synchron)
@@ -1201,6 +1249,19 @@ def main(args):
             # average loss caluclation
             avg_loss_val = total_loss_val / len(val_loader)
             print(f"Epoch {epoch + 1}/{cfg['train_params']['num_total_epochs']}, Average Validation Loss: {avg_loss_val}")
+
+            # ===== PAPER-L1 EPOCH METRIC (pixel-weighted) =====
+            if cfg["train_params"]["with_save"] and val_valid_sum > 0:
+                rv_epoch = val_abs_sum / max(val_valid_sum, 1e-8)
+
+                # "paper/" Name (klarer Vergleich)
+                writer.add_scalar("paper/val/range_view_metric_L1_epoch", rv_epoch, epoch)
+
+                # optional: auch unter deinem bisherigen Key
+                writer.add_scalar("val/range_view_metric_L1_epoch", rv_epoch, epoch)
+
+                print(f"[VAL][EPOCH] range_view_metric_L1_epoch (pixel-weighted): {rv_epoch:.6f}")
+            # ===== END =====
 
             # ===== PAPER-METRICS: LOG VALIDATION EPOCH MEANS =====
             if cfg["train_params"]["with_save"] and val_batch_count > 0:

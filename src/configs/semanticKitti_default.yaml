@@ -10,16 +10,16 @@ model_params: {
   dropout_prob: 0.3,
   mdn_dropout_prob: 0.2,
   grid_height: 64, #64
-  grid_width: 2048, #512
+  grid_width: 512, #512
 
-  org_grid_height: 64, #64
-  org_grid_width: 2048, #512
+  org_grid_height: 64,
+  org_grid_width: 2048,
 
   grid_channels: 8,
   FOV_UP: 3.0,
   FOV_DOWN: -25.0,
   MASK_THRESHOLD: -1.0,
-  preserve_ray_position: false, #true
+  preserve_ray_position: true, #true
   with_attention: true
 }
 data_params: {
@@ -40,7 +40,7 @@ data_params: {
 }
 train_params: {
   with_resume_train: false,
-  pre_train_weights: "/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt",
+  pre_train_weights: null, #"/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt",
   auto_increment: true,
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,

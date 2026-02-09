@@ -108,16 +108,33 @@ class RandomWindowSeqDataset(Dataset):
             
             hist_pc = aligned[:, :3].view(T,3,H,W)                   # [T,3,H,W]
             hist_pc = hist_pc.masked_fill(mask, 0)
+            # if self.with_projection:
+            #     # re-project transformed points to reference frame -> pixel/ ray direction vector is consistent over time -> image will get warped/ distorted
+            #         # (+) Keeps theta/phi constant across time, so the model can treat each pixel as a fixed ray. 
+            #         # (+) Reduces spatial drift, simplifying the subsequent per‑pixel attention.
+            #         # (-) Re‑projection introduces sparse holes where no historical point lands
+            #     hist_pc = spherical_projection(
+            #         hist_pc, self.out_H, self.out_W,
+            #         theta_range=self.theta_range,
+            #         #device=self.device
+            #     )                                                         # [T,3,out_H,out_W]
             if self.with_projection:
-                # re-project transformed points to reference frame -> pixel/ ray direction vector is consistent over time -> image will get warped/ distorted
-                    # (+) Keeps theta/phi constant across time, so the model can treat each pixel as a fixed ray. 
-                    # (+) Reduces spatial drift, simplifying the subsequent per‑pixel attention.
-                    # (-) Re‑projection introduces sparse holes where no historical point lands
-                hist_pc = spherical_projection(
-                    hist_pc, self.out_H, self.out_W,
-                    theta_range=self.theta_range,
-                    #device=self.device
-                )                                                         # [T,3,out_H,out_W]
+                # hist_pc: [T,3,H,W]  -> re-project each frame by flattening to (N,3)
+                reproj = []
+                for t in range(T):
+                    xyz_img = hist_pc[t]  # [3,H,W]
+                    valid = ~(xyz_img == 0).all(dim=0)  # [H,W]
+                    pts = xyz_img[:, valid].permute(1, 0).contiguous().cpu().numpy()  # (N,3)
+
+                    pj_img, _, _, _ = spherical_projection(
+                        pts,
+                        height=self.out_H,
+                        width=self.out_W,
+                        theta_range=self.theta_range
+                    )  # (H,W,3) numpy
+
+                    reproj.append(torch.from_numpy(pj_img).permute(2, 0, 1).to(self.device))  # [3,H,W]
+                hist_pc = torch.stack(reproj, dim=0)  # [T,3,H,W]
 
             # --- 4) align & project futures, plus range images ---
             future_xyzs, future_ranges = [], []
@@ -168,21 +185,35 @@ class RandomWindowSeqDataset(Dataset):
                 future_pc = alignedf[:, :3].view(3,H,W)             # [3,H,W]
                 future_pc = future_pc.masked_fill(mask, 0)
                 
+                # if self.with_projection:
+                #     # re-project transformed points to reference frame -> pixel/ ray direction vector is consistent over time -> image will get warped/ distorted
+                #         # (+) Keeps theta/phi constant across time, so the model can treat each pixel as a fixed ray. 
+                #         # (+) Reduces spatial drift, simplifying the subsequent per‑pixel attention.
+                #         # (-) Re‑projection introduces sparse holes where no historical point lands
+                #     future_pc = spherical_projection(
+                #         future_pc, self.out_H, self.out_W,
+                #         theta_range=self.theta_range,
+                #         #device=self.device
+                #     )
                 if self.with_projection:
-                    # re-project transformed points to reference frame -> pixel/ ray direction vector is consistent over time -> image will get warped/ distorted
-                        # (+) Keeps theta/phi constant across time, so the model can treat each pixel as a fixed ray. 
-                        # (+) Reduces spatial drift, simplifying the subsequent per‑pixel attention.
-                        # (-) Re‑projection introduces sparse holes where no historical point lands
-                    future_pc = spherical_projection(
-                        future_pc, self.out_H, self.out_W,
-                        theta_range=self.theta_range,
-                        #device=self.device
+                    xyz_img = future_pc  # [3,H,W]
+                    valid = ~(xyz_img == 0).all(dim=0)  # [H,W]
+                    pts = xyz_img[:, valid].permute(1, 0).contiguous().cpu().numpy()  # (N,3)
+
+                    pj_img, _, _, _ = spherical_projection(
+                        pts,
+                        height=self.out_H,
+                        width=self.out_W,
+                        theta_range=self.theta_range
                     )
+                    future_pc = torch.from_numpy(pj_img).permute(2, 0, 1).to(self.device)  # [3,H,W]
+
+                mask_after = (future_pc == 0).all(dim=0)  # [H,W]
                 future_xyzs.append(future_pc)                       # [3,out_H,out_W]
                 #future_ranges.append(torch.norm(future_pc, dim=0)) # [out_H,out_W]
                 r = torch.norm(future_pc, dim=0)  # [H, W] in meters, invalid will be 0 right now
                 # Make invalid range pixels match the paper convention: -1 for invalid
-                r = r.masked_fill(mask.squeeze(0), -1.0)
+                r = r.masked_fill(mask_after, -1.0)
                 future_ranges.append(r)
 
             future_xyz   = torch.stack(future_xyzs,   dim=0)  # [F,3,out_H,out_W]
