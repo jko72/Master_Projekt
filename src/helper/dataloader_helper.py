@@ -7,6 +7,7 @@ import numpy as np
 
 # ---- Worker seeding (top-level, picklable) ----
 WORKER_BASE_SEED = None
+_WARNED_KITTI_FALLBACK_CALIB = False
 
 def set_worker_seed_base(s: int | None):
     global WORKER_BASE_SEED
@@ -43,7 +44,7 @@ def make_sequences(base_dir):
             continue
 
         vdir = os.path.join(seq_dir, 'velodyne')
-        ldir = os.path.join(seq_dir, 'label')
+        ldir = os.path.join(seq_dir, 'labels')
         calfile = os.path.join(seq_dir, 'calib.txt')
         posefile = os.path.join(seq_dir, 'poses.txt')
 
@@ -55,6 +56,21 @@ def make_sequences(base_dir):
             calib = parse_calibration(calfile)
         else:
             calib = None    # assumed that calib['Tr'] is eye matrix
+            # SemanticKITTI often needs Tr to convert odometry poses into Velodyne frame.
+            # If calib.txt is missing, fall back to KITTI odometry default Tr.
+            if "semantickitti" in base_dir.lower():
+                calib = {
+                    "Tr": np.array([
+                        [7.533745e-03, -9.999714e-01, -6.166020e-04, -4.069766e-03],
+                        [1.480249e-02,  7.280733e-04, -9.998902e-01, -7.631618e-02],
+                        [9.998621e-01,  7.523790e-03,  1.480755e-02, -2.717806e-01],
+                        [0.0,           0.0,           0.0,           1.0],
+                    ], dtype=np.float64)
+                }
+                global _WARNED_KITTI_FALLBACK_CALIB
+                if not _WARNED_KITTI_FALLBACK_CALIB:
+                    print("[WARN][KITTI] calib.txt missing. Using built-in KITTI Tr fallback.")
+                    _WARNED_KITTI_FALLBACK_CALIB = True
         poses = parse_poses(posefile, calib)
 
         # gather sorted file-pairs

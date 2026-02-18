@@ -22,7 +22,7 @@ except ModuleNotFoundError:
         def __init__(self, cfg=None):
             print("[WARN] utils.projection not found – using dummy projection.")
         def get_target_mask_from_range_view(self, range_view):
-            return (range_view > 0.0).float() * (range_view != -1.0).float()
+            return (range_view > 0.0).float()
         def get_masked_range_view(self, output):
             return output["rv"]
         def get_valid_points_from_range_view(self, range_view):
@@ -146,7 +146,7 @@ class loss_range(nn.Module):
         pred = output["rv"].clone()                       # [B,T,H,W]
         gt   = target_range_image                         # [B,T,H,W]
 
-        valid_mask = ((gt > 0.0) & (gt != -1.0)).float()
+        valid_mask = (gt > 0.0).float()
 
         # Smooth-L1 pro Pixel
         # (PyTorch SmoothL1Loss mit reduction='none' arbeitet elementweise als Huber)
@@ -157,7 +157,7 @@ class loss_range(nn.Module):
         T = gt.shape[1]
         timestep_loss = pred.new_zeros(T)
         for i in range(T):
-            valid_t = ((gt[:, i] > 0.0) & (gt[:, i] != -1.0)).float()
+            valid_t = (gt[:, i] > 0.0).float()
             pix_t = F.smooth_l1_loss(pred[:, i], gt[:, i], beta=self.huber_beta, reduction="none")
             timestep_loss[i] = masked_mean(pix_t, valid_t)
 
@@ -217,7 +217,7 @@ class Loss(nn.Module):
         loss_mask_val = self.loss_mask(output, target_range_image)
 
         # Zeitliche TV (nur auf gültigen Pixels)
-        valid_mask = ((target_range_image > 0.0) & (target_range_image != -1.0))
+        valid_mask = (target_range_image > 0.0)
         tv_time = temporal_tv(output["rv"], valid_mask)
 
         # Optionaler vorhandener Regularizer (default 0.0)

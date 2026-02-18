@@ -149,51 +149,84 @@ def spherical_projection(
     if pc.ndim != 2 or pc.shape[1] < 3:
         raise ValueError(f"spherical_projection expects pc (N,>=3). Got {pc.shape}")
 
-    # Use max_range if given, else default to 85 like paper.
-    mr = float(max_range) if (max_range is not None) else 85.0
-
-    # FoV: if you previously passed theta_range, ignore it here on purpose.
-    # We want fixed FoV behavior like paper.
-    # If you want, you can hardcode your KITTI values here:
-    fov_up_deg = 3.0
-    fov_down_deg = -25.0
-
-    # Run paper projection on xyz only
-    proj_xyz, proj_range, proj_idx = _range_projection_paper(
-        pc=pc,
-        proj_H=int(height),
-        proj_W=int(width),
-        fov_up_deg=fov_up_deg,
-        fov_down_deg=fov_down_deg,
-        max_range=mr,
-        min_range=0.0,   # paper preprocessing usually keeps >0
-    )
-
-    # Build pj_img with same number of channels as input pc
+    height = int(height)
+    width = int(width)
     C = pc.shape[1]
+
     pj_img = np.zeros((height, width, C), dtype=np.float32)
-
-    # xyz always
-    pj_img[:, :, 0:3] = proj_xyz
-
-    # if input has intensity or other channels, fill them using proj_idx mapping
-    if C > 3:
-        # Fill additional channels by taking the point attributes from original pc
-        # for pixels where proj_idx != -1
-        valid_pix = (proj_idx >= 0)
-        if valid_pix.any():
-            # gather original point rows
-            rows = pc[proj_idx[valid_pix]]  # (M,C)
-            pj_img[valid_pix, :] = rows
-
-        # ensure xyz is consistent even after overwriting whole row
-        # (because rows contains xyz anyway, this is mostly redundant)
-        pj_img[:, :, 0:3] = proj_xyz
-
-    # Compatibility outputs (not used by paper projection)
     alpha = np.zeros((height, width), dtype=np.float32)
-    theta_min, theta_max = fov_down_deg / 180.0 * np.pi, fov_up_deg / 180.0 * np.pi
     phi_min, phi_max = -np.pi, np.pi
+
+    if pc.shape[0] == 0:
+        if theta_range is None:
+            theta_min, theta_max = -np.pi / 16.0, np.pi / 16.0
+        else:
+            theta_min, theta_max = float(theta_range[0]), float(theta_range[1])
+        return pj_img, alpha, (theta_min, theta_max), (phi_min, phi_max)
+
+    x = pc[:, 0]
+    y = pc[:, 1]
+    z = pc[:, 2]
+    r = np.sqrt(x * x + y * y + z * z)
+
+    valid = np.isfinite(r) & np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    if max_range is not None:
+        valid &= (r < float(max_range))
+    if not np.any(valid):
+        if theta_range is None:
+            theta_min, theta_max = -np.pi / 16.0, np.pi / 16.0
+        else:
+            theta_min, theta_max = float(theta_range[0]), float(theta_range[1])
+        return pj_img, alpha, (theta_min, theta_max), (phi_min, phi_max)
+
+    pc = pc[valid]
+    x = pc[:, 0]
+    y = pc[:, 1]
+    z = pc[:, 2]
+    r = np.sqrt(x * x + y * y + z * z)
+
+    # Old behavior: sort by range and resolve collisions by overwrite order.
+    order = np.argsort(r)  # ascending
+    if not sort_largest_first:
+        order = order[::-1]  # descending => near points are written last
+    pc_sorted = pc[order]
+    x_s = pc_sorted[:, 0]
+    y_s = pc_sorted[:, 1]
+    z_s = pc_sorted[:, 2]
+
+    phi = np.arctan2(y_s, x_s)  # [-pi, pi]
+    theta = np.arcsin(z_s / np.maximum(np.sqrt(x_s * x_s + y_s * y_s + z_s * z_s), 1e-8))
+
+    if theta_range is None:
+        theta_min = float(theta.min())
+        theta_max = float(theta.max())
+    else:
+        theta_min, theta_max = float(theta_range[0]), float(theta_range[1])
+        if theta_max <= theta_min:
+            raise ValueError(f"theta_range must satisfy max > min, got {theta_range}")
+
+    # Avoid degenerate bucket boundaries.
+    if theta_max - theta_min < 1e-8:
+        theta_max = theta_min + 1e-8
+
+    bins_h_asc = np.linspace(theta_min, theta_max, num=height, dtype=np.float32)
+    bins_w_asc = np.linspace(phi_min, phi_max, num=width, dtype=np.float32)
+
+    idx_h = np.searchsorted(bins_h_asc, theta, side="right") - 1
+    idx_h = np.clip(idx_h, 0, height - 1)
+    row = (height - 1) - idx_h
+
+    idx_w = np.searchsorted(bins_w_asc, phi, side="right") - 1
+    idx_w = np.clip(idx_w, 0, width - 1)
+    col = (width - 1) - idx_w
+
+    pj_img[row, col, :] = pc_sorted
+
+    # Keep compatibility alpha output.
+    th_vals = np.linspace(theta_max, theta_min, num=height, dtype=np.float32)
+    ph_vals = np.linspace(phi_max, phi_min, num=width, dtype=np.float32)
+    theta_grid, phi_grid = np.meshgrid(th_vals, ph_vals, indexing='ij')
+    alpha = np.sqrt(theta_grid * theta_grid + phi_grid * phi_grid).astype(np.float32)
 
     return pj_img, alpha, (theta_min, theta_max), (phi_min, phi_max)
 

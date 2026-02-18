@@ -568,11 +568,13 @@ def main(args):
         for i in range(n_rows):
             for j in range(n_cols):
                 ax = axes[i, j]
+                cmap = plt.get_cmap('turbo').copy()
+                cmap.set_bad(color='black')  # invalid pixels (NaN) shown as black
                 im = ax.imshow(
-                    np.zeros((H, W)),
+                    np.full((H, W), np.nan, dtype=np.float32),
                     aspect='equal',
                     vmin=0, vmax=50,
-                    cmap='turbo'
+                    cmap=cmap
                 )
                 # title and subtitle
                 title, subtitle = row_titles[i], col_titles[j]
@@ -670,8 +672,8 @@ def main(args):
 
                 # hist range channel (bei dir Kanal 3)
                 h_range = hx[:, :, 3, :, :]  # [B,P,H,W]
-                h_invalid = (h_range == -1.0)
-                fr_invalid = (fr == -1.0)
+                h_invalid = (h_range <= 0.0)
+                fr_invalid = (fr <= 0.0)
 
                 print("\n[DBG PRESERVE_RAY] ---- SANITY ----")
                 print("[DBG] hist_range invalid ratio:", h_invalid.float().mean().item())
@@ -764,7 +766,13 @@ def main(args):
     
             # VISUALIZATION
             if cfg["train_params"]["plot_examples"] and (batch_idx % cfg["train_params"]["plot_batch_step"] == 0):
-                theta_range = cfg['model_params'].get('theta_range', [-np.pi/16, np.pi/16])
+                mp = cfg['model_params']
+                if 'theta_range' in mp and mp['theta_range'] is not None:
+                    theta_range = mp['theta_range']
+                else:
+                    fov_up = float(mp.get('FOV_UP', 3.0))
+                    fov_down = float(mp.get('FOV_DOWN', -25.0))
+                    theta_range = [fov_down * np.pi / 180.0, fov_up * np.pi / 180.0]
                 phi_grid, theta_grid = make_angle_grids(H, W, theta_range, device="cpu")
                 
                 # Reshape to [B, T, H, W]
@@ -791,27 +799,50 @@ def main(args):
                 b = 0   # which batch‐element to show
                 flip = cfg["train_params"].get("plot_time_vertically", True)
                 
+                # Use GT valid pixels to set a stable, meaningful color range.
+                valid_gt = gt_all[gt_all > 0.0]
+                vmax = float(np.percentile(valid_gt, 99)) if valid_gt.size > 0 else 50.0
+                vmax = max(5.0, min(vmax, 120.0))
+
                 if flip:
                     # rows = time, cols = [GT,Mean,Mode]
                     for row in range(T):
-                        im_handles[row][0].set_data(gt_all[b,   row])
+                        gt_img = gt_all[b, row].astype(np.float32)
+                        gt_img[gt_img <= 0.0] = np.nan
+                        im_handles[row][0].set_data(gt_img)
+                        im_handles[row][0].set_clim(0.0, vmax)
                         cb_handles[row][0].update_normal(im_handles[row][0])
 
-                        im_handles[row][1].set_data(mean_all[b, row])
+                        mean_img = mean_all[b, row].astype(np.float32)
+                        mean_img[mean_img <= 0.0] = np.nan
+                        im_handles[row][1].set_data(mean_img)
+                        im_handles[row][1].set_clim(0.0, vmax)
                         cb_handles[row][1].update_normal(im_handles[row][1])
 
-                        im_handles[row][2].set_data(modes_all[b, row])
+                        mode_img = modes_all[b, row].astype(np.float32)
+                        mode_img[mode_img <= 0.0] = np.nan
+                        im_handles[row][2].set_data(mode_img)
+                        im_handles[row][2].set_clim(0.0, vmax)
                         cb_handles[row][2].update_normal(im_handles[row][2])
                 else:
                     # rows = [GT,Mean,Mode], cols=time
                     for col in range(T):
-                        im_handles[0][col].set_data(gt_all[b,   col])
+                        gt_img = gt_all[b, col].astype(np.float32)
+                        gt_img[gt_img <= 0.0] = np.nan
+                        im_handles[0][col].set_data(gt_img)
+                        im_handles[0][col].set_clim(0.0, vmax)
                         cb_handles[0][col].update_normal(im_handles[0][col])
 
-                        im_handles[1][col].set_data(mean_all[b, col])
+                        mean_img = mean_all[b, col].astype(np.float32)
+                        mean_img[mean_img <= 0.0] = np.nan
+                        im_handles[1][col].set_data(mean_img)
+                        im_handles[1][col].set_clim(0.0, vmax)
                         cb_handles[1][col].update_normal(im_handles[1][col])
 
-                        im_handles[2][col].set_data(modes_all[b, col])
+                        mode_img = modes_all[b, col].astype(np.float32)
+                        mode_img[mode_img <= 0.0] = np.nan
+                        im_handles[2][col].set_data(mode_img)
+                        im_handles[2][col].set_clim(0.0, vmax)
                         cb_handles[2][col].update_normal(im_handles[2][col])
                 
                 fig.canvas.draw()
@@ -999,7 +1030,8 @@ def main(args):
                         mean_flat = mixture.mean  # shape [B*T*H*W]
                         mean_all = mean_flat.view(B, T, H, W).detach().cpu().numpy()
                         
-                    mask = (gt_all != 0)
+                    # valid GT range pixels only (invalid are encoded as -1)
+                    mask = (gt_all > 0)
                     diff_mean_mean = np.mean(np.abs(mean_all - gt_all)[mask])
                     diff_median_mean = np.median(np.abs(mean_all - gt_all)[mask])
                     
@@ -1080,8 +1112,8 @@ def main(args):
                     print("[DEBUG] gt_mean:", future_ranges.to(args.device).mean().item())
                     print("[DEBUG] out_mean:", output.mean().item())
 
-                    print("hist invalid ratio:", (hist_xyzd[:, :, 3] == -1).float().mean().item())
-                    print("fut  invalid ratio:", (future_ranges == -1).float().mean().item())
+                    print("hist invalid ratio:", (hist_xyzd[:, :, 3] <= 0).float().mean().item())
+                    print("fut  invalid ratio:", (future_ranges <= 0).float().mean().item())
 
 
                 # build & compute 1D‐range loss
@@ -1123,11 +1155,11 @@ def main(args):
                     fr = future_ranges.to(args.device)  # [B,F,H,W]
 
                     print("[DBG] fr min/max:", fr.min().item(), fr.max().item())
-                    print("[DBG] ratio -1:", (fr == -1.0).float().mean().item())
+                    print("[DBG] ratio <=0:", (fr <= 0.0).float().mean().item())
                     print("[DBG] ratio  0:", (fr ==  0.0).float().mean().item())
                     print("[DBG] ratio >0:", (fr  >  0.0).float().mean().item())
 
-                    valid = (fr != -1.0)
+                    valid = (fr > 0.0)
                     diff = (output - fr).abs()
 
                     loss_tensor = (diff * valid).sum() / (valid.sum().clamp_min(1e-8))

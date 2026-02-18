@@ -15,8 +15,8 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8):
     return (x * mask).sum() / mask.sum().clamp_min(eps)
 
 def _valid_mask_from_range(gt_rv: torch.Tensor):
-    # != -1  (wie in deiner loss.py)
-    return (gt_rv != -1.0)
+    # valid ranges are strictly positive
+    return (gt_rv > 0.0)
 
 @torch.no_grad()
 def compute_range_metrics(pred_rv: torch.Tensor,
@@ -274,5 +274,4 @@ class BasePredictionModel(pl.LightningModule):
             #print(f"[{prefix.upper()} VIS] skipping image log:", repr(e))
 
         return m
-
 

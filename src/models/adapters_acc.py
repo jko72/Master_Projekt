@@ -215,19 +215,31 @@ class _AccToMDN_Base(BasePredictionModel):
             # pad at front with -1 (paper invalid) to reach P
             pad = rv_seq.new_full((B, self.P - T_in, 1, H, W), -1.0)
             rv_seq = torch.cat([pad, rv_seq], dim=1)
-        #rv_seq = _time_resample(rv_seq, self.F)   # [B, F, 1, H, W]
+        # Match ACC temporal dimension (built with forecast_horizon/self.F).
+        rv_seq = _time_resample(rv_seq, self.F)   # [B, F, 1, H, W]
 
-        out = self.acc(rv_seq)                   # ACC expects meters
+        # ACC range backbone should not ingest invalid markers directly.
+        # Keep invalid semantics for losses/targets, but feed a neutral value to the model.
+        rv_seq_in = rv_seq.clone()
+        invalid_in = (rv_seq_in <= 0.0)
+        rv_seq_in[invalid_in] = 0.0
+
+        out = self.acc(rv_seq_in)                # ACC expects meters
         mu = out["rv"]                           # [B, F, H, W] meters
         mask_logits = out.get("mask_logits", None)
 
 
         if not hasattr(self, "_dbg_once"):
             self._dbg_once = True
-            valid_in = (rv_seq != -1.0)
+            valid_in = (rv_seq > 0.0)
             print("[DBG ADAPTER] rv_seq shape:", tuple(rv_seq.shape), "P=", self.P)
-            print("[DBG ADAPTER] input rv_seq (meters) mean/std:",
-                rv_seq[valid_in].mean().item(), rv_seq[valid_in].std().item())
+            if valid_in.any():
+                print("[DBG ADAPTER] input rv_seq (meters) mean/std:",
+                    rv_seq[valid_in].mean().item(), rv_seq[valid_in].std().item())
+            else:
+                print("[DBG ADAPTER] input rv_seq valid: EMPTY")
+            print("[DBG ADAPTER] input invalid ratio:",
+                invalid_in.float().mean().item())
             print("[DBG ADAPTER] mu shape:", tuple(mu.shape), "F(expected)=", self.F)
             print("[DBG ADAPTER] mu (meters) mean/std:",
                 mu.mean().item(), mu.std().item())

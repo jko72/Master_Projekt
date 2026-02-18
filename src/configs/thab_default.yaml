@@ -1,11 +1,11 @@
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticTHAB/sequences
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticTHAB/sequences"
 
 model_params: {
   name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
   use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
   mdn_num_gaussians: 3, # 9
-  input_horizon: 10, 
+  input_horizon: 5, 
   forecast_horizon: 5, #  auf 4 erhöhen für vorhersage auf 3s, vorher 3
   dropout_prob: 0.3,
   mdn_dropout_prob: 0.2,

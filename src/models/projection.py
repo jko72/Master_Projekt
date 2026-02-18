@@ -53,7 +53,7 @@ class projection:
             points[:, :, :, 1] = range_view * self.y_fac.type_as(range_view)
             points[:, :, :, 2] = range_view * self.z_fac.type_as(range_view)
 
-            points[range_view < 0,:] = torch.tensor([1e3 ,1e3 ,1e3], dtype=torch.float32).to('cuda')
+            points[range_view <= 0,:] = torch.tensor([1e3 ,1e3 ,1e3], dtype=torch.float32).to('cuda')
 
             return points
         
@@ -87,7 +87,7 @@ class projection:
             torch.tensor: Target mask of valid points
         """
         target_mask = torch.zeros(range_view.shape).type_as(range_view)
-        target_mask[range_view != -1.0] = 1.0
+        target_mask[range_view > 0.0] = 1.0
         return target_mask
 
     def get_masked_range_view(self, output):
