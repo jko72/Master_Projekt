@@ -1,8 +1,8 @@
 dataset_path: "/home/devuser/workspace/data/datasets/SemanticTHAB/sequences"
 
 model_params: {
-  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
-  use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
+  name: "swin", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
+  use_mdn: true, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
   mdn_num_gaussians: 3, # 9
   input_horizon: 5, 
@@ -11,7 +11,7 @@ model_params: {
   mdn_dropout_prob: 0.2,
   grid_height: 64, #64
   grid_width: 512, #512
-  grid_channels: 8,
+  grid_channels: 1, # Range-only Input (hist_in ist [B,T,1,H,W])
   FOV_UP: 11.25,
   FOV_DOWN: -11.25,
   MASK_THRESHOLD: 0.5,
@@ -83,4 +83,3 @@ train_params: {
   LOSS_WEIGHT_RANGE_VIEW: 1.0,
   LOSS_WEIGHT_MASK: 1.0,
 }
-

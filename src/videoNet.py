@@ -10,11 +10,11 @@ from torch.distributions import Categorical, Normal, MixtureSameFamily
 
 #from dataloader import AlignedSeqDataset, RandomWindowSeqDataset #AlignedProjDataset
 from utils_torch import make_angle_grids
-from prob import build_range_mixture_distribution, compute_nll_range_loss
+from prob import compute_nll_range_loss
 from prob import generate_point_clouds_from_mixture, visualize_mixture_pdfs
 from models import build_model
-from models.loss import Loss
 from models.chamfer import cham_dist  # NEU: Chamfer-Metrik
+from models.acc_base import compute_range_metrics
 
 
 # Helper functions
@@ -259,6 +259,30 @@ def print_training_env_info(cfg):
     print(f"CuDNN deterministic:  {torch.backends.cudnn.deterministic}")
     print("=====================================\n")
 
+def masked_l1_on_valid(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    valid = (target > 0.0)
+    return ((pred - target).abs() * valid).sum() / valid.sum().clamp_min(1e-8)
+
+def compute_and_log_range_metrics(pred_rv, future, writer=None, global_step=None, prefix="val"):
+    gt_rv = future[:, :, 0, :, :]
+    m = compute_range_metrics(pred_rv, gt_rv)
+    if writer is None:
+        return m
+
+    step = 0 if global_step is None else global_step
+    writer.add_scalar(f"paper/{prefix}/range_view_metric_L1", m["mae_mean"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/mae_mean", m["mae_mean"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/rmse_mean", m["rmse_mean"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/logrmse_mean", m["logrmse_mean"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/tv_time", m["tv_time"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/vel_mae", m["vel_mae"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/acc_mae", m["acc_mae"].item(), step)
+    writer.add_scalar(f"metrics/{prefix}/valid_ratio/mean", m["valid_ratio_mean"].item(), step)
+    for k, v in m.items():
+        if k.startswith("mae_bin_"):
+            writer.add_scalar(f"metrics/{prefix}/{k}", v.item(), step)
+    return m
+
 def main(args):
     global show_pc_flag, show_pdf_flag, show_ray_flag
     with open(args.cfg_path) as file:
@@ -463,7 +487,10 @@ def main(args):
     # except Exception as ex:
     #         print("no custom pretrained weights found, use default vanilla")
     model.to(args.device)
-    criterion = Loss(cfg)
+    use_mdn = bool(cfg["model_params"].get("use_mdn", True))
+    if use_mdn and not hasattr(model, "build_mixture"):
+        raise ValueError("use_mdn=True but selected model has no build_mixture() method.")
+
     # NEU: Chamfer-Metrik (nur als Metrik, nicht im Trainings-Loss)
     chamfer_metric = cham_dist(cfg)
 
@@ -712,29 +739,37 @@ def main(args):
             start_time = time.perf_counter()    # fractional time in seconds
             output = model(hist_in)
             curr_time = (time.perf_counter() - start_time) * 1000   # elapsed time in ms
+            loss_dict = None
+            mixture = None
             
             # build & compute 1D‐range loss
             # mixture, ok = build_range_mixture_distribution(cfg, output)
-            if cfg["model_params"].get("use_mdn", True):
+            if use_mdn:
                 mixture, ok = model.build_mixture(cfg, output)
                 if not ok:
                     continue
-                target = future_xyz.to(args.device)
-                loss_dict = criterion(output, target, mode="train", epoch_number=epoch)
-
-                loss_tensor = loss_dict["loss"]
-                nll = loss_dict["loss_range_view"]
-                valid_ratio = loss_dict["valid_ratio"]
+                target_ranges = future_ranges.to(args.device)
+                loss_tensor, nll = compute_nll_range_loss(cfg, mixture, target_ranges)
+                Bm, Tm, Hm, Wm = target_ranges.shape
+                pred_mean = mixture.mean.view(Bm, Tm, Hm, Wm)
+                rv_l1 = masked_l1_on_valid(pred_mean, target_ranges)
+                valid_ratio = (target_ranges > 0.0).float().mean()
+                loss_dict = {
+                    "loss": loss_tensor.detach(),
+                    "loss_nll": torch.tensor(nll, device=target_ranges.device),
+                    "loss_range_view": rv_l1.detach(),
+                    "valid_ratio": valid_ratio.detach(),
+                }
 
             else:
                 # Direkte Range-Regression ohne Gaußparameter
                 loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
-                nll = loss_tensor.item()            
+                nll = loss_tensor.item()
             # add batch's train loss to overall loss
             total_loss += nll
                 
                 # Nur bei MDN aktiv – mixture existiert nur dann
-            if cfg["model_params"].get("use_mdn", True):
+            if use_mdn:
                 mixture_cpu = mixture_to_cpu(mixture)
             else:
                 mixture_cpu = None
@@ -865,7 +900,7 @@ def main(args):
                 #     show_pdf_flag = False
 
                 # --- ON‐DEMAND POINT‐CLOUD (SEPERATE PROCESS) ---
-                if show_pc_flag:
+                if use_mdn and show_pc_flag:
                     K = cfg["model_params"]["mdn_num_gaussians"]
                     # 2) Compute expected range per pixel
                     r_exp_flat = mixture_cpu.mean           # [B*T*H*W]
@@ -926,7 +961,7 @@ def main(args):
                     # show_pc_flag = False
 
                 #  Ray‐confidence on R
-                if show_ray_flag:
+                if use_mdn and show_ray_flag:
                     # flatten GT point cloud for (b,t)
                     b, t, j = 0, 0, np.random.choice(range(W))
                     N_r=50
@@ -994,9 +1029,11 @@ def main(args):
 
                     # ===== PAPER-METRICS: TRAINING LOSSES =====
                     # Nur loggen, wenn loss_dict existiert (use_mdn=True & build_mixture ok)
-                    if "loss_dict" in locals() and isinstance(loss_dict, dict):
+                    if isinstance(loss_dict, dict):
                         if "loss" in loss_dict:
                             writer.add_scalar("train/loss_total", loss_dict["loss"].item(), step)
+                        if "loss_nll" in loss_dict:
+                            writer.add_scalar("train/loss_nll", loss_dict["loss_nll"].item(), step)
                         if "loss_range_view" in loss_dict:
                             writer.add_scalar("train/range_view_loss", loss_dict["loss_range_view"].item(), step)
                         if "mean_chamfer_distance" in loss_dict:
@@ -1008,7 +1045,7 @@ def main(args):
 
                     # Anteil gültiger Pixel
                     try:
-                        if "loss_dict" in locals() and "valid_ratio" in loss_dict:
+                        if isinstance(loss_dict, dict) and "valid_ratio" in loss_dict:
                             writer.add_scalar('train/valid_pixel_ratio', loss_dict["valid_ratio"].item(), step)
                         elif "valid_ratio" in locals():
                             writer.add_scalar('train/valid_pixel_ratio', valid_ratio.item(), step)
@@ -1023,12 +1060,16 @@ def main(args):
                         # gather gt, mode, mean
                             # get gt
                         gt_all = future_ranges.detach().cpu().numpy()
+                        if use_mdn and mixture is not None:
                             # get modes
-                        modes_flat = estimate_mixture_modes(mixture, n_samples=cfg["train_params"]["num_samples"])  # [B*T*H*W]
-                        modes_all = modes_flat.view(B, T, H, W).detach().cpu().numpy()
+                            modes_flat = estimate_mixture_modes(mixture, n_samples=cfg["train_params"]["num_samples"])  # [B*T*H*W]
+                            modes_all = modes_flat.view(B, T, H, W).detach().cpu().numpy()
                             # get mean
-                        mean_flat = mixture.mean  # shape [B*T*H*W]
-                        mean_all = mean_flat.view(B, T, H, W).detach().cpu().numpy()
+                            mean_flat = mixture.mean  # shape [B*T*H*W]
+                            mean_all = mean_flat.view(B, T, H, W).detach().cpu().numpy()
+                        else:
+                            mean_all = output.detach().cpu().numpy()
+                            modes_all = mean_all
                         
                     # valid GT range pixels only (invalid are encoded as -1)
                     mask = (gt_all > 0)
@@ -1118,16 +1159,24 @@ def main(args):
 
                 # build & compute 1D‐range loss
                 # mixture, ok = build_range_mixture_distribution(cfg, output)
-                if cfg["model_params"].get("use_mdn", True):
+                pred_rv_for_metrics = None
+                if use_mdn:
                     mixture, ok = model.build_mixture(cfg, output)
                     if not ok:
                         continue
-                    target = future_xyz.to(args.device)
-                    loss_dict = criterion(output, target, mode="val", epoch_number=epoch)
+                    target_ranges = future_ranges.to(args.device)
+                    loss_tensor, nll = compute_nll_range_loss(cfg, mixture, target_ranges)
 
-                    loss_tensor = loss_dict["loss"]
-                    nll = loss_dict["loss_range_view"]
-                    valid_ratio = loss_dict["valid_ratio"]
+                    Bm, Tm, Hm, Wm = target_ranges.shape
+                    pred_rv_for_metrics = mixture.mean.view(Bm, Tm, Hm, Wm)
+                    rv_l1 = masked_l1_on_valid(pred_rv_for_metrics, target_ranges)
+                    valid_ratio = (target_ranges > 0.0).float().mean()
+                    loss_dict = {
+                        "loss": loss_tensor.detach(),
+                        "loss_nll": torch.tensor(nll, device=target_ranges.device),
+                        "loss_range_view": rv_l1.detach(),
+                        "valid_ratio": valid_ratio.detach(),
+                    }
 
                     # ===== PAPER-METRICS: UPDATE VALIDATION SUMS =====
                     if isinstance(loss_dict, dict):
@@ -1164,6 +1213,7 @@ def main(args):
 
                     loss_tensor = (diff * valid).sum() / (valid.sum().clamp_min(1e-8))
                     nll = loss_tensor.item()
+                    pred_rv_for_metrics = output
                     # --- Epoch-Accumulator (pixel-gewichtet, glättet Zickzack) ---
                     # Wichtig: float() damit Summen stabil sind
                     val_abs_sum   += (diff * valid).sum().detach().item()
@@ -1186,30 +1236,28 @@ def main(args):
                     future_for_metrics = future_for_metrics.to(args.device)
 
                     # output kann dict (mit 'rv') ODER Tensor sein
-                    if isinstance(output, dict) and ("rv" in output):
-                        out_for_metrics = output
-                    elif torch.is_tensor(output):
-                        out_for_metrics = {"rv": output}
+                    if pred_rv_for_metrics is not None:
+                        out_for_metrics = {"rv": pred_rv_for_metrics}
                     else:
                         out_for_metrics = None  # sollte nicht passieren
 
                     if out_for_metrics is not None:
                         step = epoch * len(train_loader) + batch_idx
                         if cfg["train_params"]["with_save"]:
-                            model.compute_and_log_metrics(
-                                output=out_for_metrics,
+                            compute_and_log_range_metrics(
+                                pred_rv=out_for_metrics["rv"],
                                 future=future_for_metrics,
                                 writer=writer,
                                 global_step=step,
-                                prefix="val"
+                                prefix="val",
                             )
                         else:
                             # ohne Writer: nur berechnen (kein Log)
-                            _ = model.compute_and_log_metrics(
-                                output=out_for_metrics,
+                            _ = compute_and_log_range_metrics(
+                                pred_rv=out_for_metrics["rv"],
                                 future=future_for_metrics,
                                 writer=None,
-                                prefix="val"
+                                prefix="val",
                             )
                     # === ENDE NEU ===
 
@@ -1222,18 +1270,10 @@ def main(args):
                         # a) Output für Chamfer vorbereiten:
                         #    - ACC-Modelle liefern Dict mit "rv" + "mask_logits"
                         #    - sonst Dummy-mask_logits verwenden
-                        if isinstance(output, dict) and ("rv" in output):
-                            if "mask_logits" in output:
-                                out_for_cd = output
-                            else:
-                                out_for_cd = {
-                                    "rv": output["rv"],
-                                    "mask_logits": torch.zeros_like(output["rv"]),
-                                }
-                        elif torch.is_tensor(output):
+                        if pred_rv_for_metrics is not None:
                             out_for_cd = {
-                                "rv": output,
-                                "mask_logits": torch.zeros_like(output),
+                                "rv": pred_rv_for_metrics,
+                                "mask_logits": torch.zeros_like(pred_rv_for_metrics),
                             }
                         else:
                             out_for_cd = None
@@ -1367,21 +1407,23 @@ def main(args):
                 curr_time = (time.perf_counter() - start_time) * 1000.0  # ms
 
                 # -------- Loss-Berechnung (wie im Validation-Loop) --------
-                if cfg["model_params"].get("use_mdn", True):
+                pred_rv_for_metrics = None
+                if use_mdn:
                     mixture, ok = model.build_mixture(cfg, output)
                     if not ok:
                         continue
 
-                    target = future_xyz  # Loss arbeitet auf xyz
-                    loss_dict = criterion(output, target, mode="test", epoch_number=last_epoch_idx)
-                    loss_tensor = loss_dict["loss"]
-                    nll = loss_dict.get("loss_range_view", loss_tensor).item()
+                    target_ranges = future_ranges
+                    loss_tensor, nll = compute_nll_range_loss(cfg, mixture, target_ranges)
+                    Bm, Tm, Hm, Wm = target_ranges.shape
+                    pred_rv_for_metrics = mixture.mean.view(Bm, Tm, Hm, Wm)
                 else:
                     # Direkte Range-Regression ohne Gaußparameter
                     loss_tensor = torch.nn.functional.l1_loss(
                         output, future_ranges.to(args.device)
                     )
                     nll = loss_tensor.item()
+                    pred_rv_for_metrics = output
 
                 test_loss_sum += loss_tensor.item()
                 test_nll_sum += nll
@@ -1395,20 +1437,18 @@ def main(args):
                 future_for_metrics = future_for_metrics.to(args.device)
 
                 # output kann dict (mit 'rv') ODER Tensor sein
-                if isinstance(output, dict) and ("rv" in output):
-                    out_for_metrics = output
-                elif torch.is_tensor(output):
-                    out_for_metrics = {"rv": output}
+                if pred_rv_for_metrics is not None:
+                    out_for_metrics = {"rv": pred_rv_for_metrics}
                 else:
                     out_for_metrics = None  # sollte nicht passieren
 
                 if out_for_metrics is not None:
                     # Kein Writer -> gibt dict m zurück
-                    m = model.compute_and_log_metrics(
-                        output=out_for_metrics,
+                    m = compute_and_log_range_metrics(
+                        pred_rv=out_for_metrics["rv"],
                         future=future_for_metrics,
                         writer=None,
-                        prefix="test"
+                        prefix="test",
                     )
                     # Wichtige Metriken aufsummieren
                     for k in metrics_sums.keys():
