@@ -19,7 +19,7 @@ model_params: {
   FOV_UP: 3.0,
   FOV_DOWN: -25.0,
   MASK_THRESHOLD: -1.0,
-  preserve_ray_position: false, #true
+  preserve_ray_position: true, #true
   with_attention: true
 }
 data_params: {

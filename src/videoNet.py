@@ -283,6 +283,58 @@ def compute_and_log_range_metrics(pred_rv, future, writer=None, global_step=None
             writer.add_scalar(f"metrics/{prefix}/{k}", v.item(), step)
     return m
 
+def _level_to_tag(level: float) -> str:
+    return f"{int(round(level * 100.0))}"
+
+def compute_mdn_diagnostics(mixture, target_ranges, confidence_levels, n_samples=256, max_pixels=4096):
+    """
+    Compute simple MDN diagnostics over valid target pixels (target > 0):
+      - sigma_mean: mean of alpha-weighted component std per pixel
+      - alpha_entropy: entropy of mixture weights
+      - coverage_<xx>: empirical central interval coverage for level xx (e.g. 68, 95)
+    """
+    target_flat = target_ranges.reshape(-1)
+    valid = target_flat > 0.0
+    out = {}
+
+    if valid.sum() == 0:
+        out["sigma_mean"] = target_ranges.new_tensor(float("nan"))
+        out["alpha_entropy"] = target_ranges.new_tensor(float("nan"))
+        for lvl in confidence_levels:
+            out[f"coverage_{_level_to_tag(float(lvl))}"] = target_ranges.new_tensor(float("nan"))
+        return out
+
+    valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+    if valid_idx.numel() > int(max_pixels):
+        perm = torch.randperm(valid_idx.numel(), device=valid_idx.device)[:int(max_pixels)]
+        valid_idx = valid_idx[perm]
+
+    all_alphas = mixture.mixture_distribution.probs                 # [N,K]
+    all_locs = mixture.component_distribution.loc                   # [N,K]
+    all_scales = mixture.component_distribution.scale               # [N,K]
+    alphas = all_alphas[valid_idx]                                  # [Nv,K]
+    locs = all_locs[valid_idx]                                      # [Nv,K]
+    scales = all_scales[valid_idx]                                  # [Nv,K]
+
+    per_pixel_sigma = (alphas * scales).sum(dim=-1)                # [Nv]
+    per_pixel_entropy = -(alphas * torch.log(alphas + 1e-12)).sum(dim=-1)  # [Nv]
+    out["sigma_mean"] = per_pixel_sigma.mean()
+    out["alpha_entropy"] = per_pixel_entropy.mean()
+
+    tgt = target_flat[valid_idx]
+    mix_small = MixtureSameFamily(Categorical(probs=alphas), Normal(loc=locs, scale=scales))
+    samples = mix_small.sample((int(n_samples),))                  # [S, Nv]
+    for lvl in confidence_levels:
+        lvl_f = float(lvl)
+        lo_q = (1.0 - lvl_f) / 2.0
+        hi_q = 1.0 - lo_q
+        lo = samples.quantile(lo_q, dim=0)
+        hi = samples.quantile(hi_q, dim=0)
+        cov = ((tgt >= lo) & (tgt <= hi)).float().mean()
+        out[f"coverage_{_level_to_tag(lvl_f)}"] = cov
+
+    return out
+
 def main(args):
     global show_pc_flag, show_pdf_flag, show_ray_flag
     with open(args.cfg_path) as file:
@@ -490,6 +542,9 @@ def main(args):
     use_mdn = bool(cfg["model_params"].get("use_mdn", True))
     if use_mdn and not hasattr(model, "build_mixture"):
         raise ValueError("use_mdn=True but selected model has no build_mixture() method.")
+    confidence_levels = [float(x) for x in cfg["train_params"].get("confidence_levels", [0.68, 0.95])]
+    mdn_diag_samples = int(cfg["train_params"].get("num_samples", 200))
+    mdn_diag_max_pixels = int(cfg["train_params"].get("mdn_diag_max_pixels", 4096))
 
     # NEU: Chamfer-Metrik (nur als Metrik, nicht im Trainings-Loss)
     chamfer_metric = cham_dist(cfg)
@@ -1043,6 +1098,22 @@ def main(args):
                     writer.add_scalar('Loss', nll, step)
                     writer.add_scalar('LR', optimizer.param_groups[0]['lr'], step)
 
+                    if use_mdn and mixture is not None:
+                        mdn_diag = compute_mdn_diagnostics(
+                            mixture=mixture,
+                            target_ranges=future_ranges.to(args.device),
+                            confidence_levels=confidence_levels,
+                            n_samples=mdn_diag_samples,
+                            max_pixels=mdn_diag_max_pixels,
+                        )
+                        writer.add_scalar("mdn/train/sigma_mean", mdn_diag["sigma_mean"].item(), step)
+                        writer.add_scalar("mdn/train/alpha_entropy", mdn_diag["alpha_entropy"].item(), step)
+                        for lvl in confidence_levels:
+                            lvl_tag = _level_to_tag(lvl)
+                            cov = mdn_diag[f"coverage_{lvl_tag}"]
+                            writer.add_scalar(f"mdn/train/coverage/{lvl_tag}", cov.item(), step)
+                            writer.add_scalar(f"mdn/train/coverage_error/{lvl_tag}", abs(cov.item() - lvl), step)
+
                     # Anteil gültiger Pixel
                     try:
                         if isinstance(loss_dict, dict) and "valid_ratio" in loss_dict:
@@ -1259,6 +1330,21 @@ def main(args):
                                 writer=None,
                                 prefix="val",
                             )
+                    if cfg["train_params"]["with_save"] and use_mdn and mixture is not None:
+                        mdn_diag = compute_mdn_diagnostics(
+                            mixture=mixture,
+                            target_ranges=future_ranges.to(args.device),
+                            confidence_levels=confidence_levels,
+                            n_samples=mdn_diag_samples,
+                            max_pixels=mdn_diag_max_pixels,
+                        )
+                        writer.add_scalar("mdn/val/sigma_mean", mdn_diag["sigma_mean"].item(), step)
+                        writer.add_scalar("mdn/val/alpha_entropy", mdn_diag["alpha_entropy"].item(), step)
+                        for lvl in confidence_levels:
+                            lvl_tag = _level_to_tag(lvl)
+                            cov = mdn_diag[f"coverage_{lvl_tag}"]
+                            writer.add_scalar(f"mdn/val/coverage/{lvl_tag}", cov.item(), step)
+                            writer.add_scalar(f"mdn/val/coverage_error/{lvl_tag}", abs(cov.item() - lvl), step)
                     # === ENDE NEU ===
 
                     # === Chamfer-Metrik (optional, wie im Paper) ===========
@@ -1381,6 +1467,12 @@ def main(args):
             "acc_mae": 0.0,
             "valid_ratio_mean": 0.0,
         }
+        mdn_test_sums = {
+            "sigma_mean": 0.0,
+            "alpha_entropy": 0.0,
+        }
+        for lvl in confidence_levels:
+            mdn_test_sums[f"coverage_{_level_to_tag(lvl)}"] = 0.0
 
         with torch.no_grad():
             for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(
@@ -1417,6 +1509,18 @@ def main(args):
                     loss_tensor, nll = compute_nll_range_loss(cfg, mixture, target_ranges)
                     Bm, Tm, Hm, Wm = target_ranges.shape
                     pred_rv_for_metrics = mixture.mean.view(Bm, Tm, Hm, Wm)
+                    mdn_diag = compute_mdn_diagnostics(
+                        mixture=mixture,
+                        target_ranges=target_ranges,
+                        confidence_levels=confidence_levels,
+                        n_samples=mdn_diag_samples,
+                        max_pixels=mdn_diag_max_pixels,
+                    )
+                    mdn_test_sums["sigma_mean"] += float(mdn_diag["sigma_mean"])
+                    mdn_test_sums["alpha_entropy"] += float(mdn_diag["alpha_entropy"])
+                    for lvl in confidence_levels:
+                        lvl_tag = _level_to_tag(lvl)
+                        mdn_test_sums[f"coverage_{lvl_tag}"] += float(mdn_diag[f"coverage_{lvl_tag}"])
                 else:
                     # Direkte Range-Regression ohne Gaußparameter
                     loss_tensor = torch.nn.functional.l1_loss(
@@ -1459,10 +1563,12 @@ def main(args):
             test_loss_mean = test_loss_sum / test_batches
             test_nll_mean = test_nll_sum / test_batches
             metrics_mean = {k: v / test_batches for k, v in metrics_sums.items()}
+            mdn_test_mean = {k: v / test_batches for k, v in mdn_test_sums.items()}
         else:
             test_loss_mean = float("nan")
             test_nll_mean = float("nan")
             metrics_mean = {k: float("nan") for k in metrics_sums.keys()}
+            mdn_test_mean = {k: float("nan") for k in mdn_test_sums.keys()}
 
         # ---------- Optional: alles einmal in TensorBoard loggen ----------
         if cfg["train_params"].get("with_save", False):
@@ -1482,7 +1588,15 @@ def main(args):
             writer.add_scalar("test/tv_time",          metrics_mean["tv_time"], final_step)
             writer.add_scalar("test/vel_mae",          metrics_mean["vel_mae"], final_step)
             writer.add_scalar("test/acc_mae",          metrics_mean["acc_mae"], final_step)
-            writer.add_scalar("test/valid_ratio_mean", metrics_mean["valid_ratio_mean"], final_step)    
+            writer.add_scalar("test/valid_ratio_mean", metrics_mean["valid_ratio_mean"], final_step)
+            if use_mdn:
+                writer.add_scalar("mdn/test/sigma_mean", mdn_test_mean["sigma_mean"], final_step)
+                writer.add_scalar("mdn/test/alpha_entropy", mdn_test_mean["alpha_entropy"], final_step)
+                for lvl in confidence_levels:
+                    lvl_tag = _level_to_tag(lvl)
+                    cov_val = mdn_test_mean[f"coverage_{lvl_tag}"]
+                    writer.add_scalar(f"mdn/test/coverage/{lvl_tag}", cov_val, final_step)
+                    writer.add_scalar(f"mdn/test/coverage_error/{lvl_tag}", abs(cov_val - lvl), final_step)
             
     if cfg["train_params"]["with_save"]:
         torch.save(model.state_dict(), os.path.join(save_path, "weights", "model_final.pt"))

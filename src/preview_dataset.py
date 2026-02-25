@@ -115,7 +115,7 @@ def main():
     parser.add_argument(
         "--cfg_path",
         type=str,
-        default="/home/devuser/workspace/src/configs/thab_default.yaml", #thab_default semanticKitti_default
+        default="/home/devuser/workspace/src/configs/semanticKitti_default.yaml", #thab_default semanticKitti_default
         help="Path to training config YAML.",
     )
     parser.add_argument(
