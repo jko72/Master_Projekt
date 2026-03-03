@@ -270,7 +270,6 @@ def compute_and_log_range_metrics(pred_rv, future, writer=None, global_step=None
         return m
 
     step = 0 if global_step is None else global_step
-    writer.add_scalar(f"paper/{prefix}/range_view_metric_L1", m["mae_mean"].item(), step)
     writer.add_scalar(f"metrics/{prefix}/mae_mean", m["mae_mean"].item(), step)
     writer.add_scalar(f"metrics/{prefix}/rmse_mean", m["rmse_mean"].item(), step)
     writer.add_scalar(f"metrics/{prefix}/logrmse_mean", m["logrmse_mean"].item(), step)
@@ -1412,10 +1411,6 @@ def main(args):
             if cfg["train_params"]["with_save"] and val_valid_sum > 0:
                 rv_epoch = val_abs_sum / max(val_valid_sum, 1e-8)
 
-                # "paper/" Name (klarer Vergleich)
-                writer.add_scalar("paper/val/range_view_metric_L1_epoch", rv_epoch, epoch)
-
-                # optional: auch unter deinem bisherigen Key
                 writer.add_scalar("val/range_view_metric_L1_epoch", rv_epoch, epoch)
 
                 print(f"[VAL][EPOCH] range_view_metric_L1_epoch (pixel-weighted): {rv_epoch:.6f}")
@@ -1615,7 +1610,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cfg_path",
         type=str,
-        default="/home/devuser/workspace/src/configs/semanticKitti_default.yaml" # thab_default  semanticKitti_default
+        default="/home/devuser/workspace/src/configs/thab_default.yaml" # thab_default  semanticKitti_default
     )
     
     parser.add_argument(

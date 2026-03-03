@@ -1,8 +1,8 @@
 dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
 
 model_params: {
-  name: "swin", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
-  use_mdn: true, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
+  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
+  use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
   mdn_num_gaussians: 1, # 9
   input_horizon: 10,
@@ -19,7 +19,7 @@ model_params: {
   FOV_UP: 3.0,
   FOV_DOWN: -25.0,
   MASK_THRESHOLD: -1.0,
-  preserve_ray_position: true, #true
+  preserve_ray_position: false, #true
   with_attention: true
 }
 data_params: {
@@ -45,7 +45,7 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 1, #Test:1, Standard: 8 bis 12, 
+  num_total_epochs: 20, #Test:1, Standard: 8 bis 12, 
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
@@ -54,7 +54,7 @@ train_params: {
   cudnn_benchmark: true,
 
   # BATCH SIZE
-  batch_size: 4,
+  batch_size: 8,
 
   # LEARNING RATE
   start_learning_rate: 5.e-4,
