@@ -312,20 +312,26 @@ def build_range_mixture_distribution(
     # positive mean via softplus
     mu_deltas = F.softplus(raw_mu) + eps_mu     # positive increments
     mu = torch.cumsum(mu_deltas, dim=-1)        # ascending means
-    # positive sigma via exp
-    sigma = torch.exp(raw_logsig) + eps_sigma
-    sigma = sigma.clamp(max=10.0)               # keeps variance reasonable while head is immature
-    # temperature-scaled mixture weights
-    temp = F.softplus(alpha_temp) + 1e-6
-    alpha = F.softmax(raw_logits / temp, dim=-1)
+    # positive sigma via softplus (numerically safer than exp)
+    sigma = F.softplus(raw_logsig) + eps_sigma
+    sigma = sigma.clamp(min=eps_sigma, max=10.0)  # keeps variance reasonable while head is immature
+    # temperature-scaled mixture logits
+    temp = F.softplus(alpha_temp).clamp_min(1e-4)
+    logits = raw_logits / temp
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
 
     # flatten for distribution
     N = B * T * H * W
-    mu_flat     = mu.reshape(N, K)
-    sigma_flat  = sigma.reshape(N, K)
-    alpha_flat  = alpha.reshape(N, K)
+    mu_flat = torch.nan_to_num(mu.reshape(N, K), nan=0.0, posinf=1e4, neginf=0.0)
+    sigma_flat = torch.nan_to_num(sigma.reshape(N, K), nan=1.0, posinf=10.0, neginf=eps_sigma).clamp(min=eps_sigma, max=10.0)
+    logits_flat = logits.reshape(N, K)
 
-    cat  = Categorical(probs=alpha_flat)
+    if not (torch.isfinite(mu_flat).all() and torch.isfinite(sigma_flat).all() and torch.isfinite(logits_flat).all()):
+        return None, False
+
+    if K == 1:
+        logits_flat = torch.zeros_like(logits_flat)
+    cat = Categorical(logits=logits_flat)
     comp = Normal(loc=mu_flat, scale=sigma_flat)
     mix  = MixtureSameFamily(cat, comp)
     return mix, True
@@ -340,8 +346,17 @@ def compute_nll_range_loss(
 ):
     target_flat = target_ranges.reshape(-1)
     mask = target_flat > 0
+    if not mask.any():
+        zero = mixture_dist.component_distribution.loc.sum() * 0.0
+        return zero, 0.0
+
     log_p = mixture_dist.log_prob(target_flat)
-    nll = -log_p[mask].mean()
+    log_p_valid = log_p[mask]
+    finite_mask = torch.isfinite(log_p_valid)
+    if not finite_mask.any():
+        zero = mixture_dist.component_distribution.loc.sum() * 0.0
+        return zero, 0.0
+    nll = -log_p_valid[finite_mask].mean()
 
     reg = 0.0
     if with_sigma_regularization:
@@ -351,8 +366,8 @@ def compute_nll_range_loss(
         kl = torch.distributions.kl_divergence(q, p).mean()
         reg += kl * cfg["train_params"].get("lambda_sigma", 1e-3)
     if with_alpha_regularization:
-        alphas = mixture_dist.mixture_distribution.probs
-        entropy = -(alphas * torch.log(alphas + 1e-12)).sum(dim=-1).mean()
+        alphas = mixture_dist.mixture_distribution.probs.clamp_min(1e-12)
+        entropy = -(alphas * torch.log(alphas)).sum(dim=-1).mean()
         reg -= entropy * cfg["train_params"].get("lambda_alpha", 5e-2)
         # Shannon entropy, measures the uncertainty or spread of the categorical distribution over components.
         # If one α_k ​is near 1 and the others near 0, H(α)≈0: the model is very "confident" in a single component.
@@ -363,7 +378,10 @@ def compute_nll_range_loss(
 
 
     loss = nll + reg
-    return loss, nll.item()
+    if not torch.isfinite(loss):
+        zero = mixture_dist.component_distribution.loc.sum() * 0.0
+        return zero, 0.0
+    return loss, float(nll.detach())
 
 
 # def build_range_mixture_distribution(

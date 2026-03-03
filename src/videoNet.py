@@ -589,6 +589,7 @@ def main(args):
         return (eta_min / base_lr) + (1 - eta_min / base_lr) * cos
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    max_grad_norm = float(cfg["train_params"].get("clip_grad_norm", 0.0))
 
     # TensorBoard
     if cfg["train_params"]["with_save"]:
@@ -820,7 +821,8 @@ def main(args):
                 loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
                 nll = loss_tensor.item()
             # add batch's train loss to overall loss
-            total_loss += nll
+            if np.isfinite(nll):
+                total_loss += nll
                 
                 # Nur bei MDN aktiv – mixture existiert nur dann
             if use_mdn:
@@ -835,8 +837,19 @@ def main(args):
             
             print(f"inference took {curr_time:.3f} ms.\tLR: {optimizer.param_groups[0]['lr']}\tloss: {nll:.3f}\t@Epoch {epoch+1}/{cfg['train_params']['num_total_epochs']}")
             
-            optimizer.zero_grad()
+            if not torch.isfinite(loss_tensor):
+                print(f"[WARN] Non-finite loss at epoch={epoch+1}, batch={batch_idx}. Skip optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
             loss_tensor.backward()
+            if max_grad_norm > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if not torch.isfinite(torch.as_tensor(grad_norm)):
+                    print(f"[WARN] Non-finite grad norm at epoch={epoch+1}, batch={batch_idx}. Skip optimizer step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             optimizer.step()
             scheduler.step()
 
