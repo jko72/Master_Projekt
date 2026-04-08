@@ -1,12 +1,12 @@
 dataset_path: "/home/devuser/workspace/data/datasets/SemanticTHAB/sequences"
 
 model_params: {
-  name: "swin", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
-  use_mdn: true, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
+  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
+  use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
   mdn_output_dim: 3,
-  mdn_num_gaussians: 1, # 9
+  mdn_num_gaussians: 3, # 9
   input_horizon: 10, 
-  forecast_horizon: 3, #  auf 4 erhöhen für vorhersage auf 3s, vorher 3
+  forecast_horizon: 3,
   dropout_prob: 0.3,
   mdn_dropout_prob: 0.2,
   grid_height: 64, #64
@@ -34,7 +34,7 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 20, #Test:1, Standard: 8 bis 20, 
+  num_total_epochs: 1, #Test:1, Standard: 8 bis 20, 
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
@@ -43,13 +43,13 @@ train_params: {
   cudnn_benchmark: true,
 
   # BATCH SIZE
-  batch_size: 4,
+  batch_size: 2,
 
   # LEARNING RATE
   start_learning_rate: 5.e-4,
   num_warmup_epochs: 2,
   weight_decay: 1.e-4,        # typical: 1.e-2 -> 1.e-4
-  alpha_temperature_init: 0.25,
+  alpha_temperature_init: 0.5, #0.25
 
   build_mixture_variance_epsilon: 1.e-5,
   build_mixture_variance_mu: 1.e-5,
