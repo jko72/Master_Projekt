@@ -21,7 +21,7 @@ DEFAULT_WEIGHTS_PATH = "/home/devuser/workspace/LidarGaussianVideoView/logs/Sema
 
 # Debug switch: set to "2d", "3d" or "both" for IDE/debugger runs.
 # If None, CLI --viz_mode is used.
-DEBUG_VIZ_MODE_OVERRIDE = "3d"
+DEBUG_VIZ_MODE_OVERRIDE = "2d"
 # 3D camera start zoom for debugger runs (smaller = farther away).
 DEBUG_3D_CAMERA_ZOOM = 0.19
 # Smooth visualization overrides for debugger runs.
