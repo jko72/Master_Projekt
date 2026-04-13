@@ -43,7 +43,7 @@ train_params: {
   cudnn_benchmark: true,
 
   # BATCH SIZE
-  batch_size: 2,
+  batch_size: 4,
 
   # LEARNING RATE
   start_learning_rate: 5.e-4,
