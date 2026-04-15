@@ -21,7 +21,7 @@ DEFAULT_WEIGHTS_PATH = "/home/devuser/workspace/LidarGaussianVideoView/logs/Sema
 
 # Debug switch: set to "2d", "3d" or "both" for IDE/debugger runs.
 # If None, CLI --viz_mode is used.
-DEBUG_VIZ_MODE_OVERRIDE = "2d"
+DEBUG_VIZ_MODE_OVERRIDE = "3d"
 # 3D camera start zoom for debugger runs (smaller = farther away).
 DEBUG_3D_CAMERA_ZOOM = 0.19
 # Smooth visualization overrides for debugger runs.
@@ -425,6 +425,7 @@ def main(args):
     pcd_pred = None
     phi_grid = None
     theta_grid = None
+    o3d_window_open = False
     if wants_3d_render:
         try:
             import open3d as o3d  # type: ignore
@@ -441,6 +442,7 @@ def main(args):
 
         vis = o3d.visualization.Visualizer()
         vis.create_window(window_name="LiDAR 3D | GT (gray) vs Pred (blue)", width=1280, height=720)
+        o3d_window_open = True
         pcd_gt = o3d.geometry.PointCloud()
         pcd_pred = o3d.geometry.PointCloud()
         vis.add_geometry(pcd_gt)
@@ -463,6 +465,7 @@ def main(args):
     print(f"use_mdn          : {use_mdn}")
     print(f"Visualization    : {mode}")
     print(f"Viz mode source  : {mode_source}")
+    print(f"Hold windows     : {args.hold_windows}")
     print(
         f"Viz loader       : batch_size={getattr(eval_loader, 'batch_size', '?')} "
         f"num_workers={getattr(eval_loader, 'num_workers', '?')}"
@@ -570,7 +573,7 @@ def main(args):
                             plt.pause(max(0.001, args.interval_ms / 1000.0))
                             visualized_2d += 1
 
-                    if wants_3d_render:
+                    if wants_3d_render and o3d_window_open:
                         t_idx = args.pc_horizon_idx
                         gt_pts = range_image_to_points(
                             gt_sample[t_idx], phi_grid, theta_grid, valid_mask=valid[t_idx], max_points=args.pc_max_points
@@ -595,8 +598,11 @@ def main(args):
 
                         vis.update_geometry(pcd_gt)
                         vis.update_geometry(pcd_pred)
-                        vis.poll_events()
+                        o3d_window_open = bool(vis.poll_events())
                         vis.update_renderer()
+                        if not o3d_window_open:
+                            print("[INFO][3D] Open3D window was closed. Continuing without 3D rendering.")
+                            continue
                         if not first_3d_fit_done:
                             configure_open3d_camera(vis, gt_pts, pred_pts)
                             first_3d_fit_done = True
@@ -620,7 +626,11 @@ def main(args):
 
     if wants_2d_render:
         plt.ioff()
-        plt.show()
+        if args.hold_windows:
+            plt.show()
+        else:
+            plt.show(block=False)
+            plt.pause(0.05)
 
 
 def build_argparser():
@@ -669,6 +679,11 @@ def build_argparser():
     )
     parser.add_argument("--no_show", action="store_true")
     parser.add_argument("--no_save", action="store_true")
+    parser.add_argument(
+        "--hold_windows",
+        action="store_true",
+        help="Keep visualization windows open and block at script end.",
+    )
     return parser
 
 
