@@ -18,16 +18,15 @@ from utils_torch import make_angle_grids
 # Optional: set a fixed weights path directly in this script.
 # Used as fallback if --weights and cfg train_params.pre_train_weights are not set.
 DEFAULT_WEIGHTS_PATH = "/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticKITTI ohne Ray/weights/model_final.pt"
-
-# Debug switch: set to "2d", "3d" or "both" for IDE/debugger runs.
+            # Paper Checkpoint: "/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt" 
 # If None, CLI --viz_mode is used.
-DEBUG_VIZ_MODE_OVERRIDE = "3d"
+DEBUG_VIZ_MODE_OVERRIDE = "both"
 # 3D camera start zoom for debugger runs (smaller = farther away).
 DEBUG_3D_CAMERA_ZOOM = 0.19
 # Smooth visualization overrides for debugger runs.
 # If None, CLI args (--viz_batch_size / --viz_num_workers) are used.
 DEBUG_VIZ_BATCH_SIZE_OVERRIDE = 4
-DEBUG_VIZ_NUM_WORKERS_OVERRIDE = 2
+DEBUG_VIZ_NUM_WORKERS_OVERRIDE = 4
 
 
 def print_runtime_info(cfg: dict, device: str) -> None:
