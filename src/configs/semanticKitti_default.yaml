@@ -1,4 +1,16 @@
 dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
+residual_params: {
+  enabled: true,
+  mode: "precompute",
+  offsets: [1],
+  normalize: true,
+  min_range: 2.0,
+  max_range: 50.0,
+  invalid_value: 0.0,
+  folder_template: "residual_images_{offset}",
+  overwrite: false,
+  visualize_debug: false
+}
 
 model_params: {
   name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
