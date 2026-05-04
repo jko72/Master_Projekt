@@ -97,7 +97,27 @@ def _load_residuals_for_history(ds, idx: int, cfg: dict, residual_offset: int):
     return np.stack(residuals, axis=0), residual_paths, missing_paths
 
 
-def _draw_frame(fig, axes, ds, cfg: dict, idx: int, split: str, vmin: float, vmax: float, show_residuals: bool, residual_offset: int):
+def _residual_stats(residuals: np.ndarray, invalid_value: float):
+    valid_mask = residuals > float(invalid_value)
+    valid_ratio = float(valid_mask.mean())
+    if np.any(valid_mask):
+        vals = residuals[valid_mask].astype(np.float32)
+        mean_valid = float(np.mean(vals))
+        max_valid = float(np.max(vals))
+        p95_valid = float(np.percentile(vals, 95))
+    else:
+        mean_valid = 0.0
+        max_valid = 0.0
+        p95_valid = 0.0
+    return {
+        "valid_ratio": valid_ratio,
+        "mean_valid": mean_valid,
+        "max_valid": max_valid,
+        "p95_valid": p95_valid,
+    }
+
+
+def _draw_frame(fig, axes, ds, cfg: dict, idx: int, split: str, vmin: float, vmax: float, show_residuals: bool, residual_offset: int, residuals_only: bool = False):
     hist_xyzd, future_xyz, future_ranges = ds[idx]
 
     s_id, start = ds.windows[idx]
@@ -109,40 +129,58 @@ def _draw_frame(fig, axes, ds, cfg: dict, idx: int, split: str, vmin: float, vma
     residuals = None
     residual_paths = []
     missing_residual_paths = []
+    residual_stats = None
     if show_residuals:
         residuals, residual_paths, missing_residual_paths = _load_residuals_for_history(ds, idx, cfg, residual_offset)
+        invalid_value = float(cfg.get("residual_params", {}).get("invalid_value", 0.0))
+        residual_stats = _residual_stats(residuals, invalid_value)
 
     t_in = hist_ranges.shape[0]
     t_out = fut_ranges.shape[0]
-    n_cols = max(t_in, t_out)
+    n_slots = t_in if residuals_only else max(t_in, t_out)
 
     ims = []
-    for i in range(n_cols):
-        ax_in = axes[0, i]
-        ax_out = axes[1, i]
-        ax_in.clear()
-        ax_out.clear()
+    for i in range(n_slots):
+        if not residuals_only:
+            ax_in = axes[0, i]
+            ax_out = axes[1, i]
+            ax_in.clear()
+            ax_out.clear()
 
-        if i < t_in:
-            im = ax_in.imshow(hist_ranges[i], cmap="turbo", vmin=vmin, vmax=vmax)
-            ims.append(im)
-            ax_in.set_title(f"Input t-{t_in - i}")
-            ax_in.set_xticks([])
-            ax_in.set_yticks([])
-        else:
-            ax_in.axis("off")
+            if i < t_in:
+                im = ax_in.imshow(hist_ranges[i], cmap="turbo", vmin=vmin, vmax=vmax)
+                ims.append(im)
+                ax_in.set_title(f"Input t-{t_in - i}")
+                ax_in.set_xticks([])
+                ax_in.set_yticks([])
+            else:
+                ax_in.axis("off")
 
-        if i < t_out:
-            im = ax_out.imshow(fut_ranges[i], cmap="turbo", vmin=vmin, vmax=vmax)
-            ims.append(im)
-            ax_out.set_title(f"Target +{i + 1}")
-            ax_out.set_xticks([])
-            ax_out.set_yticks([])
-        else:
-            ax_out.axis("off")
+            if i < t_out:
+                im = ax_out.imshow(fut_ranges[i], cmap="turbo", vmin=vmin, vmax=vmax)
+                ims.append(im)
+                ax_out.set_title(f"Target +{i + 1}")
+                ax_out.set_xticks([])
+                ax_out.set_yticks([])
+            else:
+                ax_out.axis("off")
 
-        if show_residuals:
+        if show_residuals and not residuals_only:
             ax_res = axes[2, i]
+            ax_res.clear()
+            if i < t_in:
+                residual_vmax = 1.0 if cfg.get("residual_params", {}).get("normalize", True) else float(np.nanmax(residuals[i]) if np.isfinite(np.nanmax(residuals[i])) else 1.0)
+                if residual_vmax <= 0:
+                    residual_vmax = 1.0
+                im_res = ax_res.imshow(residuals[i], cmap="turbo", vmin=0.0, vmax=residual_vmax)
+                ims.append(im_res)
+                ax_res.set_title(f"Residual t-{t_in - i}")
+                ax_res.set_xticks([])
+                ax_res.set_yticks([])
+            else:
+                ax_res.axis("off")
+        elif show_residuals and residuals_only:
+            ax_res = axes[i, 0]
             ax_res.clear()
             if i < t_in:
                 residual_vmax = 1.0 if cfg.get("residual_params", {}).get("normalize", True) else float(np.nanmax(residuals[i]) if np.isfinite(np.nanmax(residuals[i])) else 1.0)
@@ -170,6 +208,7 @@ def _draw_frame(fig, axes, ds, cfg: dict, idx: int, split: str, vmin: float, vma
         "future_xyz_shape": tuple(future_xyz.shape),
         "future_ranges_shape": tuple(future_ranges.shape),
         "residuals_shape": tuple(residuals.shape) if residuals is not None else None,
+        "residual_stats": residual_stats,
         "residual_paths": residual_paths,
         "missing_residual_paths": missing_residual_paths,
         "ims": ims,
@@ -193,6 +232,9 @@ def main():
     parser.add_argument("--max_windows", type=int, default=None, help="Optional limit for number of windows in play mode.")
     parser.add_argument("--show_residuals", action="store_true", help="Load and show precomputed residual images for history frames.")
     parser.add_argument("--residual_offset", type=int, default=1, help="Residual offset folder index (e.g., 1 -> residual_images_1).")
+    parser.add_argument("--residuals_only", action="store_true", help="Show only residual row (requires --show_residuals).")
+    parser.add_argument("--fig_w_per_col", type=float, default=3.2, help="Figure width per column.")
+    parser.add_argument("--fig_h_per_row", type=float, default=3.2, help="Figure height per row.")
     args = parser.parse_args()
 
     if args.stride <= 0:
@@ -215,9 +257,22 @@ def main():
 
     first_hist, _, first_fut = ds[0]
     n_cols = max(first_hist.shape[0], first_fut.shape[0])
-    n_rows = 3 if args.show_residuals else 2
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 3.2 * n_rows), constrained_layout=True)
-    if n_cols == 1:
+    if args.residuals_only and not args.show_residuals:
+        raise ValueError("--residuals_only requires --show_residuals.")
+    if args.residuals_only:
+        n_rows = int(first_hist.shape[0])
+        n_cols = 1
+    else:
+        n_rows = 3 if args.show_residuals else 2
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(args.fig_w_per_col * n_cols, args.fig_h_per_row * n_rows),
+        constrained_layout=True,
+    )
+    if n_rows == 1:
+        axes = np.array(axes).reshape(1, n_cols)
+    elif n_cols == 1:
         axes = np.array(axes).reshape(n_rows, 1)
 
     hist_ranges0 = first_hist[:, 3, :, :].numpy()
@@ -234,6 +289,9 @@ def main():
     print(f"show_residuals : {args.show_residuals}")
     if args.show_residuals:
         print(f"residual_offset: {args.residual_offset}")
+    print(f"residuals_only : {args.residuals_only}")
+    print(f"fig_w_per_col  : {args.fig_w_per_col}")
+    print(f"fig_h_per_row  : {args.fig_h_per_row}")
 
     if args.play:
         if args.no_show:
@@ -250,7 +308,7 @@ def main():
         print("controls       : close window to stop")
 
         for idx in indices:
-            meta = _draw_frame(fig, axes, ds, cfg, idx, args.split, vmin, vmax, args.show_residuals, args.residual_offset)
+            meta = _draw_frame(fig, axes, ds, cfg, idx, args.split, vmin, vmax, args.show_residuals, args.residual_offset, args.residuals_only)
             if (not cbar_created) and meta["ims"]:
                 cbar = fig.colorbar(meta["ims"][-1], ax=axes.ravel().tolist(), shrink=0.85)
                 cbar.set_label("Range/Residual")
@@ -259,6 +317,13 @@ def main():
             print(f"idx={idx} seq={meta['seq_id']} window_start={meta['window_start']}")
             if args.show_residuals:
                 print(f"residuals_shape : {meta['residuals_shape']}")
+                print(
+                    "residual_stats : "
+                    f"valid_ratio={meta['residual_stats']['valid_ratio']:.4f} "
+                    f"mean_valid={meta['residual_stats']['mean_valid']:.6f} "
+                    f"max_valid={meta['residual_stats']['max_valid']:.6f} "
+                    f"p95_valid={meta['residual_stats']['p95_valid']:.6f}"
+                )
                 for p in meta["residual_paths"]:
                     print(f"residual_path   : {p}")
             fig.canvas.draw_idle()
@@ -273,7 +338,7 @@ def main():
         return
 
     idx = _pick_index(len(ds), args.sample_index, args.random_sample, args.seed)
-    meta = _draw_frame(fig, axes, ds, cfg, idx, args.split, vmin, vmax, args.show_residuals, args.residual_offset)
+    meta = _draw_frame(fig, axes, ds, cfg, idx, args.split, vmin, vmax, args.show_residuals, args.residual_offset, args.residuals_only)
 
     if meta["ims"]:
         cbar = fig.colorbar(meta["ims"][-1], ax=axes.ravel().tolist(), shrink=0.85)
@@ -287,6 +352,13 @@ def main():
     print(f"future_ranges  : {meta['future_ranges_shape']}")
     if args.show_residuals:
         print(f"residuals      : {meta['residuals_shape']}")
+        print(
+            "residual_stats : "
+            f"valid_ratio={meta['residual_stats']['valid_ratio']:.4f} "
+            f"mean_valid={meta['residual_stats']['mean_valid']:.6f} "
+            f"max_valid={meta['residual_stats']['max_valid']:.6f} "
+            f"p95_valid={meta['residual_stats']['p95_valid']:.6f}"
+        )
         for p in meta["residual_paths"]:
             print(f"residual_path  : {p}")
 
