@@ -11,6 +11,18 @@ residual_params: {
   overwrite: false,
   visualize_debug: false
 }
+mos_label_params: {
+  enabled: true,
+  mode: "precompute",
+  folder_name: "mos_labels",
+  ignore_index: -1,
+  static_index: 0,
+  moving_index: 1,
+  overwrite: false,
+  min_range: 0.0,
+  max_range: 80.0,
+  label_mapping: "semantickitti_mos"
+}
 
 model_params: {
   name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
