@@ -219,13 +219,14 @@ class MOSFrameDataset(Dataset):
                 mos_label_path = os.path.join(seq_dir, self.mos_label_folder, f"{frame_stem}.npy")
 
                 self._total_frames += 1
+                # Always read label stats so summary counters are valid even when require_moving=False.
+                st = self._get_cached_or_load_label_stats(mos_label_path)
+                moving_pixels = int(st["moving_pixels"])
+                if moving_pixels > 0:
+                    self._frames_with_moving += 1
+
                 include = True
-                moving_pixels = None
                 if self.require_moving:
-                    st = self._get_cached_or_load_label_stats(mos_label_path)
-                    moving_pixels = int(st["moving_pixels"])
-                    if moving_pixels > 0:
-                        self._frames_with_moving += 1
                     if moving_pixels < self.min_moving_pixels:
                         include = False
                         self._filtered_out_frames += 1
@@ -352,4 +353,3 @@ class MOSFrameDataset(Dataset):
         stats = self._pixel_counts_from_label(label_img)
         self._label_stats_cache[mos_label_path] = stats
         return stats
-

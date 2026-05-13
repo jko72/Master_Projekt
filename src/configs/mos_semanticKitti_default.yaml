@@ -1,0 +1,66 @@
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+
+model_params:
+  grid_height: 64
+  grid_width: 512
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.0
+  max_range: 80.0
+
+mos_data_params:
+  input_mode: "range_residual"     # "range", "residual", "range_residual"
+  residual_offsets: [1]
+  residual_folder_template: "residual_images_{offset}"
+  mos_label_folder: "mos_labels"
+
+  ignore_index: -1
+  static_index: 0
+  moving_index: 1
+
+  train_sequences: ["07"]
+  val_sequences: ["08"]
+
+  require_moving_train: false
+  require_moving_val: false
+  min_moving_pixels: 1
+
+  use_moving_frame_sampler: false
+  moving_frame_weight: 5.0
+  static_frame_weight: 1.0
+
+mos_model_params:
+  name: "unet_small"
+  in_channels: 2
+  num_classes: 2
+  base_channels: 32
+  dropout: 0.1
+  norm: "batch"
+
+mos_train_params:
+  batch_size: 8
+  num_workers: 4
+  epochs: 10
+
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  clip_grad_norm: 5.0
+
+  static_class_weight: 1.0
+  moving_class_weight: 10.0
+
+  optimizer: "adamw"
+  scheduler: "none"
+
+  seed: 42
+  deterministic: false
+
+mos_log_params:
+  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  run_name: "mos_baseline_seq07_to_seq08"
+  use_tensorboard: true
+
+  save_checkpoints: false
+  save_visuals: false
+  save_csv: false
+  save_config_copy: false
