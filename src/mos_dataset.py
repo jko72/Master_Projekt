@@ -14,7 +14,7 @@ from utils_torch import spherical_projection
 class MOSFrameDataset(Dataset):
     """Frame-wise dataset for Moving Object Segmentation on range-view grids."""
 
-    ALLOWED_INPUT_MODES = {"range", "residual", "range_residual"}
+    ALLOWED_INPUT_MODES = {"range", "residual", "range_residual", "range_xyz", "range_xyz_residual"}
     ALLOWED_LABEL_VALUES = {-1, 0, 1}
 
     def __init__(
@@ -46,7 +46,7 @@ class MOSFrameDataset(Dataset):
                 f"Unsupported input_mode='{self.input_mode}'. "
                 f"Use one of {sorted(self.ALLOWED_INPUT_MODES)}."
             )
-        if self.input_mode in {"residual", "range_residual"} and len(self.residual_offsets) == 0:
+        if self.input_mode in {"residual", "range_residual", "range_xyz_residual"} and len(self.residual_offsets) == 0:
             raise ValueError("Residual input mode needs at least one residual offset.")
 
         mp = self.cfg["model_params"]
@@ -85,18 +85,25 @@ class MOSFrameDataset(Dataset):
         sample = self.samples[idx]
 
         x_channels: List[np.ndarray] = []
+        channel_names: List[str] = []
         if self.input_mode in {"range", "range_residual"}:
             range_img = self._load_range_image(sample["scan_path"])
             x_channels.append(range_img)
+            channel_names.append("range")
+        elif self.input_mode in {"range_xyz", "range_xyz_residual"}:
+            range_img, x_img, y_img, z_img = self._load_projected_xyzd(sample["scan_path"])
+            x_channels.extend([range_img, x_img, y_img, z_img])
+            channel_names.extend(["range", "x", "y", "z"])
 
         residual_paths = []
-        if self.input_mode in {"residual", "range_residual"}:
+        if self.input_mode in {"residual", "range_residual", "range_xyz_residual"}:
             for off in self.residual_offsets:
                 res_path = os.path.join(
                     sample["seq_dir"], f"residual_images_{off}", f"{sample['frame_stem']}.npy"
                 )
                 residual_paths.append(res_path)
                 x_channels.append(self._load_residual_image(res_path))
+                channel_names.append(f"residual_{int(off)}")
 
         x = torch.from_numpy(np.stack(x_channels, axis=0).astype(np.float32))
 
@@ -113,6 +120,7 @@ class MOSFrameDataset(Dataset):
             "residual_paths": residual_paths,
             "mos_label_path": mos_label_path,
             "input_mode": self.input_mode,
+            "channel_names": channel_names,
             "moving_pixels": int(pix_stats["moving_pixels"]),
             "static_pixels": int(pix_stats["static_pixels"]),
             "ignore_pixels": int(pix_stats["ignore_pixels"]),
@@ -174,7 +182,16 @@ class MOSFrameDataset(Dataset):
             return 1
         if self.input_mode == "residual":
             return len(self.residual_offsets)
-        return 1 + len(self.residual_offsets)
+        if self.input_mode == "range_residual":
+            return 1 + len(self.residual_offsets)
+        if self.input_mode == "range_xyz":
+            return 4
+        if self.input_mode == "range_xyz_residual":
+            return 4 + len(self.residual_offsets)
+        raise ValueError(
+            f"Unsupported input_mode='{self.input_mode}'. "
+            f"Use one of {sorted(self.ALLOWED_INPUT_MODES)}."
+        )
 
     @staticmethod
     def _parse_residual_offsets(residual_offsets) -> List[int]:
@@ -260,7 +277,7 @@ class MOSFrameDataset(Dataset):
             return str(path_entry)
         return None
 
-    def _load_range_image(self, scan_path: str) -> np.ndarray:
+    def _load_projected_xyzd(self, scan_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if not os.path.isfile(scan_path):
             raise FileNotFoundError(f"Scan file not found: {scan_path}")
         pts = np.fromfile(scan_path, dtype=np.float32)
@@ -276,17 +293,42 @@ class MOSFrameDataset(Dataset):
 
         if pj_img.ndim != 3:
             raise ValueError(f"spherical_projection returned unexpected shape {pj_img.shape} for {scan_path}")
+        if pj_img.shape[0] != self.H or pj_img.shape[1] != self.W:
+            raise ValueError(
+                f"spherical_projection returned unexpected spatial shape {pj_img.shape[:2]} "
+                f"for {scan_path}; expected {(self.H, self.W)}"
+            )
+        if pj_img.shape[2] < 3:
+            raise ValueError(
+                f"spherical_projection returned {pj_img.shape[2]} channels for {scan_path}, "
+                "but at least 3 channels (x,y,z) are required."
+            )
 
-        if pj_img.shape[2] >= 3:
-            xyz = pj_img[:, :, :3].astype(np.float32)
-            range_img = np.sqrt(np.sum(xyz * xyz, axis=2, dtype=np.float32)).astype(np.float32)
-        else:
-            range_img = pj_img[:, :, 0].astype(np.float32)
+        x_img = pj_img[:, :, 0].astype(np.float32)
+        y_img = pj_img[:, :, 1].astype(np.float32)
+        z_img = pj_img[:, :, 2].astype(np.float32)
 
-        invalid = ~np.isfinite(range_img)
+        range_img = np.sqrt((x_img * x_img) + (y_img * y_img) + (z_img * z_img)).astype(np.float32)
+
+        invalid = (
+            ~np.isfinite(x_img)
+            | ~np.isfinite(y_img)
+            | ~np.isfinite(z_img)
+            | ~np.isfinite(range_img)
+            | (range_img <= 0.0)
+        )
         if np.any(invalid):
+            x_img[invalid] = 0.0
+            y_img[invalid] = 0.0
+            z_img[invalid] = 0.0
             range_img[invalid] = 0.0
-        range_img = np.where(range_img > 0.0, range_img, 0.0).astype(np.float32)
+
+        return range_img.astype(np.float32), x_img.astype(np.float32), y_img.astype(np.float32), z_img.astype(
+            np.float32
+        )
+
+    def _load_range_image(self, scan_path: str) -> np.ndarray:
+        range_img, _, _, _ = self._load_projected_xyzd(scan_path)
         return range_img
 
     def _load_residual_image(self, residual_path: str) -> np.ndarray:

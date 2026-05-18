@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "residual"     # "range", "residual", "range_residual"
+  input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
@@ -30,8 +30,8 @@ mos_data_params:
   static_frame_weight: 1.0
 
 mos_model_params:
-  name: "unet_small"
-  in_channels: 2
+  name: "salsanext_mos"  # "unet_small"
+  in_channels: 5  # auto-overwritten in train_mos.py based on input_mode + residual_offsets
   num_classes: 2
   base_channels: 32
   dropout: 0.1
@@ -40,7 +40,7 @@ mos_model_params:
 mos_train_params:
   batch_size: 16
   num_workers: 6
-  epochs: 50
+  epochs: 1
 
   learning_rate: 0.0005
   weight_decay: 0.0001

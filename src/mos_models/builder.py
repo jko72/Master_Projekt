@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .mos_unet import MOSUNetSmall
+from .salsanext_mos import SalsaNextMOS
 
 
 def build_mos_model(cfg):
@@ -21,6 +22,12 @@ def build_mos_model(cfg):
             dropout=dropout,
             norm=norm,
         )
+    if name in {"salsanext", "salsanext_mos"}:
+        # SalsaNextMOS returns raw logits [B, num_classes, H, W], compatible with CrossEntropyLoss.
+        return SalsaNextMOS(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
 
     raise ValueError(f"Unknown MOS model name: {name}")
-

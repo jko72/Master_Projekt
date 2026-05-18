@@ -89,8 +89,13 @@ def compute_in_channels(input_mode: str, residual_offsets: Sequence[int]) -> int
         return len(residual_offsets)
     if input_mode == "range_residual":
         return 1 + len(residual_offsets)
+    if input_mode == "range_xyz":
+        return 4
+    if input_mode == "range_xyz_residual":
+        return 4 + len(residual_offsets)
     raise ValueError(
-        f"Invalid input_mode='{input_mode}'. Supported: ['range', 'residual', 'range_residual']"
+        "Invalid input_mode='{0}'. Supported: "
+        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual']".format(input_mode)
     )
 
 
@@ -297,6 +302,15 @@ def print_dataset_class_stats(name: str, dataset: MOSFrameDataset):
     )
 
 
+def print_dataset_channel_debug(name: str, dataset: MOSFrameDataset):
+    print(f"{name}_channel_count: {int(dataset.channel_count)}")
+    if len(dataset) > 0:
+        _, _, meta = dataset[0]
+        channel_names = meta.get("channel_names", None)
+        if channel_names:
+            print(f"{name}_channel_names: {channel_names}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Full MOS baseline training with train/val split.")
     parser.add_argument("--cfg_path", type=str, required=True, help="Path to MOS YAML config")
@@ -305,7 +319,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--input_mode", type=str, default=None, choices=["range", "residual", "range_residual"])
+    parser.add_argument(
+        "--input_mode",
+        type=str,
+        default=None,
+        choices=["range", "residual", "range_residual", "range_xyz", "range_xyz_residual"],
+    )
     parser.add_argument("--residual_offsets", type=str, default=None, help="e.g. '1' or '1,2,3'")
     parser.add_argument("--moving_weight", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -429,6 +448,8 @@ def main():
     # Print real label-derived class stats (loaded from mos_labels/*.npy), not only cached meta.
     print_dataset_class_stats("train", train_dataset)
     print_dataset_class_stats("val", val_dataset)
+    print_dataset_channel_debug("train", train_dataset)
+    print_dataset_channel_debug("val", val_dataset)
 
     batch_size = int(mtrain["batch_size"])
     num_workers = int(mtrain["num_workers"])
@@ -515,6 +536,7 @@ def main():
     print(f"val_samples       : {len(val_dataset)}")
     print(f"input_mode        : {mdata['input_mode']}")
     print(f"residual_offsets  : {mdata['residual_offsets']}")
+    print(f"channel_count     : {int(train_dataset.channel_count)}")
     print(f"model             : {mmodel.get('name', 'unet_small')}")
     print(f"in_channels       : {int(mmodel['in_channels'])}")
     print(f"num_classes       : {int(mmodel['num_classes'])}")
