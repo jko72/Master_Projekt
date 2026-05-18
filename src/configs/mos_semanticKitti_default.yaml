@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_residual"     # "range", "residual", "range_residual"
+  input_mode: "residual"     # "range", "residual", "range_residual"
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
@@ -18,7 +18,7 @@ mos_data_params:
   static_index: 0
   moving_index: 1
 
-  train_sequences: ["07"]
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "07", "09", "10"]
   val_sequences: ["08"]
 
   require_moving_train: false
@@ -38,9 +38,9 @@ mos_model_params:
   norm: "batch"
 
 mos_train_params:
-  batch_size: 8
-  num_workers: 4
-  epochs: 10
+  batch_size: 16
+  num_workers: 6
+  epochs: 50
 
   learning_rate: 0.0005
   weight_decay: 0.0001
