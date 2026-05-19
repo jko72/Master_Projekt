@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
+  input_mode: "range_xyz"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
@@ -40,7 +40,7 @@ mos_model_params:
 mos_train_params:
   batch_size: 16
   num_workers: 6
-  epochs: 1
+  epochs: 50
 
   learning_rate: 0.0005
   weight_decay: 0.0001
@@ -57,10 +57,10 @@ mos_train_params:
 
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "mos_baseline_seq07_to_seq08"
+  run_name: "Baseline_SalseNext_Range"
   use_tensorboard: true
 
   save_checkpoints: false
   save_visuals: false
   save_csv: false
-  save_config_copy: false
+  save_config_copy: true

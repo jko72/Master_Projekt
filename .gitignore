@@ -31,3 +31,6 @@ docker/.env
 docker/user.env
 
 data/
+
+# --- Local backup references ---
+tools/_backup_references/
