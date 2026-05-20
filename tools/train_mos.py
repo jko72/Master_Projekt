@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import datetime as dt
 import os
@@ -379,6 +380,9 @@ def main():
     mlog.setdefault("log_root", "/home/devuser/workspace/LidarGaussianVideoView/mos_logs")
     mlog.setdefault("run_name", "mos_baseline")
     mlog.setdefault("use_tensorboard", True)
+    mlog.setdefault("save_checkpoints", True)
+    mlog.setdefault("save_csv", True)
+    mlog.setdefault("save_config_copy", True)
 
     if args.run_name is not None:
         mlog["run_name"] = str(args.run_name)
@@ -519,6 +523,70 @@ def main():
     log_dir = os.path.join(log_root, f"{run_name}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
 
+    save_checkpoints = bool(mlog.get("save_checkpoints", True))
+    save_csv = bool(mlog.get("save_csv", True))
+    save_config_copy = bool(mlog.get("save_config_copy", True))
+
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    best_ckpt_path = os.path.join(checkpoint_dir, "best_moving_iou.pt")
+    last_ckpt_path = os.path.join(checkpoint_dir, "last.pt")
+    if save_checkpoints:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    metrics_csv_path = os.path.join(log_dir, "metrics.csv")
+    config_copy_path = os.path.join(log_dir, "config.yaml")
+
+    cfg.setdefault("run_metadata", {})
+    cfg["run_metadata"]["cfg_path"] = cfg_path
+    cfg["run_metadata"]["log_dir"] = log_dir
+    cfg["run_metadata"]["timestamp"] = timestamp
+    cfg["run_metadata"]["cli_args"] = vars(args)
+
+    if save_config_copy:
+        with open(config_copy_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+
+    metrics_file = None
+    metrics_writer = None
+    if save_csv:
+        metrics_file = open(metrics_csv_path, "w", newline="", encoding="utf-8")
+        metrics_columns = [
+            "epoch",
+            "lr",
+            "train_loss",
+            "val_loss",
+            "train_moving_iou",
+            "train_moving_precision",
+            "train_moving_recall",
+            "train_moving_f1",
+            "train_static_iou",
+            "train_mean_iou",
+            "train_pixel_accuracy",
+            "val_moving_iou",
+            "val_moving_precision",
+            "val_moving_recall",
+            "val_moving_f1",
+            "val_static_iou",
+            "val_mean_iou",
+            "val_pixel_accuracy",
+            "train_tp_moving",
+            "train_fp_moving",
+            "train_fn_moving",
+            "train_tn_static",
+            "train_valid_pixels",
+            "val_tp_moving",
+            "val_fp_moving",
+            "val_fn_moving",
+            "val_tn_static",
+            "val_valid_pixels",
+            "is_best_moving_iou",
+            "best_moving_iou_so_far",
+            "best_epoch_so_far",
+        ]
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_columns)
+        metrics_writer.writeheader()
+        metrics_file.flush()
+
     writer = None
     if bool(mlog.get("use_tensorboard", True)):
         writer = SummaryWriter(log_dir=log_dir)
@@ -550,6 +618,8 @@ def main():
     print(f"log_dir           : {log_dir}")
 
     epochs = int(mtrain["epochs"])
+    best_moving_iou = -1.0
+    best_epoch = -1
     for epoch in range(1, epochs + 1):
         train_loss, train_counts, train_metrics = train_one_epoch(
             model=model,
@@ -571,6 +641,11 @@ def main():
             scheduler.step()
 
         lr_cur = float(optimizer.param_groups[0]["lr"])
+        current_moving_iou = float(val_metrics["moving_iou"])
+        is_best_moving_iou = current_moving_iou > best_moving_iou
+        if is_best_moving_iou:
+            best_moving_iou = current_moving_iou
+            best_epoch = int(epoch)
 
         print(
             f"Epoch {epoch:03d}/{epochs:03d} | "
@@ -615,11 +690,87 @@ def main():
 
             writer.add_scalar("LearningRate/lr", lr_cur, epoch)
 
+        if metrics_writer is not None:
+            row = {
+                "epoch": int(epoch),
+                "lr": float(lr_cur),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "train_moving_iou": float(train_metrics["moving_iou"]),
+                "train_moving_precision": float(train_metrics["moving_precision"]),
+                "train_moving_recall": float(train_metrics["moving_recall"]),
+                "train_moving_f1": float(train_metrics["moving_f1"]),
+                "train_static_iou": float(train_metrics["static_iou"]),
+                "train_mean_iou": float(train_metrics["mean_iou"]),
+                "train_pixel_accuracy": float(train_metrics["pixel_accuracy"]),
+                "val_moving_iou": float(val_metrics["moving_iou"]),
+                "val_moving_precision": float(val_metrics["moving_precision"]),
+                "val_moving_recall": float(val_metrics["moving_recall"]),
+                "val_moving_f1": float(val_metrics["moving_f1"]),
+                "val_static_iou": float(val_metrics["static_iou"]),
+                "val_mean_iou": float(val_metrics["mean_iou"]),
+                "val_pixel_accuracy": float(val_metrics["pixel_accuracy"]),
+                "train_tp_moving": int(train_counts["tp_moving"]),
+                "train_fp_moving": int(train_counts["fp_moving"]),
+                "train_fn_moving": int(train_counts["fn_moving"]),
+                "train_tn_static": int(train_counts["tn_static"]),
+                "train_valid_pixels": int(train_counts["valid_pixels"]),
+                "val_tp_moving": int(val_counts["tp_moving"]),
+                "val_fp_moving": int(val_counts["fp_moving"]),
+                "val_fn_moving": int(val_counts["fn_moving"]),
+                "val_tn_static": int(val_counts["tn_static"]),
+                "val_valid_pixels": int(val_counts["valid_pixels"]),
+                "is_best_moving_iou": int(is_best_moving_iou),
+                "best_moving_iou_so_far": float(best_moving_iou),
+                "best_epoch_so_far": int(best_epoch),
+            }
+            metrics_writer.writerow(row)
+            metrics_file.flush()
+
+        if save_checkpoints:
+            checkpoint_payload = {
+                "epoch": int(epoch),
+                "best_epoch": int(best_epoch),
+                "best_moving_iou": float(best_moving_iou),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                "cfg": cfg,
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "train_counts": train_counts,
+                "val_counts": val_counts,
+                "model_name": mmodel.get("name"),
+                "input_mode": mdata.get("input_mode"),
+                "residual_offsets": mdata.get("residual_offsets"),
+            }
+            if is_best_moving_iou:
+                torch.save(checkpoint_payload, best_ckpt_path)
+                print(
+                    f"[CKPT] New best moving_iou={best_moving_iou:.6f} "
+                    f"at epoch {best_epoch} -> {best_ckpt_path}"
+                )
+
+            if (epoch % 15 == 0) or (epoch == epochs):
+                torch.save(checkpoint_payload, last_ckpt_path)
+
     if writer is not None:
         writer.flush()
         writer.close()
 
-    print(f"Training finished. TensorBoard events written to: {log_dir}")
+    if metrics_file is not None:
+        metrics_file.flush()
+        metrics_file.close()
+
+    print("Training finished.")
+    print(f"Best moving_iou: {best_moving_iou:.6f} at epoch {best_epoch}")
+    print(f"Last checkpoint: {last_ckpt_path if save_checkpoints else 'disabled by config'}")
+    print(f"Best checkpoint: {best_ckpt_path if save_checkpoints else 'disabled by config'}")
+    print(f"Metrics CSV: {metrics_csv_path if save_csv else 'disabled by config'}")
+    print(f"Config copy: {config_copy_path if save_config_copy else 'disabled by config'}")
+    print(f"TensorBoard log_dir: {log_dir}")
 
 
 if __name__ == "__main__":

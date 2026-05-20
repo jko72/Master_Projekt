@@ -60,7 +60,7 @@ mos_log_params:
   run_name: "Baseline_SalseNext_Range"
   use_tensorboard: true
 
-  save_checkpoints: false
+  save_checkpoints: true
   save_visuals: false
-  save_csv: false
+  save_csv: true
   save_config_copy: true
