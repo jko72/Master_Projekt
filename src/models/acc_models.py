@@ -146,16 +146,12 @@ class Model1(BasePredictionModel):
         T, C, H, W = shape_in
         self.enc = Encoder(C, hid_S, N_S)
         self.hid = Mid_Xnet(T*hid_S, hid_T, N_T, incep_ker, groups)
-        self.dec = Decoder(hid_S, C+1, N_S)
+        self.dec = Decoder(hid_S, 2, N_S)
 
 
     def forward(self, x_raw):
-        # print(f"x_raw shape {x_raw.shape}")
-        x_raw = x_raw[:, :, 0 , :, :]
-        x_raw = x_raw.unsqueeze(2)
-        # print(f" The x_raw shape {x_raw.shape}")
         B, T, C, H, W = x_raw.shape
-        x = x_raw.view(B*T, C, H, W)
+        x = x_raw.reshape(B*T, C, H, W)
 
         embed, skip = self.enc(x)
         _, C_, H_, W_ = embed.shape
@@ -165,7 +161,7 @@ class Model1(BasePredictionModel):
         hid = hid.reshape(B*T, C_, H_, W_)
         output = {}
         Y = self.dec(hid, skip)
-        Y = Y.reshape(B, T, C+1, H, W)
+        Y = Y.reshape(B, T, 2, H, W)
         output["rv"] = self.min_range + nn.Sigmoid()(Y[:, :, 0, :, :]) * (
             self.max_range - self.min_range
         )
@@ -178,16 +174,12 @@ class Model2(BasePredictionModel):
         T, C, H, W = shape_in
         self.enc = Encoder(C, hid_S, N_S)
         self.hid = MidMetaNet(T*hid_S, hid_T, N_T, incep_ker, groups)
-        self.dec = Decoder(hid_S, C+1, N_S)
+        self.dec = Decoder(hid_S, 2, N_S)
 
 
     def forward(self, x_raw):
-        # print(f"x_raw shape {x_raw.shape}")
-        x_raw = x_raw[:, :, 0 , :, :]
-        x_raw = x_raw.unsqueeze(2)
-        # print(f" The x_raw shape {x_raw.shape}")
         B, T, C, H, W = x_raw.shape
-        x = x_raw.view(B*T, C, H, W)
+        x = x_raw.reshape(B*T, C, H, W)
 
         embed, skip = self.enc(x)
         _, C_, H_, W_ = embed.shape
@@ -197,7 +189,7 @@ class Model2(BasePredictionModel):
         hid = hid.reshape(B*T, C_, H_, W_)
         output = {}
         Y = self.dec(hid, skip)
-        Y = Y.reshape(B, T, C+1, H, W)
+        Y = Y.reshape(B, T, 2, H, W)
         output["rv"] = self.min_range + nn.Sigmoid()(Y[:, :, 0, :, :]) * (
             self.max_range - self.min_range
         )

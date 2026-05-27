@@ -480,6 +480,8 @@ def main(args):
                     print("[CKPT] Skipping keys due to shape mismatch:")
                     for k, s_ckpt, s_model in skipped:
                         print(f"  - {k}: ckpt{s_ckpt} -> model{s_model}")
+                    if any(("acc.enc.enc.0" in k and "weight" in k) for k, _, _ in skipped):
+                        print("[CKPT] Input channel count changed. First encoder conv weights may be skipped.")
 
                 missing, unexpected = model.load_state_dict(filtered_state, strict=False)
                 print(f"[CKPT] Load done  Missing: {len(missing)} | Unexpected: {len(unexpected)}")
@@ -738,27 +740,32 @@ def main(args):
             model.train()
             #model.eval()
             
-            # model's forward gives "output" of shape [B,T,H,W,3K]
+            # model's forward gives "output" of shape [B,T,H,W,3K] (MDN) or [B,T,H,W] (regression)
             hist_xyzd = hist_xyzd.to(args.device)
-            # Range-only input: take range channel (index 3) -> [B, T, 1, H, W]
-            if hist_xyzd.shape[2] == 4:
-                hist_in = hist_xyzd[:, :, 3:4, :, :]
-            elif hist_xyzd.shape[2] == 1:
-                hist_in = hist_xyzd
-            else:
-                raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+            hist_in = hist_xyzd
+            if batch_idx == 0:
+                print(f"[DBG INPUT] hist_xyzd shape: {tuple(hist_xyzd.shape)}")
+                print(f"[DBG INPUT] using all input channels for forecasting: C={hist_in.shape[2]}")
+                print("[DBG INPUT] channel convention: [x,y,z,range] if C=4")
             # ===================== DEBUG: preserve_ray sanity checks =====================
             if batch_idx == 0:
                 hx = hist_xyzd.to(args.device)
                 fr = future_ranges.to(args.device)
 
-                # hist range channel (bei dir Kanal 3)
-                h_range = hx[:, :, 3, :, :]  # [B,P,H,W]
-                h_invalid = (h_range <= 0.0)
+                h_range = None
+                if hx.shape[2] == 1:
+                    h_range = hx[:, :, 0, :, :]
+                elif hx.shape[2] >= 4:
+                    h_range = hx[:, :, 3, :, :]
+
+                h_invalid = None if h_range is None else (h_range <= 0.0)
                 fr_invalid = (fr <= 0.0)
 
                 print("\n[DBG PRESERVE_RAY] ---- SANITY ----")
-                print("[DBG] hist_range invalid ratio:", h_invalid.float().mean().item())
+                if h_invalid is None:
+                    print("[DBG] hist_range invalid ratio: n/a (no explicit range channel in input)")
+                else:
+                    print("[DBG] hist_range invalid ratio:", h_invalid.float().mean().item())
                 print("[DBG] future_range invalid ratio:", fr_invalid.float().mean().item())
 
                 # per-time invalid ratio
@@ -772,7 +779,7 @@ def main(args):
 
                 # range stats only on valid pixels
                 valid_fr = fr[~fr_invalid]
-                valid_h  = h_range[~h_invalid]
+                valid_h = None if h_range is None else h_range[~h_invalid]
 
                 if valid_fr.numel() > 0:
                     print("[DBG] future valid mean/std/min/max:",
@@ -781,7 +788,9 @@ def main(args):
                 else:
                     print("[DBG] future valid: EMPTY (all invalid!) -> pipeline broken")
 
-                if valid_h.numel() > 0:
+                if valid_h is None:
+                    print("[DBG] hist valid stats: n/a (no explicit range channel in input)")
+                elif valid_h.numel() > 0:
                     print("[DBG] hist valid mean/std/min/max:",
                         valid_h.mean().item(), valid_h.std().item(),
                         valid_h.min().item(), valid_h.max().item())
@@ -820,6 +829,13 @@ def main(args):
                 # Direkte Range-Regression ohne Gaußparameter
                 loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
                 nll = loss_tensor.item()
+            if batch_idx == 0:
+                if use_mdn:
+                    dbg_pred_shape = tuple(mixture.mean.shape)
+                else:
+                    dbg_pred_shape = tuple(output.shape)
+                print(f"[DBG INPUT] output Range shape: {dbg_pred_shape}")
+                print(f"[DBG INPUT] target future_ranges shape: {tuple(future_ranges.shape)}")
             # add batch's train loss to overall loss
             if np.isfinite(nll):
                 total_loss += nll
@@ -1191,13 +1207,7 @@ def main(args):
             for batch_idx, (hist_xyzd, future_xyz, future_ranges) in enumerate(tqdm(iterable=val_loader, total=len(val_loader))):
                 # model's forward gives "output" of shape [B,T,H,W,3K]
                 hist_xyzd = hist_xyzd.to(args.device)
-                # Range-only input: take range channel (index 3)
-                if hist_xyzd.shape[2] == 4:
-                    hist_in = hist_xyzd[:, :, 3:4, :, :]   # [B,T,1,H,W]
-                elif hist_xyzd.shape[2] == 1:
-                    hist_in = hist_xyzd
-                else:
-                    raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+                hist_in = hist_xyzd
                 # Paper-KITTI Normalisierung (nur Range-Kanal)
                 # range_mean = 10.839
                 # range_std  = 9.314
@@ -1236,7 +1246,12 @@ def main(args):
                     print("[DEBUG] gt_mean:", future_ranges.to(args.device).mean().item())
                     print("[DEBUG] out_mean:", output.mean().item())
 
-                    print("hist invalid ratio:", (hist_xyzd[:, :, 3] <= 0).float().mean().item())
+                    if hist_xyzd.shape[2] == 1:
+                        print("hist invalid ratio:", (hist_xyzd[:, :, 0] <= 0).float().mean().item())
+                    elif hist_xyzd.shape[2] >= 4:
+                        print("hist invalid ratio:", (hist_xyzd[:, :, 3] <= 0).float().mean().item())
+                    else:
+                        print("hist invalid ratio: n/a (no explicit range channel in input)")
                     print("fut  invalid ratio:", (future_ranges <= 0).float().mean().item())
 
 
@@ -1493,13 +1508,7 @@ def main(args):
                 future_xyz = future_xyz.to(args.device)
                 future_ranges = future_ranges.to(args.device)
 
-                # Range-only input: take range channel (index 3)
-                if hist_xyzd.shape[2] == 4:
-                    hist_in = hist_xyzd[:, :, 3:4, :, :]   # [B,T,1,H,W]
-                elif hist_xyzd.shape[2] == 1:
-                    hist_in = hist_xyzd
-                else:
-                    raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+                hist_in = hist_xyzd
 
                 # Vorwärtsdurchlauf
                 start_time = time.perf_counter()

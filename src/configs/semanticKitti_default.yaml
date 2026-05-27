@@ -39,7 +39,7 @@ model_params: {
   org_grid_height: 64,
   org_grid_width: 2048,
 
-  grid_channels: 1, # Range-only Input (hist_in ist [B,T,1,H,W])
+  grid_channels: 4, # Forecasting input channels: x,y,z,range from hist_xyzd
   FOV_UP: 3.0,
   FOV_DOWN: -25.0,
   MASK_THRESHOLD: -1.0,

@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_xyz"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
+  input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
@@ -57,7 +57,7 @@ mos_train_params:
 
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "Baseline_SalseNext_Range"
+  run_name: "Baseline_SalseNext_Range_residual"
   use_tensorboard: true
 
   save_checkpoints: true

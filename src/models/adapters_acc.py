@@ -9,30 +9,22 @@ from prob import build_range_mixture_distribution
 from models.acc_base import BasePredictionModel
 
 
-def _xyz_to_range(xyz: torch.Tensor) -> torch.Tensor:
+def _prepare_acc_input(x: torch.Tensor) -> torch.Tensor:
     """
-    Accepts either:
-      - xyz:   [B, T, 3, H, W]  (x,y,z)
-      - range: [B, T, 1, H, W]  (already range)
-    Returns:
-      - range: [B, T, 1, H, W]
+    Pass through supported channel layouts unchanged.
+    Expected input shape: [B, T, C, H, W], where C in {1, 3, 4}.
     """
-    if xyz.dim() != 5:
-        raise ValueError(f"_xyz_to_range expects 5D tensor [B,T,C,H,W], got {xyz.shape}")
+    if x.dim() != 5:
+        raise ValueError(f"_prepare_acc_input expects 5D tensor [B,T,C,H,W], got {x.shape}")
 
-    C = xyz.shape[2]
+    C = x.shape[2]
+    if C in (1, 3, 4):
+        return x
 
-    if C == 1:
-        return xyz
-
-    if C >= 3:
-        r = torch.sqrt(torch.clamp(
-            xyz[:, :, 0] ** 2 + xyz[:, :, 1] ** 2 + xyz[:, :, 2] ** 2,
-            min=1e-9
-        ))
-        return r.unsqueeze(2)
-
-    raise ValueError(f"_xyz_to_range got unsupported channel size C={C}, shape={xyz.shape}")
+    raise ValueError(
+        f"_prepare_acc_input got unsupported channel size C={C}, shape={x.shape}. "
+        "Expected C in {1,3,4}."
+    )
 
 
 def _time_resample(x: torch.Tensor, target_frames: int) -> torch.Tensor:
@@ -202,44 +194,46 @@ class _AccToMDN_Base(BasePredictionModel):
 
     def forward(self, hist_xyz: torch.Tensor):
         """
-        hist_xyz: [B, T_in, 3 or 1, H, W]
+        hist_xyz: [B, T_in, 1/3/4, H, W]
         Returns:
           - MDN:        [B, F, H, W, 3K]
           - Regression: [B, F, H, W]
         """
-        rv_seq = _xyz_to_range(hist_xyz)         # [B, T_in, 1, H, W]
-        B, T_in, _, H, W = rv_seq.shape
+        seq = _prepare_acc_input(hist_xyz)       # [B, T_in, C, H, W]
+        B, T_in, C, H, W = seq.shape
         if T_in > self.P:
-            rv_seq = rv_seq[:, -self.P:]                 # last P frames
+            seq = seq[:, -self.P:]                       # last P frames
         elif T_in < self.P:
             # pad at front with -1 (paper invalid) to reach P
-            pad = rv_seq.new_full((B, self.P - T_in, 1, H, W), -1.0)
-            rv_seq = torch.cat([pad, rv_seq], dim=1)
+            pad = seq.new_full((B, self.P - T_in, C, H, W), -1.0)
+            seq = torch.cat([pad, seq], dim=1)
         # Match ACC temporal dimension (built with forecast_horizon/self.F).
-        rv_seq = _time_resample(rv_seq, self.F)   # [B, F, 1, H, W]
+        seq = _time_resample(seq, self.F)         # [B, F, C, H, W]
 
-        # ACC range backbone should not ingest invalid markers directly.
-        # Keep invalid semantics for losses/targets, but feed a neutral value to the model.
-        rv_seq_in = rv_seq.clone()
-        invalid_in = (rv_seq_in <= 0.0)
-        rv_seq_in[invalid_in] = 0.0
+        # Do not treat negative XYZ as invalid; derive invalidity channel-aware.
+        seq_in = seq.clone()
+        if C == 1:
+            invalid_in = (seq <= 0.0)
+            seq_in[invalid_in] = 0.0
+        elif C == 4:
+            invalid_in = (seq[:, :, 3:4] <= 0.0)
+            range_ch = seq_in[:, :, 3:4]
+            range_ch[invalid_in] = 0.0
+            seq_in[:, :, 3:4] = range_ch
+        else:  # C == 3
+            invalid_in = (seq[:, :, 0:3].abs().sum(dim=2, keepdim=True) <= 1e-8)
 
-        out = self.acc(rv_seq_in)                # ACC expects meters
+        out = self.acc(seq_in)                    # ACC expects meters
         mu = out["rv"]                           # [B, F, H, W] meters
         mask_logits = out.get("mask_logits", None)
 
 
         if not hasattr(self, "_dbg_once"):
             self._dbg_once = True
-            valid_in = (rv_seq > 0.0)
-            print("[DBG ADAPTER] rv_seq shape:", tuple(rv_seq.shape), "P=", self.P)
-            if valid_in.any():
-                print("[DBG ADAPTER] input rv_seq (meters) mean/std:",
-                    rv_seq[valid_in].mean().item(), rv_seq[valid_in].std().item())
-            else:
-                print("[DBG ADAPTER] input rv_seq valid: EMPTY")
-            print("[DBG ADAPTER] input invalid ratio:",
-                invalid_in.float().mean().item())
+            print("[DBG ADAPTER] input seq shape:", tuple(hist_xyz.shape))
+            print(f"[DBG ADAPTER] input channels C={hist_xyz.shape[2]}")
+            print("[DBG ADAPTER] ACC core input shape after time resample:", tuple(seq_in.shape))
+            print("[DBG ADAPTER] invalid ratio:", invalid_in.float().mean().item())
             print("[DBG ADAPTER] mu shape:", tuple(mu.shape), "F(expected)=", self.F)
             print("[DBG ADAPTER] mu (meters) mean/std:",
                 mu.mean().item(), mu.std().item())
@@ -280,7 +274,8 @@ class AccurateM1Adapter(_AccToMDN_Base):
         _map_my_schema_to_acc_cfg(cfg)
 
         mp = cfg["model_params"]
-        shape_in = (int(mp["forecast_horizon"]), 1, int(mp["grid_height"]), int(mp["grid_width"]))
+        C_in = int(mp.get("grid_channels", 4))
+        shape_in = (int(mp["forecast_horizon"]), C_in, int(mp["grid_height"]), int(mp["grid_width"]))
         acc_core = ACC_Model1(cfg, shape_in)
         super().__init__(cfg, acc_core)
 
@@ -291,7 +286,8 @@ class AccurateM2Adapter(_AccToMDN_Base):
         _map_my_schema_to_acc_cfg(cfg)
 
         mp = cfg["model_params"]
-        shape_in = (int(mp["forecast_horizon"]), 1, int(mp["grid_height"]), int(mp["grid_width"]))
+        C_in = int(mp.get("grid_channels", 4))
+        shape_in = (int(mp["forecast_horizon"]), C_in, int(mp["grid_height"]), int(mp["grid_width"]))
         acc_core = ACC_Model2(cfg, shape_in)
         super().__init__(cfg, acc_core)
 
