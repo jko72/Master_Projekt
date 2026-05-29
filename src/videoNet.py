@@ -263,6 +263,14 @@ def masked_l1_on_valid(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     valid = (target > 0.0)
     return ((pred - target).abs() * valid).sum() / valid.sum().clamp_min(1e-8)
 
+def build_training_checkpoint(model: torch.nn.Module, epoch: int | None = None):
+    ckpt = {"model_state_dict": model.state_dict()}
+    if epoch is not None:
+        ckpt["epoch"] = int(epoch)
+    if hasattr(model, "encoder") and isinstance(model.encoder, torch.nn.Module):
+        ckpt["encoder_state_dict"] = model.encoder.state_dict()
+    return ckpt
+
 def compute_and_log_range_metrics(pred_rv, future, writer=None, global_step=None, prefix="val"):
     gt_rv = future[:, :, 0, :, :]
     m = compute_range_metrics(pred_rv, gt_rv)
@@ -439,6 +447,9 @@ def main(args):
                 if isinstance(ckpt, dict) and "state_dict" in ckpt:
                     state = ckpt["state_dict"]          # Lightning .ckpt
                     print(f"[CKPT] Detected Lightning checkpoint with {len(state)} tensors.")
+                elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                    state = ckpt["model_state_dict"]    # structured training checkpoint
+                    print(f"[CKPT] Detected training checkpoint with {len(state)} model tensors.")
                 elif isinstance(ckpt, dict):
                     state = ckpt                        # plain state_dict saved as dict
                     print(f"[CKPT] Detected plain state_dict with {len(state)} tensors.")
@@ -541,6 +552,8 @@ def main(args):
     #         print("no custom pretrained weights found, use default vanilla")
     model.to(args.device)
     use_mdn = bool(cfg["model_params"].get("use_mdn", True))
+    if use_mdn and (getattr(model, "supports_mdn", True) is False):
+        raise ValueError("SalsaNextACCForecast does not support MDN. Set model_params.use_mdn=false.")
     if use_mdn and not hasattr(model, "build_mixture"):
         raise ValueError("use_mdn=True but selected model has no build_mixture() method.")
     confidence_levels = [float(x) for x in cfg["train_params"].get("confidence_levels", [0.68, 0.95])]
@@ -827,7 +840,7 @@ def main(args):
 
             else:
                 # Direkte Range-Regression ohne Gaußparameter
-                loss_tensor = torch.nn.functional.l1_loss(output, future_ranges.to(args.device))
+                loss_tensor = masked_l1_on_valid(output, future_ranges.to(args.device))
                 nll = loss_tensor.item()
             if batch_idx == 0:
                 if use_mdn:
@@ -1191,7 +1204,10 @@ def main(args):
         if cfg["train_params"]["with_save"]:
             writer.add_scalar('Loss/Train/Epoch', avg_loss, epoch)
             if epoch % cfg["train_params"]["auto_save_step"] == 0:
-                torch.save(model.state_dict(), os.path.join(save_path, "weights", f"model_epoch_{epoch}.pt"))
+                torch.save(
+                    build_training_checkpoint(model, epoch=epoch),
+                    os.path.join(save_path, "weights", f"model_epoch_{epoch}.pt"),
+                )
         
         # --- Validation Loop ---
         # ===== PAPER-METRICS: VALIDATION ACCUMULATORS =====
@@ -1540,9 +1556,7 @@ def main(args):
                         mdn_test_sums[f"coverage_{lvl_tag}"] += float(mdn_diag[f"coverage_{lvl_tag}"])
                 else:
                     # Direkte Range-Regression ohne Gaußparameter
-                    loss_tensor = torch.nn.functional.l1_loss(
-                        output, future_ranges.to(args.device)
-                    )
+                    loss_tensor = masked_l1_on_valid(output, future_ranges.to(args.device))
                     nll = loss_tensor.item()
                     pred_rv_for_metrics = output
 
@@ -1616,7 +1630,10 @@ def main(args):
                     writer.add_scalar(f"mdn/test/coverage_error/{lvl_tag}", abs(cov_val - lvl), final_step)
             
     if cfg["train_params"]["with_save"]:
-        torch.save(model.state_dict(), os.path.join(save_path, "weights", "model_final.pt"))
+        torch.save(
+            build_training_checkpoint(model, epoch=cfg["train_params"]["num_total_epochs"] - 1),
+            os.path.join(save_path, "weights", "model_final.pt"),
+        )
     
     if cfg["train_params"]["plot_examples"]:
         plt.ioff()
@@ -1632,7 +1649,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cfg_path",
         type=str,
-        default="/home/devuser/workspace/src/configs/thab_default.yaml" # thab_default  semanticKitti_default
+        default="/home/devuser/workspace/src/configs/semanticKitti_salsanext_acc_forecast.yaml" # thab_default  semanticKitti_default
     )
     
     parser.add_argument(

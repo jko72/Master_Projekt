@@ -311,6 +311,80 @@ def print_dataset_channel_debug(name: str, dataset: MOSFrameDataset):
         if channel_names:
             print(f"{name}_channel_names: {channel_names}")
 
+def _extract_encoder_state_from_checkpoint(ckpt) -> Dict[str, torch.Tensor]:
+    if isinstance(ckpt, dict) and "encoder_state_dict" in ckpt:
+        state = ckpt["encoder_state_dict"]
+        if not isinstance(state, dict):
+            raise TypeError("checkpoint['encoder_state_dict'] is not a dict.")
+        return state
+
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        ms = ckpt["model_state_dict"]
+        if not isinstance(ms, dict):
+            raise TypeError("checkpoint['model_state_dict'] is not a dict.")
+        enc = {}
+        for k, v in ms.items():
+            if str(k).startswith("encoder."):
+                enc[str(k)[len("encoder."):]] = v
+        if enc:
+            return enc
+
+    if isinstance(ckpt, dict):
+        # Plain encoder-only state_dict or full model state_dict with "encoder." prefix.
+        if any(str(k).startswith("encoder.") for k in ckpt.keys()):
+            enc = {}
+            for k, v in ckpt.items():
+                ks = str(k)
+                if ks.startswith("encoder."):
+                    enc[ks[len("encoder."):]] = v
+            if enc:
+                return enc
+        return ckpt
+
+    raise TypeError(f"Unsupported checkpoint type: {type(ckpt)}")
+
+
+def maybe_load_pretrained_encoder(model: torch.nn.Module, cfg: Dict, path_override: str | None = None):
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    ckpt_path = path_override if path_override is not None else mtrain.get("pretrained_encoder_path", None)
+    if not ckpt_path:
+        print("[PRETRAIN MOS] No pretrained encoder path configured. Training from random init.")
+        return
+
+    ckpt_path = os.path.abspath(str(ckpt_path))
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Pretrained encoder checkpoint not found: {ckpt_path}")
+
+    strict = bool(mtrain.get("pretrained_encoder_strict", True))
+    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", True))
+    init_new_channels = str(mtrain.get("pretrained_encoder_init_new_channels", "mean"))
+
+    print(f"[PRETRAIN MOS] Loading pretrained encoder from: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    encoder_state = _extract_encoder_state_from_checkpoint(ckpt)
+
+    if hasattr(model, "load_pretrained_encoder"):
+        model.load_pretrained_encoder(
+            encoder_state_dict=encoder_state,
+            strict=strict,
+            adapt_input_channels=adapt_input_channels,
+            init_new_channels=init_new_channels,
+        )
+        return
+
+    if hasattr(model, "encoder") and isinstance(model.encoder, torch.nn.Module):
+        missing, unexpected = model.encoder.load_state_dict(encoder_state, strict=strict)
+        print(
+            f"[PRETRAIN MOS] Loaded into model.encoder via fallback. "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
+        return
+
+    raise RuntimeError(
+        "Model has no encoder loading interface. Expected load_pretrained_encoder(...) "
+        "or model.encoder to exist."
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(description="Full MOS baseline training with train/val split.")
@@ -329,6 +403,12 @@ def main():
     parser.add_argument("--residual_offsets", type=str, default=None, help="e.g. '1' or '1,2,3'")
     parser.add_argument("--moving_weight", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument(
+        "--pretrained_encoder",
+        type=str,
+        default=None,
+        help="Optional path to forecasting checkpoint (.pt) with encoder_state_dict for MOS encoder init.",
+    )
     args = parser.parse_args()
 
     cfg_path = resolve_cfg_path(args.cfg_path)
@@ -376,6 +456,10 @@ def main():
     mtrain.setdefault("scheduler", "none")
     mtrain.setdefault("seed", 42)
     mtrain.setdefault("deterministic", False)
+    mtrain.setdefault("pretrained_encoder_path", None)
+    mtrain.setdefault("pretrained_encoder_strict", True)
+    mtrain.setdefault("pretrained_encoder_adapt_input_channels", True)
+    mtrain.setdefault("pretrained_encoder_init_new_channels", "mean")
 
     mlog.setdefault("log_root", "/home/devuser/workspace/LidarGaussianVideoView/mos_logs")
     mlog.setdefault("run_name", "mos_baseline")
@@ -402,6 +486,8 @@ def main():
         mtrain["moving_class_weight"] = float(args.moving_weight)
     if args.num_workers is not None:
         mtrain["num_workers"] = int(args.num_workers)
+    if args.pretrained_encoder is not None:
+        mtrain["pretrained_encoder_path"] = str(args.pretrained_encoder)
 
     in_channels = compute_in_channels(str(mdata["input_mode"]), mdata["residual_offsets"])
     mmodel["in_channels"] = int(in_channels)
@@ -489,6 +575,11 @@ def main():
     )
 
     model = build_mos_model(cfg).to(device)
+    maybe_load_pretrained_encoder(
+        model=model,
+        cfg=cfg,
+        path_override=args.pretrained_encoder,
+    )
     n_params = count_trainable_params(model)
 
     class_weights = torch.tensor(
@@ -616,6 +707,7 @@ def main():
     print(f"moving_weight     : {float(mtrain['moving_class_weight'])}")
     print(f"device            : {device}")
     print(f"log_dir           : {log_dir}")
+    print(f"pretrained_encoder: {mtrain.get('pretrained_encoder_path', None)}")
 
     epochs = int(mtrain["epochs"])
     best_moving_iou = -1.0
