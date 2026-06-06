@@ -40,7 +40,7 @@ mos_model_params:
 mos_train_params:
   batch_size: 16
   num_workers: 6
-  epochs: 1
+  epochs: 50
 
   learning_rate: 0.0005
   weight_decay: 0.0001
@@ -57,14 +57,14 @@ mos_train_params:
 
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
-  pretrained_encoder_path: null
+  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
   pretrained_encoder_init_new_channels: "mean"
 
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "Baseline_SalseNext_Range_residual"
+  run_name: "Baseline_Pretrained_Encoder_Range_residual"
   use_tensorboard: true
 
   save_checkpoints: true

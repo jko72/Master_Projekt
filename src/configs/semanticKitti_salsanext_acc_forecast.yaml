@@ -69,7 +69,7 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 1, #Test:1, Standard: 8 bis 12, 
+  num_total_epochs: 60, #Test:1, Standard: 8 bis 12, 
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
