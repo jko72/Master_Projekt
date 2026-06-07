@@ -10,6 +10,7 @@ model_params:
 
 mos_data_params:
   input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
+  # Channel order for range_xyz* modes: [x, y, z, range, residual_1, ...]
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
@@ -57,14 +58,14 @@ mos_train_params:
 
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
-  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
+  pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
   pretrained_encoder_init_new_channels: "mean"
 
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "Baseline_Pretrained_Encoder_Range_residual"
+  run_name: "Baseline_SalsaNext_RangeXYZResidual_xyzd_order"
   use_tensorboard: true
 
   save_checkpoints: true

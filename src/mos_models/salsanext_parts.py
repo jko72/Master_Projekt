@@ -287,6 +287,9 @@ def adapt_first_conv_in_channels(
     conv_key_hint: str = "down_cntx.conv1.weight",
     mode: str = "mean",
 ) -> "OrderedDict[str, torch.Tensor]":
+    # For MOS range_xyz_residual after channel unification, pretrained
+    # [x,y,z,range] maps directly to the first four MOS channels
+    # [x,y,z,range]; residual channels are appended and initialized.
     adapted_state = OrderedDict(state_dict.items())
 
     conv_key = _find_conv_key(adapted_state, conv_key_hint)

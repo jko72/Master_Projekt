@@ -159,28 +159,62 @@ def get_meta_value(meta: Dict, key: str, idx: int):
     return val
 
 
+def get_channel_names_from_meta(meta: Dict, idx: int):
+    val = meta.get("channel_names", None)
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)) and all(isinstance(v, str) for v in val):
+        return list(val)
+    if isinstance(val, (list, tuple)) and all(isinstance(v, (list, tuple)) for v in val):
+        if len(val) > 0 and all(len(v) > idx for v in val):
+            return [str(v[idx]) for v in val]
+    return None
+
+
+def select_visual_channels(x_chw: np.ndarray, input_mode: str, channel_names=None):
+    range_idx = None
+    residual_idx = None
+
+    if channel_names:
+        names = [str(name) for name in channel_names]
+        if "range" in names:
+            range_idx = names.index("range")
+        residual_indices = [i for i, name in enumerate(names) if name.startswith("residual_")]
+        if residual_indices:
+            residual_idx = residual_indices[0]
+    else:
+        if input_mode in {"range", "range_residual"}:
+            range_idx = 0
+        elif input_mode in {"range_xyz", "range_xyz_residual"}:
+            range_idx = 3
+
+        if input_mode == "residual":
+            residual_idx = 0
+        elif input_mode == "range_residual":
+            residual_idx = 1
+        elif input_mode == "range_xyz_residual":
+            residual_idx = 4
+
+    range_img = x_chw[range_idx] if range_idx is not None and range_idx < x_chw.shape[0] else None
+    residual_img = x_chw[residual_idx] if residual_idx is not None and residual_idx < x_chw.shape[0] else None
+    return range_img, residual_img
+
+
 def save_visualization(
     out_path: str,
     x_chw: np.ndarray,
     y_hw: np.ndarray,
     pred_hw: np.ndarray,
     input_mode: str,
+    channel_names,
     ignore_index: int,
     title: str,
 ):
-    range_img = None
-    residual_img = None
-
-    if input_mode in {"range", "range_residual", "range_xyz", "range_xyz_residual"} and x_chw.shape[0] >= 1:
-        range_img = x_chw[0]
-
-    if "residual" in input_mode and x_chw.shape[0] >= 1:
-        if input_mode == "residual":
-            residual_img = x_chw[0]
-        elif input_mode == "range_residual" and x_chw.shape[0] >= 2:
-            residual_img = x_chw[1]
-        else:
-            residual_img = x_chw[-1]
+    range_img, residual_img = select_visual_channels(
+        x_chw=x_chw,
+        input_mode=input_mode,
+        channel_names=channel_names,
+    )
 
     valid = y_hw != ignore_index
     error_map = np.zeros_like(y_hw, dtype=np.int8)
@@ -477,6 +511,7 @@ def main():
                                 y_hw=y_cpu[i],
                                 pred_hw=pred_cpu[i],
                                 input_mode=input_mode,
+                                channel_names=get_channel_names_from_meta(meta, i),
                                 ignore_index=ignore_index,
                                 title=title,
                             )

@@ -77,6 +77,8 @@ class MOSFrameDataset(Dataset):
                 **self.summary
             )
         )
+        if self.input_mode in {"range_xyz", "range_xyz_residual"}:
+            print("[MOSFrameDataset] channel convention for range_xyz* modes: [x,y,z,range,(residuals...)]")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -92,8 +94,8 @@ class MOSFrameDataset(Dataset):
             channel_names.append("range")
         elif self.input_mode in {"range_xyz", "range_xyz_residual"}:
             range_img, x_img, y_img, z_img = self._load_projected_xyzd(sample["scan_path"])
-            x_channels.extend([range_img, x_img, y_img, z_img])
-            channel_names.extend(["range", "x", "y", "z"])
+            x_channels.extend([x_img, y_img, z_img, range_img])
+            channel_names.extend(["x", "y", "z", "range"])
 
         residual_paths = []
         if self.input_mode in {"residual", "range_residual", "range_xyz_residual"}:
