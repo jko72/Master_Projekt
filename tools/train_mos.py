@@ -202,8 +202,21 @@ def build_moving_frame_sampler(dataset: MOSFrameDataset, moving_weight: float, s
     return sampler
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device: str, cfg: Dict):
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device: str,
+    cfg: Dict,
+    encoder_frozen: bool = False,
+    freeze_encoder_bn_eval: bool = True,
+):
     model.train()
+    if encoder_frozen and freeze_encoder_bn_eval:
+        if not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module):
+            raise RuntimeError("Cannot keep frozen encoder in eval mode because model has no encoder module.")
+        model.encoder.eval()
 
     clip_grad_norm = float(cfg.get("mos_train_params", {}).get("clip_grad_norm", 0.0))
     ignore_index = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
@@ -288,8 +301,129 @@ def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict):
     return mean_loss, agg, metrics
 
 
-def count_trainable_params(model: torch.nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_params(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def count_trainable_params(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def _non_encoder_parameters(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    if not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module):
+        return list(model.parameters())
+    encoder_param_ids = {id(p) for p in model.encoder.parameters()}
+    return [p for p in model.parameters() if id(p) not in encoder_param_ids]
+
+
+def print_trainable_summary(model: torch.nn.Module):
+    total = count_params(model)
+    trainable = count_trainable_params(model)
+    print(f"[PARAMS] total={total}, trainable={trainable}")
+
+    if hasattr(model, "encoder") and isinstance(model.encoder, torch.nn.Module):
+        encoder_total = count_params(model.encoder)
+        encoder_trainable = count_trainable_params(model.encoder)
+        non_encoder_params = _non_encoder_parameters(model)
+        non_encoder_total = sum(p.numel() for p in non_encoder_params)
+        non_encoder_trainable = sum(p.numel() for p in non_encoder_params if p.requires_grad)
+        print(f"[PARAMS] encoder total={encoder_total}, trainable={encoder_trainable}")
+        print(f"[PARAMS] non_encoder total={non_encoder_total}, trainable={non_encoder_trainable}")
+
+
+def _make_optimizer(optimizer_name: str, params, lr: float, weight_decay: float):
+    optimizer_name = str(optimizer_name).lower()
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if optimizer_name == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if optimizer_name == "sgd":
+        return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
+    raise ValueError(f"Unsupported optimizer='{optimizer_name}'. Currently supported: ['adamw', 'adam', 'sgd']")
+
+
+def build_optimizer_with_param_groups(model: torch.nn.Module, cfg: Dict):
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    base_lr = float(mtrain["learning_rate"])
+    encoder_lr = mtrain.get("encoder_learning_rate", None)
+    weight_decay = float(mtrain.get("weight_decay", 0.0))
+    optimizer_name = str(mtrain.get("optimizer", "adamw")).lower()
+
+    if encoder_lr is None:
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = _make_optimizer(
+            optimizer_name=optimizer_name,
+            params=params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+        )
+        print("[OPTIMIZER] using single parameter group lr={0:g} params={1}".format(
+            base_lr,
+            sum(p.numel() for p in params),
+        ))
+        return optimizer
+
+    if not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module):
+        raise RuntimeError(
+            "mos_train_params.encoder_learning_rate is set, but the MOS model has no "
+            "self.encoder module for separate finetuning."
+        )
+
+    encoder_lr = float(encoder_lr)
+    encoder_param_ids = {id(p) for p in model.encoder.parameters()}
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    decoder_head_params = [
+        p for p in model.parameters()
+        if id(p) not in encoder_param_ids and p.requires_grad
+    ]
+
+    overlap_ids = {id(p) for p in encoder_params}.intersection(id(p) for p in decoder_head_params)
+    if overlap_ids:
+        raise RuntimeError("Optimizer parameter group construction produced duplicate parameters.")
+    if not encoder_params:
+        raise RuntimeError("encoder_learning_rate is set, but no trainable encoder parameters were found.")
+    if not decoder_head_params:
+        raise RuntimeError("encoder_learning_rate is set, but no trainable decoder/head parameters were found.")
+
+    param_groups = [
+        {"params": encoder_params, "lr": encoder_lr, "name": "encoder"},
+        {"params": decoder_head_params, "lr": base_lr, "name": "decoder_head"},
+    ]
+    optimizer = _make_optimizer(
+        optimizer_name=optimizer_name,
+        params=param_groups,
+        lr=base_lr,
+        weight_decay=weight_decay,
+    )
+    print("[OPTIMIZER] using separate parameter groups:")
+    for group in optimizer.param_groups:
+        print(
+            "  group={0} lr={1:g} params={2}".format(
+                group.get("name", "unnamed"),
+                float(group["lr"]),
+                sum(p.numel() for p in group["params"]),
+            )
+        )
+    return optimizer
+
+
+def set_encoder_trainable(model: torch.nn.Module, trainable: bool, bn_eval: bool = True):
+    if not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module):
+        if trainable:
+            return
+        raise RuntimeError("Cannot freeze encoder because model has no self.encoder module.")
+
+    for p in model.encoder.parameters():
+        p.requires_grad = bool(trainable)
+
+    if trainable:
+        model.encoder.train()
+    elif bn_eval:
+        model.encoder.eval()
+
+
+def is_encoder_frozen_for_epoch(epoch: int, freeze_encoder_epochs: int) -> bool:
+    return int(freeze_encoder_epochs) > 0 and int(epoch) <= int(freeze_encoder_epochs)
 
 
 def print_dataset_class_stats(name: str, dataset: MOSFrameDataset):
@@ -394,6 +528,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--encoder_lr", type=float, default=None)
+    parser.add_argument("--freeze_encoder_epochs", type=int, default=None)
     parser.add_argument(
         "--input_mode",
         type=str,
@@ -448,6 +584,11 @@ def main():
     mtrain.setdefault("num_workers", 4)
     mtrain.setdefault("epochs", 20)
     mtrain.setdefault("learning_rate", 5e-4)
+    mtrain.setdefault("encoder_learning_rate", None)
+    mtrain.setdefault("freeze_encoder_epochs", 0)
+    mtrain.setdefault("freeze_encoder_bn_eval", True)
+    mtrain.setdefault("learning_rate_min", None)
+    mtrain.setdefault("encoder_learning_rate_min", None)
     mtrain.setdefault("weight_decay", 1e-4)
     mtrain.setdefault("clip_grad_norm", 5.0)
     mtrain.setdefault("static_class_weight", 1.0)
@@ -476,6 +617,10 @@ def main():
         mtrain["batch_size"] = int(args.batch_size)
     if args.lr is not None:
         mtrain["learning_rate"] = float(args.lr)
+    if args.encoder_lr is not None:
+        mtrain["encoder_learning_rate"] = float(args.encoder_lr)
+    if args.freeze_encoder_epochs is not None:
+        mtrain["freeze_encoder_epochs"] = int(args.freeze_encoder_epochs)
     if args.input_mode is not None:
         mdata["input_mode"] = str(args.input_mode)
     if args.residual_offsets is not None:
@@ -592,15 +737,7 @@ def main():
         weight=class_weights,
     )
 
-    optimizer_name = str(mtrain.get("optimizer", "adamw")).lower()
-    if optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(mtrain["learning_rate"]),
-            weight_decay=float(mtrain["weight_decay"]),
-        )
-    else:
-        raise ValueError(f"Unsupported optimizer='{optimizer_name}'. Currently supported: ['adamw']")
+    optimizer = build_optimizer_with_param_groups(model, cfg)
 
     scheduler_name = str(mtrain.get("scheduler", "none")).lower()
     if scheduler_name == "none":
@@ -704,15 +841,41 @@ def main():
     print(f"batch_size        : {batch_size}")
     print(f"epochs            : {int(mtrain['epochs'])}")
     print(f"lr                : {float(mtrain['learning_rate'])}")
+    print(f"encoder_lr        : {mtrain.get('encoder_learning_rate', None)}")
+    print(f"freeze_encoder_ep : {int(mtrain.get('freeze_encoder_epochs', 0))}")
     print(f"moving_weight     : {float(mtrain['moving_class_weight'])}")
     print(f"device            : {device}")
     print(f"log_dir           : {log_dir}")
     print(f"pretrained_encoder: {mtrain.get('pretrained_encoder_path', None)}")
+    print_trainable_summary(model)
 
     epochs = int(mtrain["epochs"])
+    freeze_encoder_epochs = int(mtrain.get("freeze_encoder_epochs", 0) or 0)
+    freeze_encoder_bn_eval = bool(mtrain.get("freeze_encoder_bn_eval", True))
+    if freeze_encoder_epochs > 0 and (
+        not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module)
+    ):
+        raise RuntimeError(
+            "mos_train_params.freeze_encoder_epochs is greater than 0, but the MOS model "
+            "has no self.encoder module to freeze."
+        )
+
     best_moving_iou = -1.0
     best_epoch = -1
+    prev_encoder_frozen = None
     for epoch in range(1, epochs + 1):
+        encoder_frozen = is_encoder_frozen_for_epoch(epoch, freeze_encoder_epochs)
+        set_encoder_trainable(
+            model,
+            trainable=not encoder_frozen,
+            bn_eval=freeze_encoder_bn_eval,
+        )
+        if freeze_encoder_epochs > 0 and (prev_encoder_frozen is None or encoder_frozen != prev_encoder_frozen):
+            state = "frozen" if encoder_frozen else "unfrozen"
+            print(f"[FREEZE] Epoch {epoch}/{epochs}: encoder {state}")
+            print_trainable_summary(model)
+        prev_encoder_frozen = encoder_frozen
+
         train_loss, train_counts, train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -720,6 +883,8 @@ def main():
             optimizer=optimizer,
             device=device,
             cfg=cfg,
+            encoder_frozen=encoder_frozen,
+            freeze_encoder_bn_eval=freeze_encoder_bn_eval,
         )
         val_loss, val_counts, val_metrics = validate_one_epoch(
             model=model,
@@ -781,6 +946,9 @@ def main():
             writer.add_scalar("ConfusionVal/tn_static", val_counts["tn_static"], epoch)
 
             writer.add_scalar("LearningRate/lr", lr_cur, epoch)
+            for group in optimizer.param_groups:
+                group_name = str(group.get("name", "default"))
+                writer.add_scalar(f"LearningRate/{group_name}", float(group["lr"]), epoch)
 
         if metrics_writer is not None:
             row = {

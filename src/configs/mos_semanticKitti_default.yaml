@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
+  input_mode: "range_xyz"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
   # Channel order for range_xyz* modes: [x, y, z, range, residual_1, ...]
   residual_offsets: [1]
   residual_folder_template: "residual_images_{offset}"
@@ -43,7 +43,7 @@ mos_train_params:
   num_workers: 6
   epochs: 50
 
-  learning_rate: 0.0005
+  learning_rate: 0.00005
   weight_decay: 0.0001
   clip_grad_norm: 5.0
 
@@ -56,16 +56,41 @@ mos_train_params:
   seed: 42
   deterministic: false
 
+  # Base LR for decoder/head and for all parameters in scratch runs.
+  # Scratch: keep pretrained_encoder_path: null, encoder_learning_rate: null,
+  # and freeze_encoder_epochs: 0.
+  # Pretrained encoder example:
+  #   pretrained_encoder_path: "/path/to/forecasting_checkpoint.pt"
+  #   encoder_learning_rate: 0.00005
+  #   freeze_encoder_epochs: 5
+  #   pretrained_encoder_init_new_channels: "zero"
+  # Choose encoder_learning_rate smaller than learning_rate for finetuning,
+  # e.g. 0.00005 or 0.00001.
+  encoder_learning_rate: 0.000005
+
+  # Optional: freeze encoder for the first N epochs.
+  # For pretrained encoders, 5 is a useful starting point.
+  # 0 means no freezing.
+  freeze_encoder_epochs: 5
+
+  # Keep BatchNorm layers inside the frozen encoder in eval mode.
+  freeze_encoder_bn_eval: true
+
+  # Optional minimum LRs for future scheduler support.
+  learning_rate_min: null
+  encoder_learning_rate_min: null
+
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
-  pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
+  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
-  pretrained_encoder_init_new_channels: "mean"
+  pretrained_encoder_init_new_channels: "zero"
 
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "Baseline_SalsaNext_RangeXYZResidual_xyzd_order"
+  # Override from CLI with --run_name for scratch/pretrained experiment names.
+  run_name: "Pretrained_Range_diff_LR"
   use_tensorboard: true
 
   save_checkpoints: true
