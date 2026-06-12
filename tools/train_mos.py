@@ -5,6 +5,7 @@ import argparse
 import csv
 import copy
 import datetime as dt
+import math
 import os
 import random
 import sys
@@ -342,6 +343,245 @@ def _make_optimizer(optimizer_name: str, params, lr: float, weight_decay: float)
     raise ValueError(f"Unsupported optimizer='{optimizer_name}'. Currently supported: ['adamw', 'adam', 'sgd']")
 
 
+def get_group_name(group, idx):
+    """
+    Reads group.get("name") if available, otherwise returns f"group_{idx}".
+    """
+    name = group.get("name", None)
+    if name is None or str(name).strip() == "":
+        return f"group_{idx}"
+    return str(name)
+
+
+def get_optimizer_group_lrs(optimizer):
+    """
+    Returns dictionary with group names and current learning rates.
+    Example:
+      {"encoder": 5e-5, "decoder_head": 5e-4}
+    If group has no name, use "group_0", "group_1", ...
+    """
+    return {
+        get_group_name(group, idx): float(group["lr"])
+        for idx, group in enumerate(optimizer.param_groups)
+    }
+
+
+def resolve_min_lrs_for_groups(optimizer, cfg):
+    """
+    Returns list of min_lrs in the same order as optimizer.param_groups.
+
+    Rules:
+    - If group name == "encoder":
+        use encoder_learning_rate_min if not None
+        else use 0.01 * current encoder lr as fallback
+    - If group name == "decoder_head":
+        use learning_rate_min if not None
+        else use 0.01 * current decoder/head lr as fallback
+    - For single/default group:
+        use learning_rate_min if not None
+        else use 0.01 * current lr as fallback
+    """
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    learning_rate_min = mtrain.get("learning_rate_min", None)
+    encoder_learning_rate_min = mtrain.get("encoder_learning_rate_min", None)
+    single_group = len(optimizer.param_groups) == 1
+
+    min_lrs = []
+    for idx, group in enumerate(optimizer.param_groups):
+        group_name = get_group_name(group, idx)
+        current_lr = float(group["lr"])
+
+        if group_name == "encoder":
+            configured_min_lr = encoder_learning_rate_min
+        elif group_name == "decoder_head" or single_group:
+            configured_min_lr = learning_rate_min
+        else:
+            configured_min_lr = learning_rate_min
+
+        if configured_min_lr is None:
+            min_lrs.append(0.01 * current_lr)
+        else:
+            min_lrs.append(float(configured_min_lr))
+    return min_lrs
+
+
+class GroupDecayLRScheduler:
+    def __init__(self, optimizer, min_lrs, epochs: int, start_epoch: int = 1, schedule_type: str = "linear"):
+        if len(min_lrs) != len(optimizer.param_groups):
+            raise ValueError(f"Expected {len(optimizer.param_groups)} min_lrs, got {len(min_lrs)}.")
+        if schedule_type not in {"linear", "cosine"}:
+            raise ValueError(f"Unsupported GroupDecayLRScheduler schedule_type='{schedule_type}'.")
+
+        self.optimizer = optimizer
+        self.min_lrs = [float(v) for v in min_lrs]
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.epochs = int(epochs)
+        self.start_epoch = max(1, int(start_epoch))
+        self.schedule_type = str(schedule_type)
+        self.last_epoch = 0
+        self._last_lr = list(self.base_lrs)
+
+    def _progress_for_epoch(self, epoch: int) -> float:
+        if int(epoch) < self.start_epoch:
+            return 0.0
+        effective_epochs = max(1, self.epochs - self.start_epoch + 1)
+        current_step = int(epoch) - self.start_epoch + 1
+        return min(1.0, max(0.0, float(current_step) / float(effective_epochs)))
+
+    def _lr_for_group(self, base_lr: float, min_lr: float, progress: float) -> float:
+        if base_lr == 0.0:
+            return 0.0
+        if self.schedule_type == "linear":
+            return min_lr + (base_lr - min_lr) * (1.0 - progress)
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + (base_lr - min_lr) * cosine_factor
+
+    def step(self, epoch: int | None = None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+        self.last_epoch = int(epoch)
+        if self.last_epoch < self.start_epoch:
+            self._last_lr = [float(group["lr"]) for group in self.optimizer.param_groups]
+            return self._last_lr
+
+        progress = self._progress_for_epoch(self.last_epoch)
+        new_lrs = []
+        for group, base_lr, min_lr in zip(self.optimizer.param_groups, self.base_lrs, self.min_lrs):
+            lr = self._lr_for_group(float(base_lr), float(min_lr), progress)
+            group["lr"] = float(lr)
+            new_lrs.append(float(lr))
+        self._last_lr = new_lrs
+        return new_lrs
+
+    def get_last_lr(self):
+        return list(self._last_lr)
+
+    def state_dict(self):
+        return {
+            "min_lrs": list(self.min_lrs),
+            "base_lrs": list(self.base_lrs),
+            "epochs": int(self.epochs),
+            "start_epoch": int(self.start_epoch),
+            "schedule_type": str(self.schedule_type),
+            "last_epoch": int(self.last_epoch),
+            "_last_lr": list(self._last_lr),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.min_lrs = [float(v) for v in state_dict["min_lrs"]]
+        self.base_lrs = [float(v) for v in state_dict["base_lrs"]]
+        self.epochs = int(state_dict["epochs"])
+        self.start_epoch = int(state_dict["start_epoch"])
+        self.schedule_type = str(state_dict["schedule_type"])
+        self.last_epoch = int(state_dict.get("last_epoch", 0))
+        self._last_lr = [float(v) for v in state_dict.get("_last_lr", self.base_lrs)]
+
+
+def build_scheduler(optimizer, cfg, epochs: int):
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    scheduler_name = str(mtrain.get("scheduler", "none")).lower()
+    supported = "none, cosine, linear, plateau"
+
+    if scheduler_name == "none":
+        return None, scheduler_name
+
+    if scheduler_name not in {"cosine", "linear", "plateau"}:
+        raise ValueError(f"Unsupported scheduler='{scheduler_name}'. Supported: {supported}.")
+
+    start_epoch = int(mtrain.get("scheduler_start_epoch", 1) or 1)
+    min_lrs = resolve_min_lrs_for_groups(optimizer, cfg)
+
+    print(f"[SCHEDULER] type={scheduler_name} start_epoch={start_epoch} epochs={int(epochs)}")
+    for idx, (group, min_lr) in enumerate(zip(optimizer.param_groups, min_lrs)):
+        print(
+            "[SCHEDULER] group={0} base_lr={1:g} min_lr={2:g}".format(
+                get_group_name(group, idx),
+                float(group["lr"]),
+                float(min_lr),
+            )
+        )
+
+    if scheduler_name in {"cosine", "linear"}:
+        return (
+            GroupDecayLRScheduler(
+                optimizer=optimizer,
+                min_lrs=min_lrs,
+                epochs=int(epochs),
+                start_epoch=start_epoch,
+                schedule_type=scheduler_name,
+            ),
+            scheduler_name,
+        )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=str(mtrain.get("scheduler_mode", "max")),
+        factor=float(mtrain.get("scheduler_factor", 0.5)),
+        patience=int(mtrain.get("scheduler_patience", 5)),
+        threshold=float(mtrain.get("scheduler_threshold", 0.0001)),
+        cooldown=int(mtrain.get("scheduler_cooldown", 0)),
+        min_lr=min_lrs,
+    )
+    return scheduler, scheduler_name
+
+
+def _get_plateau_monitor_value(cfg, val_loss, val_metrics):
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    monitor = str(mtrain.get("scheduler_monitor", "val_moving_iou"))
+    supported = {
+        "val_moving_iou": float(val_metrics["moving_iou"]),
+        "val_mean_iou": float(val_metrics["mean_iou"]),
+        "val_loss": float(val_loss),
+        "val_moving_f1": float(val_metrics["moving_f1"]),
+        "val_moving_recall": float(val_metrics["moving_recall"]),
+        "val_moving_precision": float(val_metrics["moving_precision"]),
+    }
+    if monitor not in supported:
+        raise ValueError(
+            "Unsupported scheduler_monitor='{0}'. Supported: {1}.".format(
+                monitor,
+                ", ".join(sorted(supported.keys())),
+            )
+        )
+    return supported[monitor]
+
+
+def step_scheduler_if_needed(scheduler, scheduler_name, cfg, epoch, val_loss, val_metrics):
+    if scheduler is None or scheduler_name == "none":
+        return
+
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    start_epoch = int(mtrain.get("scheduler_start_epoch", 1) or 1)
+    if int(epoch) < start_epoch:
+        return
+
+    if scheduler_name in {"cosine", "linear"}:
+        scheduler.step(int(epoch))
+        return
+
+    if scheduler_name == "plateau":
+        metric_value = _get_plateau_monitor_value(cfg, val_loss, val_metrics)
+        scheduler.step(metric_value)
+        return
+
+    raise ValueError(f"Unsupported scheduler='{scheduler_name}'. Supported: none, cosine, linear, plateau.")
+
+
+def lr_value_for_logging(group_lrs: Dict[str, float], optimizer):
+    lr_main = float(optimizer.param_groups[0]["lr"])
+    lr_encoder = group_lrs.get("encoder", None)
+    lr_decoder_head = group_lrs.get("decoder_head", None)
+    if lr_decoder_head is None and len(optimizer.param_groups) == 1:
+        lr_decoder_head = lr_main
+    return lr_main, lr_encoder, lr_decoder_head
+
+
+def format_lr_for_print(value):
+    if value is None:
+        return "n/a"
+    return f"{float(value):.3e}"
+
+
 def build_optimizer_with_param_groups(model: torch.nn.Module, cfg: Dict):
     mtrain = (cfg or {}).get("mos_train_params", {}) or {}
     base_lr = float(mtrain["learning_rate"])
@@ -595,6 +835,13 @@ def main():
     mtrain.setdefault("moving_class_weight", 10.0)
     mtrain.setdefault("optimizer", "adamw")
     mtrain.setdefault("scheduler", "none")
+    mtrain.setdefault("scheduler_monitor", "val_moving_iou")
+    mtrain.setdefault("scheduler_mode", "max")
+    mtrain.setdefault("scheduler_factor", 0.5)
+    mtrain.setdefault("scheduler_patience", 5)
+    mtrain.setdefault("scheduler_threshold", 0.0001)
+    mtrain.setdefault("scheduler_cooldown", 0)
+    mtrain.setdefault("scheduler_start_epoch", 1)
     mtrain.setdefault("seed", 42)
     mtrain.setdefault("deterministic", False)
     mtrain.setdefault("pretrained_encoder_path", None)
@@ -738,12 +985,8 @@ def main():
     )
 
     optimizer = build_optimizer_with_param_groups(model, cfg)
-
-    scheduler_name = str(mtrain.get("scheduler", "none")).lower()
-    if scheduler_name == "none":
-        scheduler = None
-    else:
-        raise ValueError(f"Unsupported scheduler='{scheduler_name}'. Currently supported: ['none']")
+    epochs = int(mtrain["epochs"])
+    scheduler, scheduler_name = build_scheduler(optimizer, cfg, epochs)
 
     log_root = os.path.abspath(str(mlog.get("log_root", "/home/devuser/workspace/LidarGaussianVideoView/mos_logs")))
     run_name = str(mlog.get("run_name", "mos_baseline"))
@@ -781,6 +1024,8 @@ def main():
         metrics_columns = [
             "epoch",
             "lr",
+            "lr_encoder",
+            "lr_decoder_head",
             "train_loss",
             "val_loss",
             "train_moving_iou",
@@ -894,10 +1139,17 @@ def main():
             cfg=cfg,
         )
 
-        if scheduler is not None:
-            scheduler.step()
+        step_scheduler_if_needed(
+            scheduler=scheduler,
+            scheduler_name=scheduler_name,
+            cfg=cfg,
+            epoch=epoch,
+            val_loss=val_loss,
+            val_metrics=val_metrics,
+        )
 
-        lr_cur = float(optimizer.param_groups[0]["lr"])
+        group_lrs = get_optimizer_group_lrs(optimizer)
+        lr_cur, lr_encoder, lr_decoder_head = lr_value_for_logging(group_lrs, optimizer)
         current_moving_iou = float(val_metrics["moving_iou"])
         is_best_moving_iou = current_moving_iou > best_moving_iou
         if is_best_moving_iou:
@@ -912,7 +1164,9 @@ def main():
             f"val_moving_iou={val_metrics['moving_iou']:.4f} | "
             f"val_moving_f1={val_metrics['moving_f1']:.4f} | "
             f"val_moving_recall={val_metrics['moving_recall']:.4f} | "
-            f"val_moving_precision={val_metrics['moving_precision']:.4f}"
+            f"val_moving_precision={val_metrics['moving_precision']:.4f} | "
+            f"decoder_lr={format_lr_for_print(lr_decoder_head)} | "
+            f"encoder_lr={format_lr_for_print(lr_encoder)}"
         )
 
         if writer is not None:
@@ -946,14 +1200,20 @@ def main():
             writer.add_scalar("ConfusionVal/tn_static", val_counts["tn_static"], epoch)
 
             writer.add_scalar("LearningRate/lr", lr_cur, epoch)
-            for group in optimizer.param_groups:
-                group_name = str(group.get("name", "default"))
-                writer.add_scalar(f"LearningRate/{group_name}", float(group["lr"]), epoch)
+            writer.add_scalar("LR/main", lr_cur, epoch)
+            if lr_encoder is not None:
+                writer.add_scalar("LR/encoder", float(lr_encoder), epoch)
+            if lr_decoder_head is not None:
+                writer.add_scalar("LR/decoder_head", float(lr_decoder_head), epoch)
+            for group_name, group_lr in group_lrs.items():
+                writer.add_scalar(f"LearningRate/{group_name}", float(group_lr), epoch)
 
         if metrics_writer is not None:
             row = {
                 "epoch": int(epoch),
                 "lr": float(lr_cur),
+                "lr_encoder": lr_encoder,
+                "lr_decoder_head": lr_decoder_head,
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),
                 "train_moving_iou": float(train_metrics["moving_iou"]),

@@ -43,7 +43,31 @@ mos_train_params:
   num_workers: 6
   epochs: 50
 
-  learning_rate: 0.00005
+  # Recommended pretrained finetuning:
+  # learning_rate: 0.0005
+  # encoder_learning_rate: 0.00005
+  # freeze_encoder_epochs: 5
+  #
+  # Scheduler options:
+  # scheduler: "none"
+  # scheduler: "cosine"
+  # scheduler: "linear"
+  # scheduler: "plateau"
+  #
+  # Cosine/linear:
+  # learning_rate_min: 0.000005
+  # encoder_learning_rate_min: 0.0000005
+  #
+  # Plateau:
+  # scheduler_monitor: "val_moving_iou"
+  # scheduler_mode: "max"
+  # scheduler_factor: 0.5
+  # scheduler_patience: 5
+
+  learning_rate: 0.0005
+  encoder_learning_rate: 0.00005
+  freeze_encoder_epochs: 0
+
   weight_decay: 0.0001
   clip_grad_norm: 5.0
 
@@ -51,7 +75,16 @@ mos_train_params:
   moving_class_weight: 10.0
 
   optimizer: "adamw"
-  scheduler: "none"
+  scheduler: "cosine"
+  learning_rate_min: 0.000005
+  encoder_learning_rate_min: 0.0000005
+  scheduler_monitor: "val_moving_iou"
+  scheduler_mode: "max"
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+  scheduler_threshold: 0.0001
+  scheduler_cooldown: 0
+  scheduler_start_epoch: 1
 
   seed: 42
   deterministic: false
@@ -66,19 +99,9 @@ mos_train_params:
   #   pretrained_encoder_init_new_channels: "zero"
   # Choose encoder_learning_rate smaller than learning_rate for finetuning,
   # e.g. 0.00005 or 0.00001.
-  encoder_learning_rate: 0.000005
-
-  # Optional: freeze encoder for the first N epochs.
-  # For pretrained encoders, 5 is a useful starting point.
-  # 0 means no freezing.
-  freeze_encoder_epochs: 5
 
   # Keep BatchNorm layers inside the frozen encoder in eval mode.
   freeze_encoder_bn_eval: true
-
-  # Optional minimum LRs for future scheduler support.
-  learning_rate_min: null
-  encoder_learning_rate_min: null
 
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
@@ -90,7 +113,7 @@ mos_train_params:
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
   # Override from CLI with --run_name for scratch/pretrained experiment names.
-  run_name: "Pretrained_Range_diff_LR"
+  run_name: "Pretrained_RangeXYZ_Cosine_EncLR5e5_HeadLR5e4_Freeze5"
   use_tensorboard: true
 
   save_checkpoints: true
