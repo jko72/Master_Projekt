@@ -13,8 +13,8 @@ residual_params: {
 }
 
 model_params: {
-  name: "acc_m2", #Auswahl des Modells ("swin", "acc_m1", "acc_m2")
-  use_mdn: false, #false -> kein Gauß direkte range vorhersage, true -> Gauß wird verwendet
+  name: "salsanext_acc_forecast", # nutzt SalsaNext-Encoder fuer self-supervised Range-Forecasting; Encoder fuer SalsaNextMOS-Transfer gedacht
+  use_mdn: false, # MDN wird in diesem Modellpfad NICHT unterstuetzt
   mdn_output_dim: 3,
   mdn_num_gaussians: 1, # 9
   input_horizon: 10,
@@ -48,16 +48,16 @@ train_params: {
   auto_increment_upper_bound: 2.e+4,
   auto_increment_lower_bound: 5.e+3,
   delta_t: 0.1,
-  num_total_epochs: 60, #Test:1, Standard: 8 bis 20, 
+  num_total_epochs: 60, #Test:1, Standard: 8 bis 20,
 
   # optional zur vergleichbarkeit
   random_seed: 42, # weglassen = kein festes Shuffle
-  deterministic: false, # optional; True = selbe rechenroutine für Operationen, nur nutzen wenn absolute vergleichbarkeit sein muss
+  deterministic: false, # optional; True = selbe rechenroutine fuer Operationen, nur nutzen wenn absolute vergleichbarkeit sein muss
   shuffle_train: true, # optional; False = Datensatz wird wie vom Dataset erzeugt trainiert -> Sequenz 0 dann Sequenz 1
   cudnn_benchmark: true,
 
   # BATCH SIZE
-  batch_size: 4,
+  batch_size: 2,
 
   # LEARNING RATE
   start_learning_rate: 5.e-4,
@@ -71,7 +71,7 @@ train_params: {
   use_density_threshold: true,
   density_threshold: 0.285,
 
-  output_horizons: [0, 10, 20], #Vorhersage für 3s [0, 10, 20, 30]
+  output_horizons: [0, 10, 20], #Vorhersage fuer 3s [0, 10, 20, 30]
   confidence_levels: [0.95, 0.68],
   learning_rate_min: 5.e-6, # Finale Learningrate, 5.e-5
   clip_grad_norm: 5.0,
@@ -79,7 +79,7 @@ train_params: {
   dataloader_prefetch: 2,
   num_samples: 200,
   cost_weight: 0.005,
-  
+
   plot_batch_step: 5,
   plot_time_vertically: True,
 
