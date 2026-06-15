@@ -105,7 +105,7 @@ mos_train_params:
 
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
-  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-05-29_09-47-53/weights/model_final.pt"
+  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticTHAB_Pretrain_Baseline/weights/model_final.pt"
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
   pretrained_encoder_init_new_channels: "zero"
@@ -113,7 +113,7 @@ mos_train_params:
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
   # Override from CLI with --run_name for scratch/pretrained experiment names.
-  run_name: "Pretrained_RangeXYZ_Cosine_EncLR5e5_HeadLR5e4_Freeze5"
+  run_name: "Pretrained_SemanticTHAB_Range"
   use_tensorboard: true
 
   save_checkpoints: true

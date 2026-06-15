@@ -17,7 +17,7 @@ from utils_torch import make_angle_grids
 
 # Optional: set a fixed weights path directly in this script.
 # Used as fallback if --weights and cfg train_params.pre_train_weights are not set.
-DEFAULT_WEIGHTS_PATH = "/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticKITTI ohne Ray/weights/model_final.pt"
+DEFAULT_WEIGHTS_PATH = "/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticKitti_Pretrain_Baseline/weights/model_final.pt" #"/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticKITTI ohne Ray/weights/model_final.pt"
             # Paper Checkpoint: "/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt" 
 # If None, CLI --viz_mode is used.
 DEBUG_VIZ_MODE_OVERRIDE = "both"
@@ -267,6 +267,50 @@ def make_viz_eval_loader(base_loader, batch_size: int, num_workers: int):
     )
 
 
+def select_model_input(hist_xyzd: torch.Tensor, cfg: dict) -> torch.Tensor:
+    """
+    Match dataloader output [B,T,C,H,W] to the channel count used when the
+    forecasting model was built.
+    """
+    if hist_xyzd.ndim != 5:
+        raise ValueError(f"Expected hist_xyzd shape [B,T,C,H,W], got {tuple(hist_xyzd.shape)}")
+
+    available_channels = int(hist_xyzd.shape[2])
+    expected_channels = int(cfg.get("model_params", {}).get("grid_channels", available_channels))
+
+    if expected_channels == available_channels:
+        return hist_xyzd
+
+    if expected_channels == 4:
+        if available_channels < 4:
+            raise ValueError(
+                f"Model expects 4 input channels, but dataloader returned C={available_channels}."
+            )
+        return hist_xyzd[:, :, :4, :, :]
+
+    if expected_channels == 3:
+        if available_channels < 3:
+            raise ValueError(
+                f"Model expects 3 input channels, but dataloader returned C={available_channels}."
+            )
+        return hist_xyzd[:, :, :3, :, :]
+
+    if expected_channels == 1:
+        if available_channels == 1:
+            return hist_xyzd
+        if available_channels >= 4:
+            return hist_xyzd[:, :, 3:4, :, :]
+        raise ValueError(
+            f"Model expects range-only input, but dataloader returned C={available_channels}; "
+            "cannot infer the range channel."
+        )
+
+    raise ValueError(
+        f"Unsupported model input channel count grid_channels={expected_channels}. "
+        "Expected one of: 1, 3, 4."
+    )
+
+
 def get_theta_range(cfg: dict) -> Tuple[float, float]:
     fov_up = float(cfg["model_params"].get("FOV_UP", 3.0))
     fov_down = float(cfg["model_params"].get("FOV_DOWN", -25.0))
@@ -490,12 +534,7 @@ def main(args):
                 hist_xyzd = hist_xyzd.to(args.device)
                 future_ranges = future_ranges.to(args.device)
 
-                if hist_xyzd.shape[2] == 4:
-                    hist_in = hist_xyzd[:, :, 3:4, :, :]
-                elif hist_xyzd.shape[2] == 1:
-                    hist_in = hist_xyzd
-                else:
-                    raise ValueError(f"Unexpected input channels from dataloader: {hist_xyzd.shape}")
+                hist_in = select_model_input(hist_xyzd, cfg)
 
                 t0 = time.perf_counter()
                 output = model(hist_in)
