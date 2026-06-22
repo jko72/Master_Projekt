@@ -1,6 +1,7 @@
 from models.rangeMixtureSwinTrans import RangeMixtureSwinTransformerModel
 from models.adapters_acc import AccurateM1Adapter, AccurateM2Adapter
 from models.salsanext_acc_forecast import SalsaNextACCForecast
+from models.salsanext_acc_forecast_decoder import SalsaNextACCForecastDecoder
 
 def build_model(name, cfg):
     n = str(name).lower()
@@ -12,4 +13,11 @@ def build_model(name, cfg):
         return AccurateM2Adapter(cfg)
     if n in ["salsa_acc", "salsanext_acc", "salsanext_acc_forecast", "salsa_acc_m2"]:
         return SalsaNextACCForecast(cfg)
+    if n in [
+        "salsanext_acc_forecast_decoder",
+        "salsa_acc_decoder",
+        "salsa_acc_full",
+        "salsanext_acc_full",
+    ]:
+        return SalsaNextACCForecastDecoder(cfg)
     raise ValueError(f"Unknown model name: {name}")

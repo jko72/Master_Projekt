@@ -103,9 +103,27 @@ mos_train_params:
   # Keep BatchNorm layers inside the frozen encoder in eval mode.
   freeze_encoder_bn_eval: true
 
+  # Encoder-only pretraining:
+  #   pretrained_encoder_path: "/path/to/model_final.pt"
+  #   pretrained_backbone_path: null
+  #
+  # Encoder+Decoder backbone pretraining:
+  #   pretrained_encoder_path: null
+  #   pretrained_backbone_path: "/path/to/model_final.pt"
+  #   pretrained_load_encoder: true
+  #   pretrained_load_decoder: true
+  #   pretrained_skip_decoder_head: true
+  #
+  # The decoder head is skipped because forecasting uses 1 output channel,
+  # while MOS uses 2 classes.
+
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
-  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticTHAB_Pretrain_Baseline/weights/model_final.pt"
+  pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticTHAB_Pretrain_Baseline/weights/model_final.pt"
+  pretrained_backbone_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-06-17_08-25-24/weights/model_final.pt"
+  pretrained_load_encoder: true
+  pretrained_load_decoder: true
+  pretrained_skip_decoder_head: true
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
   pretrained_encoder_init_new_channels: "zero"

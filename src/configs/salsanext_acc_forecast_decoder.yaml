@@ -1,0 +1,123 @@
+dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
+residual_params: {
+  enabled: true,
+  mode: "precompute",
+  offsets: [1],
+  normalize: true,
+  min_range: 2.0,
+  max_range: 50.0,
+  invalid_value: 0.0,
+  folder_template: "residual_images_{offset}",
+  overwrite: false,
+  visualize_debug: false
+}
+mos_label_params: {
+  enabled: true,
+  mode: "precompute",
+  folder_name: "mos_labels",
+  ignore_index: -1,
+  static_index: 0,
+  moving_index: 1,
+  overwrite: false,
+  min_range: 0.0,
+  max_range: 80.0,
+  label_mapping: "semantickitti_mos"
+}
+
+model_params: {
+  name: "salsanext_acc_forecast_decoder", # Encoder+decoder SalsaNext forecasting pretraining
+  use_mdn: false, # required: this model uses direct range regression, not MDN
+  mdn_output_dim: 3,
+  mdn_num_gaussians: 1, # 9
+  input_horizon: 10,
+  forecast_horizon: 3,
+  dropout_prob: 0.2,
+  mdn_dropout_prob: 0.2,
+  grid_height: 64, #64
+  grid_width: 512, #512
+
+  org_grid_height: 64,
+  org_grid_width: 2048,
+
+  grid_channels: 4, # Forecasting input channels: x,y,z,range from hist_xyzd
+  salsa_encoder_bottleneck_channels: 256,
+  salsa_acc_hid_T: 256,
+  salsa_acc_temporal_depth: 8,
+  FOV_UP: 3.0,
+  FOV_DOWN: -25.0,
+  MASK_THRESHOLD: -1.0,
+  preserve_ray_position: false, #true
+  with_attention: true
+}
+data_params: {
+  stats: {
+    mean: [10.839, 0.005, 0.494, -1.13, 0.0],
+    std:  [ 9.314,11.521, 8.262,  0.828,1.0],
+    min_range: -1.0,
+    max_range: 85.0
+},
+
+  split_type: "predefined",   # "rotary" oder "predefined"
+
+  predefined_splits: {
+    train: ["00", "01", "02", "03", "04", "05", "08", "09", "10"],
+    val:   ["06", "07"],
+    test:  []
+  }
+}
+train_params: {
+  with_resume_train: false,
+  pre_train_weights: null, #"/home/devuser/workspace/LidarGaussianVideoView/model2_kitti.ckpt",
+  auto_increment: true,
+  auto_increment_upper_bound: 2.e+4,
+  auto_increment_lower_bound: 5.e+3,
+  delta_t: 0.1,
+  num_total_epochs: 20, #Test:1, Standard: 8 bis 12, 
+
+  # optional zur vergleichbarkeit
+  random_seed: 42, # weglassen = kein festes Shuffle
+  deterministic: false, # optional; True = selbe rechenroutine für Operationen, nur nutzen wenn absolute vergleichbarkeit sein muss
+  shuffle_train: true, # optional; False = Datensatz wird wie vom Dataset erzeugt trainiert -> Sequenz 0 dann Sequenz 1
+  cudnn_benchmark: true,
+
+  # BATCH SIZE
+  batch_size: 2,
+
+  # LEARNING RATE
+  start_learning_rate: 5.e-4,
+  num_warmup_epochs: 2,
+  weight_decay: 1.e-4,        # typical: 1.e-2 -> 1.e-4
+  alpha_temperature_init: 0.25,
+
+  build_mixture_variance_epsilon: 1.e-5,
+  build_mixture_variance_mu: 1.e-5,
+  alpha_threshold: 0.2,
+  use_density_threshold: true,
+  density_threshold: 0.285,
+
+  output_horizons: [0, 10, 20], # 2.0s bei 10Hz
+  confidence_levels: [0.95, 0.68],
+  learning_rate_min: 5.e-6, # Finale Learningrate, 5.e-5
+  clip_grad_norm: 5.0,
+  dataloader_num_workers: 4,  # 4
+  dataloader_prefetch: 2,
+  num_samples: 200,
+  cost_weight: 0.005,
+  
+  plot_batch_step: 5,
+  plot_time_vertically: True,
+
+  plot_epoch_step: 50,
+  auto_save_step: 5,
+  logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/logs",
+  tensorboard_log_interval: 10,
+  compute_chamfer_metric: false,   # Chamfer-Logging an/aus
+  chamfer_metric_interval: 10,     # nur jedes X. Val-Batch Chamfer berechnen
+
+  # LOGGING
+  plot_examples: true,  # visualize while training
+  with_save: true,     # logging with tensorboard and saves weights
+  LOSS_WEIGHT_CHAMFER_DISTANCE: 0.0,
+  LOSS_WEIGHT_RANGE_VIEW: 1.0,
+  LOSS_WEIGHT_MASK: 1.0,
+}

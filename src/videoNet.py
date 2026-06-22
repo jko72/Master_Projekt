@@ -267,8 +267,20 @@ def build_training_checkpoint(model: torch.nn.Module, epoch: int | None = None):
     ckpt = {"model_state_dict": model.state_dict()}
     if epoch is not None:
         ckpt["epoch"] = int(epoch)
-    if hasattr(model, "encoder") and isinstance(model.encoder, torch.nn.Module):
+
+    if hasattr(model, "get_encoder_state_dict"):
+        ckpt["encoder_state_dict"] = model.get_encoder_state_dict()
+    elif hasattr(model, "encoder") and isinstance(model.encoder, torch.nn.Module):
         ckpt["encoder_state_dict"] = model.encoder.state_dict()
+
+    if hasattr(model, "get_decoder_state_dict"):
+        ckpt["decoder_state_dict"] = model.get_decoder_state_dict()
+    elif hasattr(model, "decoder") and isinstance(model.decoder, torch.nn.Module):
+        ckpt["decoder_state_dict"] = model.decoder.state_dict()
+
+    if hasattr(model, "get_backbone_state_dict"):
+        ckpt["backbone_state_dict"] = model.get_backbone_state_dict()
+
     return ckpt
 
 def compute_and_log_range_metrics(pred_rv, future, writer=None, global_step=None, prefix="val"):

@@ -685,6 +685,18 @@ def print_dataset_channel_debug(name: str, dataset: MOSFrameDataset):
         if channel_names:
             print(f"{name}_channel_names: {channel_names}")
 
+def _extract_prefixed_state(state_dict, prefix: str) -> Dict[str, torch.Tensor]:
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Expected state_dict to be a dict, got {type(state_dict)}")
+    prefix = str(prefix)
+    out = {}
+    for k, v in state_dict.items():
+        ks = str(k)
+        if ks.startswith(prefix):
+            out[ks[len(prefix) :]] = v
+    return out
+
+
 def _extract_encoder_state_from_checkpoint(ckpt) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt, dict) and "encoder_state_dict" in ckpt:
         state = ckpt["encoder_state_dict"]
@@ -692,30 +704,105 @@ def _extract_encoder_state_from_checkpoint(ckpt) -> Dict[str, torch.Tensor]:
             raise TypeError("checkpoint['encoder_state_dict'] is not a dict.")
         return state
 
+    if isinstance(ckpt, dict) and "backbone_state_dict" in ckpt:
+        backbone = ckpt["backbone_state_dict"]
+        if isinstance(backbone, dict) and "encoder" in backbone:
+            state = backbone["encoder"]
+            if not isinstance(state, dict):
+                raise TypeError("checkpoint['backbone_state_dict']['encoder'] is not a dict.")
+            return state
+
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         ms = ckpt["model_state_dict"]
-        if not isinstance(ms, dict):
-            raise TypeError("checkpoint['model_state_dict'] is not a dict.")
-        enc = {}
-        for k, v in ms.items():
-            if str(k).startswith("encoder."):
-                enc[str(k)[len("encoder."):]] = v
+        enc = _extract_prefixed_state(ms, "encoder.")
         if enc:
             return enc
 
     if isinstance(ckpt, dict):
         # Plain encoder-only state_dict or full model state_dict with "encoder." prefix.
-        if any(str(k).startswith("encoder.") for k in ckpt.keys()):
-            enc = {}
-            for k, v in ckpt.items():
-                ks = str(k)
-                if ks.startswith("encoder."):
-                    enc[ks[len("encoder."):]] = v
-            if enc:
-                return enc
+        enc = _extract_prefixed_state(ckpt, "encoder.")
+        if enc:
+            return enc
         return ckpt
 
     raise TypeError(f"Unsupported checkpoint type: {type(ckpt)}")
+
+
+def _extract_decoder_state_from_checkpoint(ckpt) -> Dict[str, torch.Tensor]:
+    if isinstance(ckpt, dict) and "decoder_state_dict" in ckpt:
+        state = ckpt["decoder_state_dict"]
+        if not isinstance(state, dict):
+            raise TypeError("checkpoint['decoder_state_dict'] is not a dict.")
+        return state
+
+    if isinstance(ckpt, dict) and "backbone_state_dict" in ckpt:
+        backbone = ckpt["backbone_state_dict"]
+        if isinstance(backbone, dict) and "decoder" in backbone:
+            state = backbone["decoder"]
+            if not isinstance(state, dict):
+                raise TypeError("checkpoint['backbone_state_dict']['decoder'] is not a dict.")
+            return state
+
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        ms = ckpt["model_state_dict"]
+        dec = _extract_prefixed_state(ms, "decoder.")
+        if dec:
+            return dec
+
+    if isinstance(ckpt, dict):
+        dec = _extract_prefixed_state(ckpt, "decoder.")
+        if dec:
+            return dec
+
+    raise KeyError("Could not find decoder weights in checkpoint.")
+
+
+def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_override: str | None = None):
+    mtrain = (cfg or {}).get("mos_train_params", {}) or {}
+    ckpt_path = path_override if path_override is not None else mtrain.get("pretrained_backbone_path", None)
+    if not ckpt_path:
+        return False
+
+    ckpt_path = os.path.abspath(str(ckpt_path))
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Pretrained backbone checkpoint not found: {ckpt_path}")
+    if not hasattr(model, "load_pretrained_backbone"):
+        raise RuntimeError(
+            "pretrained_backbone_path is set, but the selected MOS model has no "
+            "load_pretrained_backbone(...) method."
+        )
+
+    load_encoder = bool(mtrain.get("pretrained_load_encoder", True))
+    load_decoder = bool(mtrain.get("pretrained_load_decoder", False))
+    skip_decoder_head = bool(mtrain.get("pretrained_skip_decoder_head", True))
+    strict_encoder = bool(mtrain.get("pretrained_encoder_strict", True))
+    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", True))
+    init_new_channels = str(mtrain.get("pretrained_encoder_init_new_channels", "zero"))
+
+    print(f"[PRETRAIN MOS] Loading pretrained backbone from: {ckpt_path}")
+    print(
+        f"[PRETRAIN MOS] load_encoder={load_encoder} "
+        f"load_decoder={load_decoder} skip_decoder_head={skip_decoder_head}"
+    )
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    encoder_state = None
+    decoder_state = None
+    if load_encoder:
+        encoder_state = _extract_encoder_state_from_checkpoint(ckpt)
+    if load_decoder:
+        decoder_state = _extract_decoder_state_from_checkpoint(ckpt)
+
+    model.load_pretrained_backbone(
+        encoder_state_dict=encoder_state,
+        decoder_state_dict=decoder_state,
+        strict_encoder=strict_encoder,
+        strict_decoder=False,
+        adapt_input_channels=adapt_input_channels,
+        init_new_channels=init_new_channels,
+        skip_decoder_head=skip_decoder_head,
+    )
+    return True
 
 
 def maybe_load_pretrained_encoder(model: torch.nn.Module, cfg: Dict, path_override: str | None = None):
@@ -785,6 +872,17 @@ def main():
         default=None,
         help="Optional path to forecasting checkpoint (.pt) with encoder_state_dict for MOS encoder init.",
     )
+    parser.add_argument(
+        "--pretrained_backbone",
+        type=str,
+        default=None,
+        help="Optional path to forecasting checkpoint (.pt) with encoder+decoder backbone weights.",
+    )
+    parser.add_argument(
+        "--pretrained_load_decoder",
+        action="store_true",
+        help="Load decoder upsampling weights from --pretrained_backbone and skip the forecasting head by default.",
+    )
     args = parser.parse_args()
 
     cfg_path = resolve_cfg_path(args.cfg_path)
@@ -845,6 +943,10 @@ def main():
     mtrain.setdefault("seed", 42)
     mtrain.setdefault("deterministic", False)
     mtrain.setdefault("pretrained_encoder_path", None)
+    mtrain.setdefault("pretrained_backbone_path", None)
+    mtrain.setdefault("pretrained_load_encoder", True)
+    mtrain.setdefault("pretrained_load_decoder", False)
+    mtrain.setdefault("pretrained_skip_decoder_head", True)
     mtrain.setdefault("pretrained_encoder_strict", True)
     mtrain.setdefault("pretrained_encoder_adapt_input_channels", True)
     mtrain.setdefault("pretrained_encoder_init_new_channels", "mean")
@@ -880,6 +982,13 @@ def main():
         mtrain["num_workers"] = int(args.num_workers)
     if args.pretrained_encoder is not None:
         mtrain["pretrained_encoder_path"] = str(args.pretrained_encoder)
+    if args.pretrained_backbone is not None:
+        mtrain["pretrained_backbone_path"] = str(args.pretrained_backbone)
+    if args.pretrained_load_decoder:
+        mtrain["pretrained_load_decoder"] = True
+
+    if mtrain.get("pretrained_backbone_path") and mtrain.get("pretrained_encoder_path"):
+        raise ValueError("Set either pretrained_backbone_path or pretrained_encoder_path, not both.")
 
     in_channels = compute_in_channels(str(mdata["input_mode"]), mdata["residual_offsets"])
     mmodel["in_channels"] = int(in_channels)
@@ -967,11 +1076,18 @@ def main():
     )
 
     model = build_mos_model(cfg).to(device)
-    maybe_load_pretrained_encoder(
-        model=model,
-        cfg=cfg,
-        path_override=args.pretrained_encoder,
-    )
+    if mtrain.get("pretrained_backbone_path"):
+        maybe_load_pretrained_backbone(
+            model=model,
+            cfg=cfg,
+            path_override=args.pretrained_backbone,
+        )
+    else:
+        maybe_load_pretrained_encoder(
+            model=model,
+            cfg=cfg,
+            path_override=args.pretrained_encoder,
+        )
     n_params = count_trainable_params(model)
 
     class_weights = torch.tensor(
@@ -1092,6 +1208,7 @@ def main():
     print(f"device            : {device}")
     print(f"log_dir           : {log_dir}")
     print(f"pretrained_encoder: {mtrain.get('pretrained_encoder_path', None)}")
+    print(f"pretrained_backbone: {mtrain.get('pretrained_backbone_path', None)}")
     print_trainable_summary(model)
 
     epochs = int(mtrain["epochs"])
