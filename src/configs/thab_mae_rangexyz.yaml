@@ -44,6 +44,7 @@ test_params:
   batch_size: 1
   num_workers: 2
   max_samples: 20
+  max_visualizations: 100
   seed: 42
   mask_epoch: 0
   output_dir: null

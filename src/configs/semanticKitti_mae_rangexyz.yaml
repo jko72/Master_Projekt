@@ -43,17 +43,18 @@ data_params:
 test_params:
   batch_size: 1
   num_workers: 2
-  max_samples: 20
+  max_samples: 0
+  max_visualizations: 25
   seed: 42
   mask_epoch: 0
   output_dir: null
-  show: true
+  show: false
   show_pause_seconds: 0.5
 
 train_params:
   batch_size: 16
   num_workers: 4
-  num_total_epochs: 20
+  num_total_epochs: 60
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2

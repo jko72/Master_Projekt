@@ -33,6 +33,12 @@ def parse_args():
     parser.add_argument("--output_dir", default=None, type=str)
     parser.add_argument("--test_sequences", default=None, type=str, help="Override, e.g. '08' or '0006,0009'")
     parser.add_argument("--max_samples", default=None, type=int)
+    parser.add_argument(
+        "--max_visualizations",
+        default=None,
+        type=int,
+        help="Maximum PNGs to save/show; 0 disables visualizations, negative saves all.",
+    )
     parser.add_argument("--batch_size", default=None, type=int)
     parser.add_argument("--num_workers", default=None, type=int)
     parser.add_argument("--seed", default=None, type=int)
@@ -242,6 +248,11 @@ def main():
     max_samples = int(args.max_samples if args.max_samples is not None else test_cfg.get("max_samples", 20))
     if max_samples <= 0:
         max_samples = len(dataset)
+    max_visualizations = int(
+        args.max_visualizations
+        if args.max_visualizations is not None
+        else test_cfg.get("max_visualizations", 100)
+    )
     default_output = Path(checkpoint_path).parent.parent / "test_results" / Path(checkpoint_path).stem
     output_dir = os.path.abspath(
         os.path.expanduser(str(args.output_dir or test_cfg.get("output_dir") or default_output))
@@ -296,15 +307,18 @@ def main():
                     seq_id = str(meta["seq_id"][local_index])
                     frame_stem = str(meta["frame_stem"][local_index])
                     filename = f"{sample_count:05d}_seq-{seq_id}_frame-{frame_stem}.png"
-                    visual_path = visualizer.render(
-                        target[local_index].detach().cpu(),
-                        masked[local_index].detach().cpu(),
-                        pred[local_index].detach().cpu(),
-                        mask[local_index].detach().cpu(),
-                        valid[local_index].detach().cpu(),
-                        title=f"MAE-RangeXYZ | Sequence {seq_id} | Frame {frame_stem}",
-                        filename=filename,
-                    )
+                    should_visualize = max_visualizations < 0 or sample_count < max_visualizations
+                    visual_path = ""
+                    if should_visualize:
+                        visual_path = visualizer.render(
+                            target[local_index].detach().cpu(),
+                            masked[local_index].detach().cpu(),
+                            pred[local_index].detach().cpu(),
+                            mask[local_index].detach().cpu(),
+                            valid[local_index].detach().cpu(),
+                            title=f"MAE-RangeXYZ | Sequence {seq_id} | Frame {frame_stem}",
+                            filename=filename,
+                        )
                     values = {key: float(metrics[key].item()) for key in METRIC_KEYS}
                     for key in METRIC_KEYS:
                         totals[key] += values[key]
@@ -315,7 +329,8 @@ def main():
                     print(
                         f"[TEST {sample_count:04d}/{min(max_samples, len(dataset)):04d}] "
                         f"seq={seq_id} frame={frame_stem} "
-                        f"loss={values['loss_total']:.6f} saved={visual_path}"
+                        f"loss={values['loss_total']:.6f} "
+                        f"visualization={visual_path if visual_path else 'skipped'}"
                     )
                     if sample_count >= max_samples:
                         break
@@ -330,6 +345,10 @@ def main():
                 "checkpoint": checkpoint_path,
                 "test_sequences": sequence_ids,
                 "num_samples": sample_count,
+                "num_visualizations": min(
+                    sample_count,
+                    sample_count if max_visualizations < 0 else max_visualizations,
+                ),
                 **means,
             },
             handle,
