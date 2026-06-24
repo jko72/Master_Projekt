@@ -19,8 +19,9 @@ mos_data_params:
   static_index: 0
   moving_index: 1
 
-  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "07", "09", "10"]
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
   val_sequences: ["08"]
+  test_sequences: ["07"]
 
   require_moving_train: false
   require_moving_val: false
@@ -120,9 +121,9 @@ mos_train_params:
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
   pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/logs/SemanticTHAB_Pretrain_Baseline/weights/model_final.pt"
-  pretrained_backbone_path: "/home/devuser/workspace/LidarGaussianVideoView/logs/26-06-17_08-25-24/weights/model_final.pt"
+  pretrained_backbone_path: null #"/home/devuser/workspace/LidarGaussianVideoView/logs/26-06-17_08-25-24/weights/model_final.pt"
   pretrained_load_encoder: true
-  pretrained_load_decoder: true
+  pretrained_load_decoder: false
   pretrained_skip_decoder_head: true
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
