@@ -54,7 +54,7 @@ test_params:
 train_params:
   batch_size: 16
   num_workers: 4
-  num_total_epochs: 60
+  num_total_epochs: 80
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2
@@ -69,5 +69,5 @@ train_params:
   use_tensorboard: true
   plot_examples: true
   plot_batch_step: 5
-  save_visualizations: true
+  save_visualizations: false
   visualization_interval_epochs: 5
