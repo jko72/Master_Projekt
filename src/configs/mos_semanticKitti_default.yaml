@@ -9,9 +9,9 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_xyz"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
+  input_mode: "range_xyz_residual"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual"
   # Channel order for range_xyz* modes: [x, y, z, range, residual_1, ...]
-  residual_offsets: [1]
+  residual_offsets: [1,2,3,4,5]
   residual_folder_template: "residual_images_{offset}"
   mos_label_folder: "mos_labels"
 
@@ -42,7 +42,7 @@ mos_model_params:
 mos_train_params:
   batch_size: 16
   num_workers: 6
-  epochs: 70
+  epochs: 50
 
   # Recommended pretrained finetuning:
   # learning_rate: 0.0005
@@ -121,9 +121,9 @@ mos_train_params:
   # Optional: Forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
   # The loader uses checkpoint["encoder_state_dict"] when available.
   pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/mae_rangexyz_2026_Baseline/checkpoints/best_val_loss.pt"
-  pretrained_backbone_path: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/mae_rangexyz_2026_Baseline/checkpoints/best_val_loss.pt"
-  pretrained_load_encoder: true
-  pretrained_load_decoder: true
+  pretrained_backbone_path: null #"/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/mae_rangexyz_2026_Baseline/checkpoints/best_val_loss.pt"
+  pretrained_load_encoder: false
+  pretrained_load_decoder: false
   pretrained_skip_decoder_head: true
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true
@@ -132,7 +132,7 @@ mos_train_params:
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
   # Override from CLI with --run_name for scratch/pretrained experiment names.
-  run_name: "MOS_semanticKitti_MAE_Pretrained_encoder_decoder_2026"
+  run_name: "MOS_semanticKitti_Range_residual_of5_2026"
   use_tensorboard: true
 
 
