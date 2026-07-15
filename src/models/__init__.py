@@ -3,6 +3,7 @@ from models.adapters_acc import AccurateM1Adapter, AccurateM2Adapter
 from models.salsanext_acc_forecast import SalsaNextACCForecast
 from models.salsanext_acc_forecast_decoder import SalsaNextACCForecastDecoder
 from models.salsanext_mae_rangexyz import SalsaNextMAERangeXYZ
+from models.salsanext_temporal_mae import SalsaNextTemporalMAE
 
 def build_model(name, cfg):
     n = str(name).lower()
@@ -23,4 +24,6 @@ def build_model(name, cfg):
         return SalsaNextACCForecastDecoder(cfg)
     if n in ["mae_rangexyz", "salsanext_mae_rangexyz"]:
         return SalsaNextMAERangeXYZ(cfg)
+    if n in ["temporal_mae", "salsanext_temporal_mae"]:
+        return SalsaNextTemporalMAE(cfg)
     raise ValueError(f"Unknown model name: {name}")

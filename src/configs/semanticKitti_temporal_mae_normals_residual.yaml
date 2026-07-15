@@ -1,0 +1,81 @@
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+
+model_params:
+  name: "salsanext_temporal_mae"
+  grid_height: 64
+  grid_width: 512
+  grid_channels: 7
+  output_channels: 8
+  input_horizon: 5
+  org_grid_height: 64
+  org_grid_width: 2048
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.1
+  max_range: 80.0
+  preserve_ray_position: false
+  dropout_prob: 0.2
+  salsa_encoder_bottleneck_channels: 256
+  temporal_hidden_channels: 256
+  temporal_depth: 8
+
+pretrain_params:
+  task: "temporal_mae_normals_residual"
+  temporal:
+    align_history_to_current: true
+  mask:
+    type: "patch"
+    patch_h: 4
+    patch_w: 16
+    mask_ratio: 0.5
+    mask_only_valid: true
+    apply_to: "current"
+  loss:
+    name: "smooth_l1"
+    xyz_weight: 0.5
+    range_weight: 1.0
+    loss_on_mask_only: true
+    min_range: 0.1
+  residual_targets:
+    enabled: true
+    offsets: [1]
+    folder_template: "residual_images_{offset}"
+    allow_missing: false
+  auxiliary_tasks:
+    surface_normals:
+      enabled: true
+      weight: 0.1
+      loss: "cosine"
+    residual_reconstruction:
+      enabled: true
+      weight: 0.2
+      loss: "smooth_l1"
+      loss_on_mask_only: false
+      positive_threshold: 0.02
+      positive_weight: 5.0
+
+data_params:
+  split_type: "predefined"
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+
+train_params:
+  run_name: "temporal_mae_normals_residual_semanticKitti"
+  batch_size: 8
+  num_workers: 4
+  num_total_epochs: 80
+  learning_rate: 5.0e-4
+  learning_rate_min: 5.0e-6
+  num_warmup_epochs: 2
+  weight_decay: 1.0e-4
+  clip_grad_norm: 5.0
+  optimizer: "adamw"
+  scheduler: "warmup_cosine"
+  seed: 42
+  deterministic: false
+  with_save: true
+  logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs"
+  use_tensorboard: true
+  save_visualizations: false
+  visualization_interval_epochs: 5
