@@ -1,4 +1,4 @@
-"""SalsaNext masked autoencoder for four-channel RangeXYZ views."""
+"""SalsaNext masked autoencoder for RangeXYZ views."""
 
 from __future__ import annotations
 
@@ -11,26 +11,29 @@ from mos_models.salsanext_parts import SalsaNextDecoder, SalsaNextEncoder
 
 
 class SalsaNextMAERangeXYZ(nn.Module):
-    """Reconstruct ``[x,y,z,range]`` without adding a mask input channel."""
+    """Reconstruct RangeXYZ channels without adding a mask input channel."""
 
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
         model_cfg = cfg.get("model_params", {}) or {}
         in_channels = int(model_cfg.get("grid_channels", 4))
-        if in_channels != 4:
-            raise ValueError(f"MAE-RangeXYZ requires model_params.grid_channels=4, got {in_channels}.")
+        if in_channels < 4 or in_channels not in {4, 7}:
+            raise ValueError(
+                "MAE-RangeXYZ supports model_params.grid_channels of 4 or 7 "
+                f"for this step, got {in_channels}."
+            )
         dropout = float(model_cfg.get("dropout_prob", model_cfg.get("dropout", 0.2)))
-        self.in_channels = 4
-        self.out_channels = 4
-        self.encoder = SalsaNextEncoder(in_channels=4, dropout=dropout)
-        self.decoder = SalsaNextDecoder(num_classes=4, dropout=dropout)
-        self.mask_token = nn.Parameter(torch.zeros(1, 4, 1, 1))
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.encoder = SalsaNextEncoder(in_channels=in_channels, dropout=dropout)
+        self.decoder = SalsaNextDecoder(num_classes=in_channels, dropout=dropout)
+        self.mask_token = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
         nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 4 or x.shape[1] != 4:
-            raise ValueError(f"Expected x=[B,4,H,W], got {tuple(x.shape)}")
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(f"Expected x=[B,{self.in_channels},H,W], got {tuple(x.shape)}")
         if (
             mask.ndim != 4
             or mask.shape[1] != 1

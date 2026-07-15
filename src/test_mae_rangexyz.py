@@ -20,7 +20,14 @@ from models import build_model
 from train_mae_rangexyz import seed_worker, set_seed
 
 
-METRIC_KEYS = ("loss_total", "loss_xyz", "loss_range", "masked_valid_ratio", "valid_ratio")
+METRIC_KEYS = (
+    "loss_total",
+    "loss_xyz",
+    "loss_range",
+    "loss_normals",
+    "masked_valid_ratio",
+    "valid_ratio",
+)
 
 
 def parse_args():

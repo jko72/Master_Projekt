@@ -29,7 +29,14 @@ except ImportError:
     SummaryWriter = None
 
 
-METRIC_KEYS = ("loss_total", "loss_xyz", "loss_range", "masked_valid_ratio", "valid_ratio")
+METRIC_KEYS = (
+    "loss_total",
+    "loss_xyz",
+    "loss_range",
+    "loss_normals",
+    "masked_valid_ratio",
+    "valid_ratio",
+)
 
 
 def parse_args():
@@ -69,8 +76,9 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     model_cfg.setdefault("grid_height", 64)
     model_cfg.setdefault("grid_width", 512)
     model_cfg.setdefault("dropout_prob", 0.2)
-    if int(model_cfg["grid_channels"]) != 4:
-        raise ValueError("MAE-RangeXYZ requires model_params.grid_channels: 4")
+    grid_channels = int(model_cfg["grid_channels"])
+    if grid_channels not in {4, 7}:
+        raise ValueError("MAE-RangeXYZ requires model_params.grid_channels: 4 or 7")
 
     mask_cfg = cfg["pretrain_params"]["mask"]
     mask_cfg.setdefault("type", "patch")
@@ -85,6 +93,17 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     loss_cfg.setdefault("range_weight", 1.0)
     loss_cfg.setdefault("loss_on_mask_only", True)
     loss_cfg.setdefault("min_range", 0.1)
+    normals_cfg = cfg["pretrain_params"]["auxiliary_tasks"].setdefault("surface_normals", {})
+    normals_cfg.setdefault("enabled", False)
+    normals_cfg.setdefault("weight", 0.1)
+    normals_cfg.setdefault("loss", "cosine")
+    normals_enabled = bool(normals_cfg.get("enabled", False))
+    expected_channels = 7 if normals_enabled else 4
+    if grid_channels != expected_channels:
+        raise ValueError(
+            "model_params.grid_channels must be 7 when surface_normals.enabled is true "
+            "and 4 when it is false."
+        )
 
     data_cfg = cfg["data_params"]
     data_cfg.setdefault("split_type", "predefined")
@@ -520,7 +539,8 @@ def main():
             f"train_total={train_metrics['loss_total']:.6f} "
             f"val_total={val_metrics['loss_total']:.6f} "
             f"val_xyz={val_metrics['loss_xyz']:.6f} "
-            f"val_range={val_metrics['loss_range']:.6f}"
+            f"val_range={val_metrics['loss_range']:.6f} "
+            f"val_normals={val_metrics['loss_normals']:.6f}"
         )
 
         payload = checkpoint_payload(model, cfg, epoch + 1, val_metrics["loss_total"])

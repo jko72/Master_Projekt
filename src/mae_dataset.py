@@ -1,7 +1,9 @@
 """Frame-wise LiDAR range-view dataset for MAE-RangeXYZ pretraining.
 
-Channel convention is always ``[x, y, z, range]``. No labels, residual
-images, poses, or future frames are consumed by this dataset.
+Default channel convention is ``[x, y, z, range]``. When surface-normal
+pretraining is enabled it becomes ``[x, y, z, range, nx, ny, nz]``.
+No labels, residual images, poses, or future frames are consumed by this
+dataset.
 """
 
 from __future__ import annotations
@@ -19,8 +21,8 @@ from utils_torch import spherical_projection
 class RangeXYZMAEDataset(Dataset):
     """Project individual scans and create reproducible patch masks.
 
-    Returned tensors have shapes ``target_xyzd=[4,H,W]``,
-    ``masked_xyzd=[4,H,W]``, ``mask=[1,H,W]`` and
+    Returned tensors have shapes ``target_xyzd=[C,H,W]``,
+    ``masked_xyzd=[C,H,W]``, ``mask=[1,H,W]`` and
     ``valid_mask=[1,H,W]``. A mask value of one means "masked".
     """
 
@@ -40,6 +42,8 @@ class RangeXYZMAEDataset(Dataset):
         pretrain_cfg = cfg.get("pretrain_params", {}) or {}
         mask_cfg = pretrain_cfg.get("mask", {}) or {}
         loss_cfg = pretrain_cfg.get("loss", {}) or {}
+        auxiliary_cfg = pretrain_cfg.get("auxiliary_tasks", {}) or {}
+        normals_cfg = auxiliary_cfg.get("surface_normals", {}) or {}
         train_cfg = cfg.get("train_params", {}) or {}
 
         self.height = int(model_cfg.get("grid_height", 64))
@@ -53,6 +57,18 @@ class RangeXYZMAEDataset(Dataset):
         self.min_range = float(loss_cfg.get("min_range", model_cfg.get("min_range", 0.1)))
         max_range = model_cfg.get("max_range", model_cfg.get("MAX_RANGE", None))
         self.max_range = None if max_range is None else float(max_range)
+        self.surface_normals_enabled = bool(normals_cfg.get("enabled", False))
+        self.channel_names = ["x", "y", "z", "range"]
+        if self.surface_normals_enabled:
+            self.channel_names += ["nx", "ny", "nz"]
+        self.num_channels = len(self.channel_names)
+        grid_channels = int(model_cfg.get("grid_channels", self.num_channels))
+        if grid_channels != self.num_channels:
+            raise ValueError(
+                "model_params.grid_channels must match MAE target channels: "
+                f"got {grid_channels}, expected {self.num_channels} for "
+                f"surface_normals.enabled={self.surface_normals_enabled}."
+            )
 
         self.mask_type = str(mask_cfg.get("type", "patch")).lower()
         self.patch_h = int(mask_cfg.get("patch_h", 4))
@@ -73,7 +89,8 @@ class RangeXYZMAEDataset(Dataset):
         self._build_index()
         print(
             f"[RangeXYZMAEDataset:{self.split}] frames={len(self.samples)} "
-            f"shape=[4,{self.height},{self.width}] channels=[x,y,z,range]"
+            f"shape=[{self.num_channels},{self.height},{self.width}] "
+            f"channels={self.channel_names}"
         )
 
     def _build_index(self) -> None:
@@ -127,7 +144,7 @@ class RangeXYZMAEDataset(Dataset):
             "meta": {
                 **sample,
                 "split": self.split,
-                "channel_names": ["x", "y", "z", "range"],
+                "channel_names": list(self.channel_names),
             },
         }
 
@@ -151,13 +168,21 @@ class RangeXYZMAEDataset(Dataset):
                 f"with H,W={(self.height, self.width)}."
             )
 
-        xyz = torch.from_numpy(projected[..., :3].astype(np.float32)).permute(2, 0, 1).contiguous()
+        xyz_img = projected[..., :3].astype(np.float32)
+        xyz = torch.from_numpy(xyz_img).permute(2, 0, 1).contiguous()
         range_channel = torch.linalg.vector_norm(xyz, dim=0)
         xyz_is_zero = torch.all(xyz == 0.0, dim=0)
         finite = torch.isfinite(xyz).all(dim=0) & torch.isfinite(range_channel)
         valid = finite & (~xyz_is_zero) & (range_channel > self.min_range)
 
         target = torch.cat((xyz, range_channel.unsqueeze(0)), dim=0)
+        if self.surface_normals_enabled:
+            from helper.normal_helper import build_normal_xyz
+
+            normals_np = build_normal_xyz(xyz_img)
+            normals = torch.from_numpy(normals_np).permute(2, 0, 1).contiguous()
+            normals = torch.where(valid.unsqueeze(0), normals, torch.zeros_like(normals))
+            target = torch.cat((target, normals), dim=0)
         target = torch.where(valid.unsqueeze(0), target, torch.zeros_like(target))
         return target.float(), valid.unsqueeze(0).float()
 
