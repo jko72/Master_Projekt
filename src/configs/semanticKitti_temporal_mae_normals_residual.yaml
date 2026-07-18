@@ -62,9 +62,9 @@ data_params:
 
 train_params:
   run_name: "temporal_mae_normals_residual_semanticKitti"
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
-  num_total_epochs: 80
+  num_total_epochs: 50
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2
@@ -77,5 +77,5 @@ train_params:
   with_save: true
   logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs"
   use_tensorboard: true
-  save_visualizations: false
+  save_visualizations: true
   visualization_interval_epochs: 5

@@ -1,0 +1,91 @@
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+
+model_params:
+  grid_height: 64
+  grid_width: 512
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.0
+  max_range: 80.0
+
+mos_data_params:
+  input_mode: "range_xyz_normal_residual"
+  # Channel order: [x, y, z, range, nx, ny, nz, residual_1, ...]
+  residual_offsets: [1,2,3,4,5]
+  residual_folder_template: "residual_images_{offset}"
+  mos_label_folder: "mos_labels"
+
+  ignore_index: -1
+  static_index: 0
+  moving_index: 1
+
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+
+  require_moving_train: false
+  require_moving_val: false
+  min_moving_pixels: 1
+
+  use_moving_frame_sampler: false
+  moving_frame_weight: 5.0
+  static_frame_weight: 1.0
+
+mos_model_params:
+  name: "salsanext_mos"
+  in_channels: 12  # auto-overwritten in train_mos.py based on input_mode + residual_offsets
+  num_classes: 2
+  base_channels: 32
+  dropout: 0.1
+  norm: "batch"
+
+mos_train_params:
+  batch_size: 16
+  num_workers: 6
+  epochs: 50
+
+  learning_rate: 0.0005
+  encoder_learning_rate: 0.00005
+  freeze_encoder_epochs: 0
+
+  weight_decay: 0.0001
+  clip_grad_norm: 5.0
+
+  static_class_weight: 1.0
+  moving_class_weight: 10.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  learning_rate_min: 0.000005
+  encoder_learning_rate_min: 0.0000005
+  scheduler_monitor: "val_moving_iou"
+  scheduler_mode: "max"
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+  scheduler_threshold: 0.0001
+  scheduler_cooldown: 0
+  scheduler_start_epoch: 1
+
+  seed: 42
+  deterministic: false
+
+  freeze_encoder_bn_eval: true
+
+  pretrained_encoder_path: null
+  pretrained_backbone_path: null
+  pretrained_load_encoder: false
+  pretrained_load_decoder: false
+  pretrained_skip_decoder_head: true
+  pretrained_encoder_strict: true
+  pretrained_encoder_adapt_input_channels: true
+  pretrained_encoder_init_new_channels: "zero"
+
+mos_log_params:
+  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  run_name: "MOS_semanticKitti_range_xyz_normal_residual_12345"
+  use_tensorboard: true
+
+  save_checkpoints: true
+  save_visuals: false
+  save_csv: true
+  save_config_copy: true

@@ -61,6 +61,28 @@ def parse_residual_offsets(value) -> List[int]:
     return vals
 
 
+def compute_in_channels(input_mode: str, residual_offsets: Sequence[int]) -> int:
+    if input_mode == "range":
+        return 1
+    if input_mode == "residual":
+        return len(residual_offsets)
+    if input_mode == "range_residual":
+        return 1 + len(residual_offsets)
+    if input_mode == "range_xyz":
+        return 4
+    if input_mode == "range_xyz_residual":
+        return 4 + len(residual_offsets)
+    if input_mode == "range_xyz_normal":
+        return 7
+    if input_mode == "range_xyz_normal_residual":
+        return 7 + len(residual_offsets)
+    raise ValueError(
+        "Invalid input_mode='{0}'. Supported: "
+        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual', "
+        "'range_xyz_normal', 'range_xyz_normal_residual']".format(input_mode)
+    )
+
+
 def select_sequences(all_sequences: List[Dict], requested_ids: Sequence[str], split_name: str) -> List[Dict]:
     requested_norm = [normalize_seq_id(s) for s in requested_ids]
     wanted = set(requested_norm)
@@ -185,7 +207,7 @@ def select_visual_channels(x_chw: np.ndarray, input_mode: str, channel_names=Non
     else:
         if input_mode in {"range", "range_residual"}:
             range_idx = 0
-        elif input_mode in {"range_xyz", "range_xyz_residual"}:
+        elif input_mode in {"range_xyz", "range_xyz_residual", "range_xyz_normal", "range_xyz_normal_residual"}:
             range_idx = 3
 
         if input_mode == "residual":
@@ -194,6 +216,8 @@ def select_visual_channels(x_chw: np.ndarray, input_mode: str, channel_names=Non
             residual_idx = 1
         elif input_mode == "range_xyz_residual":
             residual_idx = 4
+        elif input_mode == "range_xyz_normal_residual":
+            residual_idx = 7
 
     range_img = x_chw[range_idx] if range_idx is not None and range_idx < x_chw.shape[0] else None
     residual_img = x_chw[residual_idx] if residual_idx is not None and residual_idx < x_chw.shape[0] else None
@@ -278,6 +302,22 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate a MOS checkpoint on range-view labels.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint .pt file")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--input_mode",
+        type=str,
+        default=None,
+        choices=[
+            "range",
+            "residual",
+            "range_residual",
+            "range_xyz",
+            "range_xyz_residual",
+            "range_xyz_normal",
+            "range_xyz_normal_residual",
+        ],
+        help="Optional input-mode override; defaults to the mode stored in the checkpoint cfg.",
+    )
+    parser.add_argument("--residual_offsets", type=str, default=None, help="Optional override, e.g. '1' or '1,2,3'.")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -340,8 +380,14 @@ def main():
             f"Config missing required key for split '{args.split}': mos_data_params.{split_key}"
         )
 
-    input_mode = str(mdata.get("input_mode", ckpt.get("input_mode", "range_residual")))
-    residual_offsets = parse_residual_offsets(mdata.get("residual_offsets", ckpt.get("residual_offsets", [1])))
+    input_mode = str(args.input_mode or mdata.get("input_mode", ckpt.get("input_mode", "range_residual")))
+    if args.residual_offsets is not None:
+        residual_offsets = parse_residual_offsets(args.residual_offsets)
+    else:
+        residual_offsets = parse_residual_offsets(mdata.get("residual_offsets", ckpt.get("residual_offsets", [1])))
+    mdata["input_mode"] = input_mode
+    mdata["residual_offsets"] = list(residual_offsets)
+    mmodel["in_channels"] = compute_in_channels(input_mode, residual_offsets)
     mos_label_folder = str(mdata.get("mos_label_folder", "mos_labels"))
     ignore_index = int(mdata.get("ignore_index", -1))
 

@@ -14,7 +14,16 @@ from utils_torch import spherical_projection
 class MOSFrameDataset(Dataset):
     """Frame-wise dataset for Moving Object Segmentation on range-view grids."""
 
-    ALLOWED_INPUT_MODES = {"range", "residual", "range_residual", "range_xyz", "range_xyz_residual"}
+    ALLOWED_INPUT_MODES = {
+        "range",
+        "residual",
+        "range_residual",
+        "range_xyz",
+        "range_xyz_residual",
+        "range_xyz_normal",
+        "range_xyz_normal_residual",
+    }
+    RESIDUAL_INPUT_MODES = {"residual", "range_residual", "range_xyz_residual", "range_xyz_normal_residual"}
     ALLOWED_LABEL_VALUES = {-1, 0, 1}
 
     def __init__(
@@ -46,7 +55,7 @@ class MOSFrameDataset(Dataset):
                 f"Unsupported input_mode='{self.input_mode}'. "
                 f"Use one of {sorted(self.ALLOWED_INPUT_MODES)}."
             )
-        if self.input_mode in {"residual", "range_residual", "range_xyz_residual"} and len(self.residual_offsets) == 0:
+        if self.input_mode in self.RESIDUAL_INPUT_MODES and len(self.residual_offsets) == 0:
             raise ValueError("Residual input mode needs at least one residual offset.")
 
         mp = self.cfg["model_params"]
@@ -55,6 +64,9 @@ class MOSFrameDataset(Dataset):
         fov_up = float(mp.get("FOV_UP", 3.0))
         fov_down = float(mp.get("FOV_DOWN", -25.0))
         self.theta_range = [fov_down * np.pi / 180.0, fov_up * np.pi / 180.0]
+        self.min_range = float(mp.get("min_range", mp.get("MIN_RANGE", 0.0)))
+        max_range = mp.get("max_range", mp.get("MAX_RANGE", None))
+        self.max_range = None if max_range is None else float(max_range)
         self.label_ignore_value = -1
 
         self._missing_residual_warned: set[str] = set()
@@ -79,6 +91,11 @@ class MOSFrameDataset(Dataset):
         )
         if self.input_mode in {"range_xyz", "range_xyz_residual"}:
             print("[MOSFrameDataset] channel convention for range_xyz* modes: [x,y,z,range,(residuals...)]")
+        if self.input_mode in {"range_xyz_normal", "range_xyz_normal_residual"}:
+            print(
+                "[MOSFrameDataset] channel convention for range_xyz_normal* modes: "
+                "[x,y,z,range,nx,ny,nz,(residuals...)]"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -96,12 +113,19 @@ class MOSFrameDataset(Dataset):
             range_img, x_img, y_img, z_img = self._load_projected_xyzd(sample["scan_path"])
             x_channels.extend([x_img, y_img, z_img, range_img])
             channel_names.extend(["x", "y", "z", "range"])
+        elif self.input_mode in {"range_xyz_normal", "range_xyz_normal_residual"}:
+            range_img, x_img, y_img, z_img, nx_img, ny_img, nz_img = self._load_projected_xyzd_normals(
+                sample["scan_path"]
+            )
+            x_channels.extend([x_img, y_img, z_img, range_img, nx_img, ny_img, nz_img])
+            channel_names.extend(["x", "y", "z", "range", "nx", "ny", "nz"])
 
         residual_paths = []
-        if self.input_mode in {"residual", "range_residual", "range_xyz_residual"}:
+        if self.input_mode in self.RESIDUAL_INPUT_MODES:
             for off in self.residual_offsets:
+                folder_template = str(self.cfg.get("mos_data_params", {}).get("residual_folder_template", "residual_images_{offset}"))
                 res_path = os.path.join(
-                    sample["seq_dir"], f"residual_images_{off}", f"{sample['frame_stem']}.npy"
+                    sample["seq_dir"], folder_template.format(offset=int(off)), f"{sample['frame_stem']}.npy"
                 )
                 residual_paths.append(res_path)
                 x_channels.append(self._load_residual_image(res_path))
@@ -190,6 +214,10 @@ class MOSFrameDataset(Dataset):
             return 4
         if self.input_mode == "range_xyz_residual":
             return 4 + len(self.residual_offsets)
+        if self.input_mode == "range_xyz_normal":
+            return 7
+        if self.input_mode == "range_xyz_normal_residual":
+            return 7 + len(self.residual_offsets)
         raise ValueError(
             f"Unsupported input_mode='{self.input_mode}'. "
             f"Use one of {sorted(self.ALLOWED_INPUT_MODES)}."
@@ -327,6 +355,73 @@ class MOSFrameDataset(Dataset):
 
         return range_img.astype(np.float32), x_img.astype(np.float32), y_img.astype(np.float32), z_img.astype(
             np.float32
+        )
+
+    def _load_projected_xyzd_normals(
+        self,
+        scan_path: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not os.path.isfile(scan_path):
+            raise FileNotFoundError(f"Scan file not found: {scan_path}")
+        pts = np.fromfile(scan_path, dtype=np.float32)
+        if pts.size % 4 != 0:
+            raise ValueError(f"Scan file has invalid float count (not divisible by 4): {scan_path}")
+        pts = pts.reshape(-1, 4)
+        pj_img, _, _, _ = spherical_projection(
+            pts.astype(np.float32),
+            height=self.H,
+            width=self.W,
+            theta_range=self.theta_range,
+        )
+
+        if pj_img.ndim != 3:
+            raise ValueError(f"spherical_projection returned unexpected shape {pj_img.shape} for {scan_path}")
+        if pj_img.shape[0] != self.H or pj_img.shape[1] != self.W:
+            raise ValueError(
+                f"spherical_projection returned unexpected spatial shape {pj_img.shape[:2]} "
+                f"for {scan_path}; expected {(self.H, self.W)}"
+            )
+        if pj_img.shape[2] < 3:
+            raise ValueError(
+                f"spherical_projection returned {pj_img.shape[2]} channels for {scan_path}, "
+                "but at least 3 channels (x,y,z) are required."
+            )
+
+        xyz_img = pj_img[:, :, :3].astype(np.float32)
+        x_img = xyz_img[:, :, 0].astype(np.float32)
+        y_img = xyz_img[:, :, 1].astype(np.float32)
+        z_img = xyz_img[:, :, 2].astype(np.float32)
+        range_img = np.sqrt((x_img * x_img) + (y_img * y_img) + (z_img * z_img)).astype(np.float32)
+
+        xyz_is_zero = np.all(xyz_img == 0.0, axis=2)
+        valid = (
+            np.isfinite(xyz_img).all(axis=2)
+            & np.isfinite(range_img)
+            & (~xyz_is_zero)
+            & (range_img > self.min_range)
+        )
+        if self.max_range is not None:
+            valid &= range_img < self.max_range
+
+        from helper.normal_helper import build_normal_xyz
+
+        normals = build_normal_xyz(xyz_img)
+        normals[~valid] = 0.0
+        invalid = ~valid
+        if np.any(invalid):
+            x_img[invalid] = 0.0
+            y_img[invalid] = 0.0
+            z_img[invalid] = 0.0
+            range_img[invalid] = 0.0
+
+        return (
+            range_img.astype(np.float32),
+            x_img.astype(np.float32),
+            y_img.astype(np.float32),
+            z_img.astype(np.float32),
+            normals[:, :, 0].astype(np.float32),
+            normals[:, :, 1].astype(np.float32),
+            normals[:, :, 2].astype(np.float32),
         )
 
     def _load_range_image(self, scan_path: str) -> np.ndarray:

@@ -95,9 +95,14 @@ def compute_in_channels(input_mode: str, residual_offsets: Sequence[int]) -> int
         return 4
     if input_mode == "range_xyz_residual":
         return 4 + len(residual_offsets)
+    if input_mode == "range_xyz_normal":
+        return 7
+    if input_mode == "range_xyz_normal_residual":
+        return 7 + len(residual_offsets)
     raise ValueError(
         "Invalid input_mode='{0}'. Supported: "
-        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual']".format(input_mode)
+        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual', "
+        "'range_xyz_normal', 'range_xyz_normal_residual']".format(input_mode)
     )
 
 
@@ -861,7 +866,15 @@ def main():
         "--input_mode",
         type=str,
         default=None,
-        choices=["range", "residual", "range_residual", "range_xyz", "range_xyz_residual"],
+        choices=[
+            "range",
+            "residual",
+            "range_residual",
+            "range_xyz",
+            "range_xyz_residual",
+            "range_xyz_normal",
+            "range_xyz_normal_residual",
+        ],
     )
     parser.add_argument("--residual_offsets", type=str, default=None, help="e.g. '1' or '1,2,3'")
     parser.add_argument("--moving_weight", type=float, default=None)
