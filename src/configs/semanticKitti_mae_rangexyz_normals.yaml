@@ -31,7 +31,7 @@ pretrain_params:
   auxiliary_tasks:
     surface_normals:
       enabled: true
-      weight: 0.1
+      weight: 0.5
       loss: "cosine"
 
 data_params:
@@ -55,7 +55,7 @@ train_params:
   run_name: "mae_rangexyz_normals_semanticKitti"
   batch_size: 16
   num_workers: 4
-  num_total_epochs: 80
+  num_total_epochs: 50
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2
