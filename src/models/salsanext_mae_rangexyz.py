@@ -18,11 +18,8 @@ class SalsaNextMAERangeXYZ(nn.Module):
         self.cfg = cfg
         model_cfg = cfg.get("model_params", {}) or {}
         in_channels = int(model_cfg.get("grid_channels", 4))
-        if in_channels < 4 or in_channels not in {4, 7}:
-            raise ValueError(
-                "MAE-RangeXYZ supports model_params.grid_channels of 4 or 7 "
-                f"for this step, got {in_channels}."
-            )
+        if in_channels < 4:
+            raise ValueError(f"MAE-RangeXYZ requires at least 4 input channels, got {in_channels}.")
         dropout = float(model_cfg.get("dropout_prob", model_cfg.get("dropout", 0.2)))
         self.in_channels = in_channels
         self.out_channels = in_channels

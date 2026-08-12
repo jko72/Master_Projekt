@@ -9,7 +9,7 @@ model_params:
   max_range: 80.0
 
 mos_data_params:
-  input_mode: "range_xyz_normal"     # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual", "range_xyz_normal", "range_xyz_normal_residual"
+  input_mode: "range_xyz_residual"   # "range", "residual", "range_residual", "range_xyz", "range_xyz_residual", "range_xyz_normal", "range_xyz_normal_residual"
   # Channel order for range_xyz* modes: [x, y, z, range, residual_1, ...]
   # Channel order for range_xyz_normal* modes: [x, y, z, range, nx, ny, nz, residual_1, ...]
   residual_offsets: [1]
@@ -124,7 +124,7 @@ mos_train_params:
   # For Temporal-MAE [x,y,z,range,nx,ny,nz] checkpoints, use
   # input_mode: "range_xyz_normal_residual" so channels 0..6 map semantically.
   # Appended residual channels are initialized by pretrained_encoder_init_new_channels.
-  pretrained_encoder_path: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/mae_rangexyz_normals_semanticKitti_2026-08-03_13-24-54/checkpoints/best_val_loss.pt"
+  pretrained_encoder_path: null #"/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/mae_rangexyz_normals_semanticKitti_2026-08-03_13-24-54/checkpoints/best_val_loss.pt"
   pretrained_backbone_path: null #"/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/temporal_mae_normals_residual_semanticKitti_2026/checkpoints/model_final.pt"
   pretrained_load_encoder: true
   pretrained_load_decoder: false
@@ -136,7 +136,7 @@ mos_train_params:
 mos_log_params:
   log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
   # Override from CLI with --run_name for scratch/pretrained experiment names.
-  run_name: "Pretrained_MOS_Kitti_MAE_Range_Normals_2026"
+  run_name: "Scratch_MOS_Kitti_range_xyz_residual_1_2026"
   use_tensorboard: true
 
 

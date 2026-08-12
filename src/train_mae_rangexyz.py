@@ -34,6 +34,8 @@ METRIC_KEYS = (
     "loss_xyz",
     "loss_range",
     "loss_normals",
+    "loss_residual",
+    "residual_pos_ratio",
     "masked_valid_ratio",
     "valid_ratio",
 )
@@ -66,6 +68,7 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     cfg.setdefault("pretrain_params", {})
     cfg["pretrain_params"].setdefault("mask", {})
     cfg["pretrain_params"].setdefault("loss", {})
+    cfg["pretrain_params"].setdefault("residual_inputs", {})
     cfg["pretrain_params"].setdefault("auxiliary_tasks", {})
     cfg.setdefault("data_params", {})
     cfg.setdefault("train_params", {})
@@ -77,8 +80,6 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     model_cfg.setdefault("grid_width", 512)
     model_cfg.setdefault("dropout_prob", 0.2)
     grid_channels = int(model_cfg["grid_channels"])
-    if grid_channels not in {4, 7}:
-        raise ValueError("MAE-RangeXYZ requires model_params.grid_channels: 4 or 7")
 
     mask_cfg = cfg["pretrain_params"]["mask"]
     mask_cfg.setdefault("type", "patch")
@@ -93,16 +94,34 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     loss_cfg.setdefault("range_weight", 1.0)
     loss_cfg.setdefault("loss_on_mask_only", True)
     loss_cfg.setdefault("min_range", 0.1)
+    residual_cfg = cfg["pretrain_params"]["residual_inputs"]
+    residual_cfg.setdefault("enabled", False)
+    residual_cfg.setdefault("offsets", [1])
+    residual_cfg.setdefault("folder_template", "residual_images_{offset}")
+    residual_cfg.setdefault("allow_missing", False)
+    residual_offsets = [int(v) for v in residual_cfg.get("offsets", [1])] if bool(residual_cfg.get("enabled", False)) else []
+    if bool(residual_cfg.get("enabled", False)) and not residual_offsets:
+        raise ValueError("pretrain_params.residual_inputs.offsets must contain at least one value")
+    if any(offset <= 0 for offset in residual_offsets):
+        raise ValueError(f"pretrain_params.residual_inputs.offsets must be positive, got {residual_offsets}")
+
     normals_cfg = cfg["pretrain_params"]["auxiliary_tasks"].setdefault("surface_normals", {})
     normals_cfg.setdefault("enabled", False)
     normals_cfg.setdefault("weight", 0.1)
     normals_cfg.setdefault("loss", "cosine")
+    residual_aux_cfg = cfg["pretrain_params"]["auxiliary_tasks"].setdefault("residual_reconstruction", {})
+    residual_aux_cfg.setdefault("enabled", bool(residual_offsets))
+    residual_aux_cfg.setdefault("weight", 0.2)
+    residual_aux_cfg.setdefault("loss", "smooth_l1")
+    residual_aux_cfg.setdefault("loss_on_mask_only", True)
+    residual_aux_cfg.setdefault("positive_threshold", 0.02)
+    residual_aux_cfg.setdefault("positive_weight", 1.0)
     normals_enabled = bool(normals_cfg.get("enabled", False))
-    expected_channels = 7 if normals_enabled else 4
+    expected_channels = (7 if normals_enabled else 4) + len(residual_offsets)
     if grid_channels != expected_channels:
         raise ValueError(
-            "model_params.grid_channels must be 7 when surface_normals.enabled is true "
-            "and 4 when it is false."
+            "model_params.grid_channels must equal base MAE channels plus residual inputs: "
+            f"got {grid_channels}, expected {expected_channels}."
         )
 
     data_cfg = cfg["data_params"]
@@ -275,6 +294,9 @@ def run_epoch(
                 print(f"mask shape: {tuple(mask.shape)}")
                 print(f"valid_mask shape: {tuple(valid.shape)}")
                 print(f"pred shape: {tuple(pred.shape)}")
+                metas = batch.get("meta", {})
+                if isinstance(metas, dict) and "channel_names" in metas:
+                    print(f"channels: {metas['channel_names']}")
                 print(f"valid ratio: {(valid > 0.5).float().mean().item():.6f}")
                 print(f"masked valid ratio: {masked_valid_ratio.item():.6f}")
                 print(f"finite loss: {torch.isfinite(loss).item()} ({loss.item():.6f})")
@@ -540,7 +562,8 @@ def main():
             f"val_total={val_metrics['loss_total']:.6f} "
             f"val_xyz={val_metrics['loss_xyz']:.6f} "
             f"val_range={val_metrics['loss_range']:.6f} "
-            f"val_normals={val_metrics['loss_normals']:.6f}"
+            f"val_normals={val_metrics['loss_normals']:.6f} "
+            f"val_residual={val_metrics['loss_residual']:.6f}"
         )
 
         payload = checkpoint_payload(model, cfg, epoch + 1, val_metrics["loss_total"])

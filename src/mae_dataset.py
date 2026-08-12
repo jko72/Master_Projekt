@@ -2,8 +2,8 @@
 
 Default channel convention is ``[x, y, z, range]``. When surface-normal
 pretraining is enabled it becomes ``[x, y, z, range, nx, ny, nz]``.
-No labels, residual images, poses, or future frames are consumed by this
-dataset.
+Optional residual input channels are appended as ``residual_<offset>``.
+No labels, poses, or future frames are consumed by this dataset.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ class RangeXYZMAEDataset(Dataset):
         pretrain_cfg = cfg.get("pretrain_params", {}) or {}
         mask_cfg = pretrain_cfg.get("mask", {}) or {}
         loss_cfg = pretrain_cfg.get("loss", {}) or {}
+        residual_cfg = pretrain_cfg.get("residual_inputs", {}) or {}
         auxiliary_cfg = pretrain_cfg.get("auxiliary_tasks", {}) or {}
         normals_cfg = auxiliary_cfg.get("surface_normals", {}) or {}
         train_cfg = cfg.get("train_params", {}) or {}
@@ -61,13 +62,24 @@ class RangeXYZMAEDataset(Dataset):
         self.channel_names = ["x", "y", "z", "range"]
         if self.surface_normals_enabled:
             self.channel_names += ["nx", "ny", "nz"]
+        self.residual_enabled = bool(residual_cfg.get("enabled", False))
+        self.residual_offsets = [int(v) for v in residual_cfg.get("offsets", [1])]
+        if self.residual_enabled and not self.residual_offsets:
+            raise ValueError("pretrain_params.residual_inputs.offsets must contain at least one offset.")
+        if any(offset <= 0 for offset in self.residual_offsets):
+            raise ValueError(f"Residual offsets must be positive, got {self.residual_offsets}.")
+        self.residual_folder_template = str(residual_cfg.get("folder_template", "residual_images_{offset}"))
+        self.allow_missing_residuals = bool(
+            residual_cfg.get("allow_missing", residual_cfg.get("allow_missing_residuals", False))
+        )
+        if self.residual_enabled:
+            self.channel_names += [f"residual_{offset}" for offset in self.residual_offsets]
         self.num_channels = len(self.channel_names)
         grid_channels = int(model_cfg.get("grid_channels", self.num_channels))
         if grid_channels != self.num_channels:
             raise ValueError(
                 "model_params.grid_channels must match MAE target channels: "
-                f"got {grid_channels}, expected {self.num_channels} for "
-                f"surface_normals.enabled={self.surface_normals_enabled}."
+                f"got {grid_channels}, expected {self.num_channels} for channels={self.channel_names}."
             )
 
         self.mask_type = str(mask_cfg.get("type", "patch")).lower()
@@ -94,20 +106,29 @@ class RangeXYZMAEDataset(Dataset):
         )
 
     def _build_index(self) -> None:
+        max_offset = max(self.residual_offsets) if self.residual_enabled else 0
         for seq in self.sequences:
             if not isinstance(seq, dict):
                 continue
             seq_id = str(seq.get("seq_id", "unknown"))
             for frame_index, path_entry in enumerate(seq.get("paths", [])):
+                if frame_index < max_offset:
+                    continue
                 scan_path = self._extract_scan_path(path_entry)
                 if scan_path is None:
+                    continue
+                frame_stem = os.path.splitext(os.path.basename(scan_path))[0]
+                residual_paths = self._residual_paths_for_scan(scan_path, frame_stem)
+                missing = [path for path in residual_paths if not os.path.isfile(path)]
+                if missing and not self.allow_missing_residuals:
                     continue
                 self.samples.append(
                     {
                         "seq_id": seq_id,
                         "frame_index": int(frame_index),
-                        "frame_stem": os.path.splitext(os.path.basename(scan_path))[0],
+                        "frame_stem": frame_stem,
                         "scan_path": scan_path,
+                        "residual_paths": residual_paths,
                     }
                 )
 
@@ -134,6 +155,9 @@ class RangeXYZMAEDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         sample = self.samples[index]
         target_xyzd, valid_mask = self._load_xyzd(sample["scan_path"])
+        if self.residual_enabled:
+            residuals = self._load_residual_inputs(sample["residual_paths"])
+            target_xyzd = torch.cat((target_xyzd, residuals), dim=0)
         mask = self._make_patch_mask(valid_mask, index)
         masked_xyzd = target_xyzd.masked_fill(mask.expand_as(target_xyzd).bool(), 0.0)
         return {
@@ -147,6 +171,16 @@ class RangeXYZMAEDataset(Dataset):
                 "channel_names": list(self.channel_names),
             },
         }
+
+    def _residual_paths_for_scan(self, scan_path: str, frame_stem: str) -> list[str]:
+        if not self.residual_enabled:
+            return []
+        seq_dir = os.path.dirname(os.path.dirname(scan_path))
+        paths = []
+        for offset in self.residual_offsets:
+            folder = self.residual_folder_template.format(offset=offset)
+            paths.append(os.path.join(seq_dir, folder, f"{frame_stem}.npy"))
+        return paths
 
     def _load_xyzd(self, scan_path: str) -> tuple[torch.Tensor, torch.Tensor]:
         if not os.path.isfile(scan_path):
@@ -185,6 +219,24 @@ class RangeXYZMAEDataset(Dataset):
             target = torch.cat((target, normals), dim=0)
         target = torch.where(valid.unsqueeze(0), target, torch.zeros_like(target))
         return target.float(), valid.unsqueeze(0).float()
+
+    def _load_residual_inputs(self, residual_paths: Sequence[str]) -> torch.Tensor:
+        residuals = []
+        for path in residual_paths:
+            if not os.path.isfile(path):
+                if self.allow_missing_residuals:
+                    residuals.append(torch.zeros((self.height, self.width), dtype=torch.float32))
+                    continue
+                raise FileNotFoundError(f"Residual input not found: {path}")
+            residual = np.load(path).astype(np.float32)
+            if residual.shape != (self.height, self.width):
+                raise ValueError(f"Residual input {path} has shape {residual.shape}, expected {(self.height, self.width)}")
+            if not np.isfinite(residual).all():
+                raise ValueError(f"Residual input contains non-finite values: {path}")
+            residuals.append(torch.from_numpy(residual))
+        if not residuals:
+            return torch.zeros((0, self.height, self.width), dtype=torch.float32)
+        return torch.stack(residuals, dim=0).contiguous()
 
     def _make_patch_mask(self, valid_mask: torch.Tensor, index: int) -> torch.Tensor:
         valid = valid_mask[0].bool()
