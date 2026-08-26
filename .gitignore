@@ -35,3 +35,6 @@ data/
 
 # --- Local backup references ---
 tools/_backup_references/
+
+# --- Separates Ergebnis-Repository ---
+Master_Projekt_Results/

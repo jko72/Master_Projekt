@@ -41,8 +41,8 @@ mos_model_params:
   norm: "batch"
 
 mos_train_params:
-  batch_size: 16
-  num_workers: 6
+  batch_size: 8
+  num_workers: 4
   epochs: 50
 
   # Recommended pretrained finetuning:
