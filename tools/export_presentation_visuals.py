@@ -48,8 +48,9 @@ MOVING = "#f28e2b"
 INVALID = "#808080"
 MASK_CMAP = mcolors.ListedColormap([INVALID, STATIC, MOVING])
 MASK_NORM = mcolors.BoundaryNorm([-1.5, -0.5, 0.5, 1.5], MASK_CMAP.N)
-PRED_CMAP = mcolors.ListedColormap([STATIC, MOVING])
-PRED_NORM = mcolors.BoundaryNorm([-0.5, 0.5, 1.5], PRED_CMAP.N)
+# Prediction panels retain the GT ignore mask: -1=grey, 0=static, 1=moving.
+PRED_CMAP = MASK_CMAP
+PRED_NORM = MASK_NORM
 ERROR_CMAP = mcolors.ListedColormap([INVALID, "#f7f7f7", "#d73027", "#fee08b"])
 ERROR_NORM = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], ERROR_CMAP.N)
 
@@ -274,8 +275,11 @@ def save_contact_sheet(out: Path, records, predictions, range_vmax):
               ("+ Residuen 1–5\nScratch", "pred"), ("+ MAE-Encoder\nResiduen 1–5", "pred")]
     fig, axs = plt.subplots(len(records), 5, figsize=(15, max(8.5, 1.35 * len(records))), constrained_layout=True)
     for row, rec in enumerate(records):
-        values = [rec["range"], rec["target"], predictions["baseline"][rec["stem"]],
-                  predictions["residual"][rec["stem"]], predictions["mae"][rec["stem"]]]
+        valid = rec["target"] != -1
+        values = [rec["range"], rec["target"],
+                  np.where(valid, predictions["baseline"][rec["stem"]], -1),
+                  np.where(valid, predictions["residual"][rec["stem"]], -1),
+                  np.where(valid, predictions["mae"][rec["stem"]], -1)]
         for col, ((label, kind), value) in enumerate(zip(labels, values)):
             title = label if row == 0 else ""
             draw(axs[row, col], value, kind, title, range_vmax)
@@ -287,10 +291,11 @@ def save_contact_sheet(out: Path, records, predictions, range_vmax):
 
 def save_detail(out: Path, rec, predictions, range_vmax, cropped=False):
     crop = rec["crop"]
+    valid = rec["target"] != -1
     panels = [(rec["range"], "range", "Range-Image"), (rec["target"], "gt", "Ground Truth"),
-              (predictions["baseline"][rec["stem"]], "pred", "Range+XYZ Scratch"),
-              (predictions["residual"][rec["stem"]], "pred", "Scratch + Residuen 1–5"),
-              (predictions["mae"][rec["stem"]], "pred", "MAE-Encoder + Residuen 1–5")]
+              (np.where(valid, predictions["baseline"][rec["stem"]], -1), "pred", "Range+XYZ Scratch"),
+              (np.where(valid, predictions["residual"][rec["stem"]], -1), "pred", "Scratch + Residuen 1–5"),
+              (np.where(valid, predictions["mae"][rec["stem"]], -1), "pred", "MAE-Encoder + Residuen 1–5")]
     fig, axs = plt.subplots(len(panels), 1, figsize=(12, 9.8 if cropped else 7.2), constrained_layout=True)
     for ax, (arr, kind, title) in zip(axs, panels):
         draw(ax, arr[crop] if cropped else arr, kind, title, range_vmax)
