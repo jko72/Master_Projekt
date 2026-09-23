@@ -57,9 +57,9 @@ data_params: {
   split_type: "predefined",   # "rotary" oder "predefined"
 
   predefined_splits: {
-    train: ["00", "01", "02", "03", "04", "05", "08", "09", "10"],
-    val:   ["06", "07"],
-    test:  []
+    train: ["00", "01", "02", "03", "04", "05", "06","09", "10"],
+    val:   ["08"],
+    test:  ["07"]
   }
 }
 train_params: {
