@@ -38,3 +38,5 @@ tools/_backup_references/
 
 # --- Separates Ergebnis-Repository ---
 Master_Projekt_Results/
+# --- Präsentationsexporte ---
+presentation_assets/
