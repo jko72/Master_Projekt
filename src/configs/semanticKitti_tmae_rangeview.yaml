@@ -55,10 +55,10 @@ data_params:
   test_sequences: ["07"]
 
 train_params:
-  run_name: "tmae_rangeview_semanticKitti_Test"
-  batch_size: 8
+  run_name: "tmae_rangeview_semanticKitti_Baseline"
+  batch_size: 4
   num_workers: 4
-  num_total_epochs: 1
+  num_total_epochs: 50
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2
