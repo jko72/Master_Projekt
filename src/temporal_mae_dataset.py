@@ -16,7 +16,7 @@ from utils_torch import spherical_projection
 
 def project_range_features(
     points: np.ndarray, height: int, width: int, theta_range,
-    min_range: float, max_range: float | None, surface_normals_enabled: bool,
+    min_range: float, max_range: float | None, include_intensity: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     projected, _, _, _ = spherical_projection(
         points.astype(np.float32),
@@ -25,9 +25,10 @@ def project_range_features(
         theta_range=theta_range,
         max_range=max_range,
     )
-    if projected.shape[:2] != (height, width) or projected.shape[-1] < 3:
+    required_channels = 4 if include_intensity else 3
+    if projected.shape[:2] != (height, width) or projected.shape[-1] < required_channels:
         raise ValueError(
-            f"Unexpected projection shape {projected.shape}; expected [H,W,>=3] "
+            f"Unexpected projection shape {projected.shape}; expected [H,W,>={required_channels}] "
             f"with H,W={(height, width)}."
         )
 
@@ -39,20 +40,17 @@ def project_range_features(
     valid = finite & (~xyz_is_zero) & (range_channel > min_range)
 
     feature = torch.cat((xyz, range_channel.unsqueeze(0)), dim=0)
-    if surface_normals_enabled:
-        from helper.normal_helper import build_normal_xyz
-
-        normals_np = build_normal_xyz(xyz_img)
-        normals = torch.from_numpy(normals_np).permute(2, 0, 1).contiguous()
-        normals = torch.where(valid.unsqueeze(0), normals, torch.zeros_like(normals))
-        feature = torch.cat((feature, normals), dim=0)
+    if include_intensity:
+        intensity = torch.from_numpy(projected[..., 3].copy()).unsqueeze(0)
+        valid = valid & torch.isfinite(intensity[0])
+        feature = torch.cat((feature, intensity), dim=0)
     feature = torch.where(valid.unsqueeze(0), feature, torch.zeros_like(feature))
     return feature.float(), valid.unsqueeze(0).float()
 
 
 
 class TemporalRangeMAEDataset(Dataset):
-    """Build short aligned range-view histories with current residual targets."""
+    """Build aligned range-view pairs for masked current-scan reconstruction."""
 
     def __init__(
         self,
@@ -72,8 +70,6 @@ class TemporalRangeMAEDataset(Dataset):
         mask_cfg = pretrain_cfg.get("mask", {}) or {}
         loss_cfg = pretrain_cfg.get("loss", {}) or {}
         residual_cfg = pretrain_cfg.get("residual_targets", {}) or {}
-        auxiliary_cfg = pretrain_cfg.get("auxiliary_tasks", {}) or {}
-        normals_cfg = auxiliary_cfg.get("surface_normals", {}) or {}
         train_cfg = cfg.get("train_params", {}) or {}
 
         self.height = int(model_cfg.get("grid_height", 64))
@@ -93,10 +89,8 @@ class TemporalRangeMAEDataset(Dataset):
         self.max_range = None if max_range is None else float(max_range)
 
         self.align_history_to_current = bool(temporal_cfg.get("align_history_to_current", True))
-        self.surface_normals_enabled = bool(normals_cfg.get("enabled", True))
-        self.channel_names = ["x", "y", "z", "range"]
-        if self.surface_normals_enabled:
-            self.channel_names += ["nx", "ny", "nz"]
+        self.channel_names = ["x", "y", "z", "range", "intensity"]
+        self.target_names = ["x", "y", "z", "range"]
         self.num_channels = len(self.channel_names)
         grid_channels = int(model_cfg.get("grid_channels", self.num_channels))
         if grid_channels != self.num_channels:
@@ -143,7 +137,7 @@ class TemporalRangeMAEDataset(Dataset):
 
         self.samples: list[dict] = []
         self._build_index()
-        target_names = self.channel_names + self.residual_names
+        target_names = self.target_names + self.residual_names
         print(
             f"[TemporalRangeMAEDataset:{self.split}] frames={len(self.samples)} "
             f"input_horizon={self.input_horizon} "
@@ -249,7 +243,7 @@ class TemporalRangeMAEDataset(Dataset):
             raise RuntimeError("Current frame was not included in temporal history.")
 
         hist_features = torch.stack(features, dim=0)
-        target_current = hist_features[-1].clone()
+        target_current = hist_features[-1, :4].clone()
         target_residuals = self._load_residual_targets(sample["residual_paths"])
         residual_valid_mask = current_valid_mask.clone()
 
@@ -297,7 +291,7 @@ class TemporalRangeMAEDataset(Dataset):
     def _project_features(self, points: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         return project_range_features(
             points, self.height, self.width, self.theta_range,
-            self.min_range, self.max_range, self.surface_normals_enabled,
+            self.min_range, self.max_range, include_intensity=True,
         )
 
     def _load_residual_targets(self, residual_paths: Sequence[str]) -> torch.Tensor:

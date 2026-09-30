@@ -35,7 +35,6 @@ METRIC_KEYS = (
     "loss_total",
     "loss_xyz",
     "loss_range",
-    "loss_normals",
     "loss_residual",
     "residual_pos_ratio",
     "masked_valid_ratio",
@@ -78,8 +77,8 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
 
     model_cfg = cfg["model_params"]
     model_cfg.setdefault("name", "salsanext_temporal_mae")
-    model_cfg.setdefault("grid_channels", 7)
-    model_cfg.setdefault("output_channels", 7)
+    model_cfg.setdefault("grid_channels", 5)
+    model_cfg.setdefault("output_channels", 4)
     model_cfg.setdefault("input_horizon", 2)
     model_cfg.setdefault("grid_height", 64)
     model_cfg.setdefault("grid_width", 512)
@@ -119,10 +118,6 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
         raise ValueError("pretrain_params.residual_targets.offsets must contain at least one value")
 
     auxiliary_cfg = cfg["pretrain_params"]["auxiliary_tasks"]
-    normals_cfg = auxiliary_cfg.setdefault("surface_normals", {})
-    normals_cfg.setdefault("enabled", True)
-    normals_cfg.setdefault("weight", 0.1)
-    normals_cfg.setdefault("loss", "cosine")
     residual_aux_cfg = auxiliary_cfg.setdefault("residual_reconstruction", {})
     residual_aux_cfg.setdefault("enabled", False)
     residual_aux_cfg.setdefault("weight", 0.2)
@@ -131,17 +126,13 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     residual_aux_cfg.setdefault("positive_threshold", 0.02)
     residual_aux_cfg.setdefault("positive_weight", 5.0)
 
-    expected_channels = 7 if bool(normals_cfg.get("enabled", True)) else 4
     grid_channels = int(model_cfg["grid_channels"])
-    if grid_channels != expected_channels:
-        raise ValueError(
-            "model_params.grid_channels must match surface_normals.enabled "
-            f"(got {grid_channels}, expected {expected_channels})."
-        )
-    expected_output_channels = grid_channels + len(residual_offsets)
+    if grid_channels != 5:
+        raise ValueError(f"model_params.grid_channels must be 5 for [x,y,z,range,intensity], got {grid_channels}.")
+    expected_output_channels = 4 + len(residual_offsets)
     if int(model_cfg["output_channels"]) != expected_output_channels:
         raise ValueError(
-            "model_params.output_channels must equal grid_channels + len(residual_offsets): "
+            "model_params.output_channels must equal 4 + len(residual_offsets): "
             f"got {model_cfg['output_channels']}, expected {expected_output_channels}."
         )
 
@@ -501,7 +492,6 @@ def main():
             f"val_total={val_metrics['loss_total']:.6f} "
             f"val_xyz={val_metrics['loss_xyz']:.6f} "
             f"val_range={val_metrics['loss_range']:.6f} "
-            f"val_normals={val_metrics['loss_normals']:.6f} "
             f"val_residual={val_metrics['loss_residual']:.6f}"
         )
 

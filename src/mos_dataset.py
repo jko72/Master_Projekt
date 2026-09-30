@@ -497,11 +497,11 @@ class MOSFrameDataset(Dataset):
 class TemporalMOSDataset(MOSFrameDataset):
     """Two scans in the current LiDAR coordinate system, with labels on the current scan."""
 
-    def __init__(self, sequences, cfg, split="train", input_mode="range_xyz_normal",
+    def __init__(self, sequences, cfg, split="train", input_mode="range_xyz",
                  residual_offsets=(1,), mos_label_folder="mos_labels", device="cpu",
                  require_moving=False, min_moving_pixels=1, allow_missing_labels=False):
-        if input_mode != "range_xyz_normal":
-            raise ValueError("Temporal T-MAE MOS currently requires input_mode=range_xyz_normal")
+        if input_mode != "range_xyz":
+            raise ValueError("Temporal T-MAE MOS requires input_mode=range_xyz")
         self.sequence_map = {self._normalize_seq_id(s["seq_id"]): s for s in sequences}
         self.previous_offset = int(cfg.get("mos_data_params", {}).get("previous_offset", 3))
         if self.previous_offset <= 0:
@@ -529,9 +529,9 @@ class TemporalMOSDataset(MOSFrameDataset):
         previous_pose = np.asarray(seq["poses"][previous_idx], dtype=np.float64)
         previous_points = transform_points(previous_points, np.linalg.inv(current_pose) @ previous_pose)
         past, _ = project_range_features(previous_points, self.H, self.W, self.theta_range,
-                                         self.min_range, self.max_range, True)
+                                         self.min_range, self.max_range, include_intensity=False)
         current, _ = project_range_features(current_points, self.H, self.W, self.theta_range,
-                                            self.min_range, self.max_range, True)
+                                            self.min_range, self.max_range, include_intensity=False)
         x = torch.stack((past, current), dim=0)
         y_np = self._load_mos_label(sample["mos_label_path"])
         y = torch.from_numpy(y_np.astype(np.int64))
@@ -542,7 +542,7 @@ class TemporalMOSDataset(MOSFrameDataset):
             "scan_path": sample["scan_path"],
             "previous_scan_path": previous_path,
             "previous_offset": self.previous_offset,
-            "channel_names": ["x", "y", "z", "range", "nx", "ny", "nz"],
+            "channel_names": ["x", "y", "z", "range"],
             "moving_pixels": int((y_np == 1).sum()),
             "static_pixels": int((y_np == 0).sum()),
             "ignore_pixels": int((y_np == -1).sum()),

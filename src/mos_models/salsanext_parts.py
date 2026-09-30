@@ -290,8 +290,8 @@ def adapt_first_conv_in_channels(
     # Channel-aligned MOS transfer:
     # - [x,y,z,range] pretraining maps directly to the first four
     #   range_xyz* MOS channels.
-    # - [x,y,z,range,nx,ny,nz] pretraining maps directly to the first
-    #   seven range_xyz_normal* MOS channels.
+    # - T-MAE [x,y,z,range,intensity] to MOS [x,y,z,range] retains
+    #   the first four pretrained filters and drops the intensity filter.
     # - Appended residual channels are initialized by the selected mode,
     #   usually mode="zero" for clean Temporal-MAE encoder transfer.
     adapted_state = OrderedDict(state_dict.items())

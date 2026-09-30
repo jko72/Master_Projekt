@@ -9,10 +9,10 @@ from .salsanext_mos import SalsaNextMOS
 
 
 class SalsaNextTemporalMOS(SalsaNextMOS):
-    def __init__(self, in_channels: int = 7, num_classes: int = 2,
+    def __init__(self, in_channels: int = 4, num_classes: int = 2,
                  dropout: float = 0.2, cross_attention_heads: int = 8):
-        if in_channels != 7:
-            raise ValueError("Temporal MOS uses 7 range-view channels for exact T-MAE transfer")
+        if in_channels != 4:
+            raise ValueError("Temporal MOS uses [x,y,z,range] without normals or intensity")
         super().__init__(in_channels=in_channels, num_classes=num_classes, dropout=dropout)
         self.backbone = RangeViewSiamWCA(in_channels, dropout, cross_attention_heads)
         self.encoder = self.backbone.encoder
@@ -20,7 +20,7 @@ class SalsaNextTemporalMOS(SalsaNextMOS):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 5 or x.shape[1] != 2 or x.shape[2] != self.in_channels:
-            raise ValueError("SalsaNextTemporalMOS expects [B,2,7,H,W]")
+            raise ValueError("SalsaNextTemporalMOS expects [B,2,4,H,W]")
         bottleneck, skips = self.backbone(x)
         return self.decoder(bottleneck, skips)
 

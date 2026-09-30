@@ -13,12 +13,12 @@ class SalsaNextTemporalMAE(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         model_cfg = cfg.get("model_params", {})
-        self.in_channels = int(model_cfg.get("grid_channels", 7))
+        self.in_channels = int(model_cfg.get("grid_channels", 5))
         if int(model_cfg.get("input_horizon", 2)) != 2:
             raise ValueError("T-MAE uses exactly one previous and one current scan")
-        self.out_channels = int(model_cfg.get("output_channels", self.in_channels))
-        if self.out_channels != self.in_channels:
-            raise ValueError("T-MAE reconstruction head must output current-frame channels")
+        self.out_channels = int(model_cfg.get("output_channels", 4))
+        if self.in_channels != 5 or self.out_channels != 4:
+            raise ValueError("T-MAE requires five input channels and four geometric reconstruction channels")
         dropout = float(model_cfg.get("dropout_prob", 0.2))
         heads = int(model_cfg.get("cross_attention_heads", 8))
         self.backbone = RangeViewSiamWCA(self.in_channels, dropout, heads)

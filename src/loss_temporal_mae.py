@@ -35,8 +35,8 @@ def temporal_mae_loss(
         )
     batch_size, current_channels, height, width = target_current.shape
     residual_channels = int(target_residuals.shape[1])
-    if current_channels not in {4, 7}:
-        raise ValueError(f"target_current must have C=4 or C=7, got C={current_channels}.")
+    if current_channels != 4:
+        raise ValueError(f"target_current must have C=4, got C={current_channels}.")
 
     expected_pred_shape = (batch_size, current_channels + residual_channels, height, width)
     if tuple(pred.shape) != expected_pred_shape:
@@ -57,10 +57,6 @@ def temporal_mae_loss(
     xyz_weight = float(loss_cfg.get("xyz_weight", 0.5))
     range_weight = float(loss_cfg.get("range_weight", 1.0))
     current_loss_on_mask_only = bool(loss_cfg.get("loss_on_mask_only", True))
-
-    normals_cfg = _aux_config(cfg, "surface_normals")
-    normal_weight = float(normals_cfg.get("weight", 0.1))
-    normal_loss_name = str(normals_cfg.get("loss", "cosine")).lower()
 
     residual_cfg = _aux_config(cfg, "residual_reconstruction")
     residual_enabled = bool(residual_cfg.get("enabled", False)) and residual_channels > 0
@@ -107,29 +103,6 @@ def temporal_mae_loss(
     ).clamp_min(1.0)
     loss_range = (current_per_channel[:, 3:4] * selected_current_f).sum() / selected_current_pixels.clamp_min(1.0)
 
-    if current_channels == 7:
-        if normal_loss_name == "cosine":
-            normal_per_pixel = 1.0 - F.cosine_similarity(
-                safe_pred_current[:, 4:7],
-                safe_target_current[:, 4:7],
-                dim=1,
-                eps=1e-8,
-            )
-            normal_per_pixel = torch.where(
-                selected_current[:, 0],
-                normal_per_pixel,
-                torch.zeros_like(normal_per_pixel),
-            )
-            loss_normals = normal_per_pixel.sum() / selected_current_pixels.clamp_min(1.0)
-        elif normal_loss_name in {"smooth_l1", "huber"}:
-            loss_normals = (current_per_channel[:, 4:7] * selected_current_f).sum() / (
-                selected_current_pixels * 3.0
-            ).clamp_min(1.0)
-        else:
-            raise ValueError("Unsupported surface normal loss. Use 'cosine' or 'smooth_l1'.")
-    else:
-        loss_normals = pred.new_tensor(0.0)
-
     finite_residual = torch.isfinite(pred_residuals) & torch.isfinite(target_residuals)
     selected_residual = (residual_valid_mask > 0.5).expand_as(target_residuals) & finite_residual
     if residual_loss_on_mask_only:
@@ -163,7 +136,6 @@ def temporal_mae_loss(
     loss_total = (
         xyz_weight * loss_xyz
         + range_weight * loss_range
-        + normal_weight * loss_normals
         + residual_weight * loss_residual
     )
 
@@ -176,7 +148,6 @@ def temporal_mae_loss(
         "loss_total": loss_total.detach(),
         "loss_xyz": loss_xyz.detach(),
         "loss_range": loss_range.detach(),
-        "loss_normals": loss_normals.detach(),
         "loss_residual": loss_residual.detach(),
         "residual_pos_ratio": residual_pos_ratio.detach(),
         "masked_valid_ratio": masked_valid_ratio.detach(),

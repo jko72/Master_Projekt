@@ -1058,8 +1058,8 @@ def main():
         raise ValueError("Set either pretrained_backbone_path or pretrained_encoder_path, not both.")
 
     if str(mmodel["name"]).lower() == "salsanext_temporal_mos":
-        if mdata["input_mode"] != "range_xyz_normal":
-            raise ValueError("Temporal MOS requires input_mode=range_xyz_normal")
+        if mdata["input_mode"] != "range_xyz":
+            raise ValueError("Temporal MOS requires input_mode=range_xyz")
         if mtrain.get("pretrained_backbone_path") and not bool(mtrain.get("pretrained_load_encoder", True)):
             raise ValueError("Temporal MOS checkpoint transfer needs pretrained_load_encoder=true")
 
