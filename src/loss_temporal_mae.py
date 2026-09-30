@@ -37,8 +37,7 @@ def temporal_mae_loss(
     residual_channels = int(target_residuals.shape[1])
     if current_channels not in {4, 7}:
         raise ValueError(f"target_current must have C=4 or C=7, got C={current_channels}.")
-    if residual_channels < 1:
-        raise ValueError("target_residuals must contain at least one residual channel.")
+
     expected_pred_shape = (batch_size, current_channels + residual_channels, height, width)
     if tuple(pred.shape) != expected_pred_shape:
         raise ValueError(f"pred must be {expected_pred_shape}, got {tuple(pred.shape)}")
@@ -64,7 +63,7 @@ def temporal_mae_loss(
     normal_loss_name = str(normals_cfg.get("loss", "cosine")).lower()
 
     residual_cfg = _aux_config(cfg, "residual_reconstruction")
-    residual_enabled = bool(residual_cfg.get("enabled", True))
+    residual_enabled = bool(residual_cfg.get("enabled", False)) and residual_channels > 0
     residual_weight = float(residual_cfg.get("weight", 0.2))
     residual_loss_name = str(residual_cfg.get("loss", "smooth_l1")).lower()
     residual_loss_on_mask_only = bool(residual_cfg.get("loss_on_mask_only", False))
@@ -138,7 +137,9 @@ def temporal_mae_loss(
 
     safe_pred_residuals = torch.where(finite_residual, pred_residuals, torch.zeros_like(pred_residuals))
     safe_target_residuals = torch.where(finite_residual, target_residuals, torch.zeros_like(target_residuals))
-    if residual_loss_name in {"smooth_l1", "huber"}:
+    if residual_channels == 0:
+        residual_per_channel = pred_residuals
+    elif residual_loss_name in {"smooth_l1", "huber"}:
         residual_per_channel = F.smooth_l1_loss(safe_pred_residuals, safe_target_residuals, reduction="none")
     elif residual_loss_name in {"l1", "mae"}:
         residual_per_channel = F.l1_loss(safe_pred_residuals, safe_target_residuals, reduction="none")

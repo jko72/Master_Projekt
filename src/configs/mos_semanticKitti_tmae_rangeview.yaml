@@ -1,0 +1,63 @@
+# Temporal MOS fine-tuning from semanticKitti_tmae_rangeview.yaml.
+# Set pretrained_backbone_path to the T-MAE best checkpoint before training.
+
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+model_params:
+  grid_height: 64
+  grid_width: 512
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.1
+  max_range: 80.0
+mos_data_params:
+  input_mode: "range_xyz_normal"
+  residual_offsets: [1]  # unused by this input mode
+  previous_offset: 3
+  mos_label_folder: "mos_labels"
+  ignore_index: -1
+  static_index: 0
+  moving_index: 1
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+  require_moving_train: false
+  require_moving_val: false
+  min_moving_pixels: 1
+  use_moving_frame_sampler: false
+mos_model_params:
+  name: "salsanext_temporal_mos"
+  in_channels: 7
+  num_classes: 2
+  dropout: 0.1
+  cross_attention_heads: 8
+mos_train_params:
+  batch_size: 4
+  num_workers: 4
+  epochs: 50
+  learning_rate: 0.0005
+  encoder_learning_rate: 0.00005
+  freeze_encoder_epochs: 0
+  weight_decay: 0.0001
+  clip_grad_norm: 5.0
+  static_class_weight: 1.0
+  moving_class_weight: 10.0
+  optimizer: "adamw"
+  scheduler: "cosine"
+  learning_rate_min: 0.000005
+  encoder_learning_rate_min: 0.0000005
+  seed: 42
+  deterministic: false
+  pretrained_backbone_path: null
+  pretrained_load_encoder: true
+  pretrained_load_decoder: true
+  pretrained_skip_decoder_head: true
+  pretrained_encoder_strict: true
+  pretrained_encoder_adapt_input_channels: false
+mos_log_params:
+  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  run_name: "MOS_semanticKitti_tmae_rangeview"
+  use_tensorboard: true
+  save_checkpoints: true
+  save_visuals: false
+  save_csv: true
+  save_config_copy: true

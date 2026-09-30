@@ -1,4 +1,3 @@
-# Compatibility config name; now runs the paper-style range-view T-MAE.
 # T-MAE transfer to the project's 2D spherical range view.
 # Previous scan is ego-motion aligned and complete; current scan is 75% masked.
 # Train: python src/train_temporal_mae.py --cfg_path configs/semanticKitti_tmae_rangeview.yaml
@@ -56,10 +55,10 @@ data_params:
   test_sequences: ["07"]
 
 train_params:
-  run_name: "tmae_rangeview_semanticKitti"
-  batch_size: 4
+  run_name: "tmae_rangeview_semanticKitti_Test"
+  batch_size: 8
   num_workers: 4
-  num_total_epochs: 50
+  num_total_epochs: 1
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2

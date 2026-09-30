@@ -11,6 +11,7 @@ import math
 import os
 import random
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -78,27 +79,28 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     model_cfg = cfg["model_params"]
     model_cfg.setdefault("name", "salsanext_temporal_mae")
     model_cfg.setdefault("grid_channels", 7)
-    model_cfg.setdefault("output_channels", 8)
-    model_cfg.setdefault("input_horizon", 5)
+    model_cfg.setdefault("output_channels", 7)
+    model_cfg.setdefault("input_horizon", 2)
     model_cfg.setdefault("grid_height", 64)
     model_cfg.setdefault("grid_width", 512)
     model_cfg.setdefault("dropout_prob", 0.2)
     model_cfg.setdefault("salsa_encoder_bottleneck_channels", 256)
-    model_cfg.setdefault("temporal_hidden_channels", 256)
-    model_cfg.setdefault("temporal_depth", 8)
+    model_cfg.setdefault("cross_attention_heads", 8)
 
     temporal_cfg = cfg["pretrain_params"]["temporal"]
     temporal_cfg.setdefault("align_history_to_current", True)
+    temporal_cfg.setdefault("previous_offset", 3)
+    temporal_cfg.setdefault("previous_offset_range", [3, 3])
 
     mask_cfg = cfg["pretrain_params"]["mask"]
     mask_cfg.setdefault("type", "patch")
-    mask_cfg.setdefault("patch_h", 4)
+    mask_cfg.setdefault("patch_h", 16)
     mask_cfg.setdefault("patch_w", 16)
-    mask_cfg.setdefault("mask_ratio", 0.5)
+    mask_cfg.setdefault("mask_ratio", 0.75)
     mask_cfg.setdefault("mask_only_valid", True)
     mask_cfg.setdefault("apply_to", "current")
-    if str(mask_cfg["apply_to"]).lower() not in {"current", "all"}:
-        raise ValueError("pretrain_params.mask.apply_to must be 'current' or 'all'")
+    if str(mask_cfg["apply_to"]).lower() != "current":
+        raise ValueError("T-MAE masks only the current scan")
 
     loss_cfg = cfg["pretrain_params"]["loss"]
     loss_cfg.setdefault("name", "smooth_l1")
@@ -108,11 +110,11 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     loss_cfg.setdefault("min_range", 0.1)
 
     residual_cfg = cfg["pretrain_params"]["residual_targets"]
-    residual_cfg.setdefault("enabled", True)
-    residual_cfg.setdefault("offsets", [1])
+    residual_cfg.setdefault("enabled", False)
+    residual_cfg.setdefault("offsets", [])
     residual_cfg.setdefault("folder_template", "residual_images_{offset}")
     residual_cfg.setdefault("allow_missing", False)
-    residual_offsets = [int(v) for v in residual_cfg.get("offsets", [1])]
+    residual_offsets = [int(v) for v in residual_cfg.get("offsets", [])] if bool(residual_cfg["enabled"]) else []
     if bool(residual_cfg.get("enabled", True)) and not residual_offsets:
         raise ValueError("pretrain_params.residual_targets.offsets must contain at least one value")
 
@@ -122,7 +124,7 @@ def apply_defaults_and_cli(cfg: dict, args) -> dict:
     normals_cfg.setdefault("weight", 0.1)
     normals_cfg.setdefault("loss", "cosine")
     residual_aux_cfg = auxiliary_cfg.setdefault("residual_reconstruction", {})
-    residual_aux_cfg.setdefault("enabled", True)
+    residual_aux_cfg.setdefault("enabled", False)
     residual_aux_cfg.setdefault("weight", 0.2)
     residual_aux_cfg.setdefault("loss", "smooth_l1")
     residual_aux_cfg.setdefault("loss_on_mask_only", False)
@@ -281,9 +283,15 @@ def run_epoch(
     device,
     optimizer=None,
     debug_first_batch=False,
+    epoch_index=0,
+    total_epochs=1,
 ):
     training = optimizer is not None
     model.train(training)
+    phase = "Training" if training else "Validierung"
+    total_batches = len(loader)
+    interactive = sys.stdout.isatty()
+    last_reported_bucket = -1
     totals = {key: 0.0 for key in METRIC_KEYS}
     sample_count = 0
     last_visual = None
@@ -336,8 +344,28 @@ def run_epoch(
                 residual_valid[:1].detach().cpu(),
             )
 
+            completed = batch_index + 1
+            percent = 100 * completed // total_batches
+            running_loss = totals["loss_total"] / sample_count
+            filled = 20 * completed // total_batches
+            bar = "#" * filled + "." * (20 - filled)
+            progress = (
+                f"Epoche {epoch_index + 1}/{total_epochs} | {phase:11s} "
+                f"[{bar}] {percent:3d}% ({completed}/{total_batches} Batches) "
+                f"Loss {running_loss:.5f}"
+            )
+            if interactive:
+                print(f"\r{progress}", end="", flush=True)
+            else:
+                bucket = percent // 10
+                if bucket != last_reported_bucket or completed == total_batches:
+                    print(progress, flush=True)
+                    last_reported_bucket = bucket
+
     if sample_count == 0:
         raise RuntimeError("DataLoader produced zero samples")
+    if interactive:
+        print()
     return {key: value / sample_count for key, value in totals.items()}, last_visual
 
 
@@ -351,24 +379,16 @@ def save_visualization(tensors, output_path: str) -> bool:
         return False
 
     target_current, target_residuals, pred, valid, residual_valid = tensors
-    current_channels = int(target_current.shape[1])
     valid_np = valid[0, 0].numpy() > 0.5
-    residual_valid_np = residual_valid[0, 0].numpy() > 0.5
     target_range = target_current[0, 3].numpy()
     pred_range = pred[0, 3].numpy()
-    target_residual = target_residuals[0, 0].numpy()
-    pred_residual = pred[0, current_channels].numpy()
-    residual_error = np.abs(pred_residual - target_residual)
-    panels = [target_range, pred_range, target_residual, pred_residual, residual_error]
-    titles = ["Target Range", "Reconstructed Range", "Target Residual 1", "Reconstructed Residual 1", "Residual Error"]
-
-    fig, axes = plt.subplots(1, 5, figsize=(24, 4), constrained_layout=True)
+    error = np.abs(pred_range - target_range)
+    panels = [target_range, pred_range, error]
+    titles = ["Target Range", "Reconstructed Range", "Absolute Range Error"]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
     for axis, panel, title in zip(axes, panels, titles):
         shown = panel.astype(np.float32).copy()
-        if "Residual" in title:
-            shown[~residual_valid_np] = np.nan
-        else:
-            shown[~valid_np] = np.nan
+        shown[~valid_np] = np.nan
         image = axis.imshow(shown, aspect="auto", interpolation="nearest")
         axis.set_title(title)
         axis.axis("off")
@@ -384,6 +404,7 @@ def checkpoint_payload(model, cfg, epoch: int, val_loss: float) -> dict:
         "model_state_dict": model.state_dict(),
         "encoder_state_dict": model.get_encoder_state_dict(),
         "decoder_state_dict": model.get_decoder_state_dict(),
+        "cross_attention_state_dict": model.get_cross_attention_state_dict(),
         "backbone_state_dict": model.get_backbone_state_dict(),
         "epoch": int(epoch),
         "cfg": copy.deepcopy(cfg),
@@ -454,8 +475,13 @@ def main():
             device,
             optimizer=optimizer,
             debug_first_batch=(epoch == 0),
+            epoch_index=epoch,
+            total_epochs=epochs,
         )
-        val_metrics, visual = run_epoch(model, val_loader, cfg, device, optimizer=None)
+        val_metrics, visual = run_epoch(
+            model, val_loader, cfg, device, optimizer=None,
+            epoch_index=epoch, total_epochs=epochs,
+        )
         last_val = float(val_metrics["loss_total"])
         lr = float(optimizer.param_groups[0]["lr"])
 

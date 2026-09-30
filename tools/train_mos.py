@@ -23,7 +23,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from helper.dataloader_helper import make_sequences
-from mos_dataset import MOSFrameDataset
+from mos_dataset import MOSFrameDataset, TemporalMOSDataset
 from mos_models import build_mos_model
 
 
@@ -208,6 +208,28 @@ def build_moving_frame_sampler(dataset: MOSFrameDataset, moving_weight: float, s
     return sampler
 
 
+
+def _print_batch_progress(phase: str, epoch: int, total_epochs: int,
+                          completed: int, total_batches: int, running_loss: float,
+                          last_bucket: int) -> int:
+    percent = 100 * completed // total_batches
+    filled = 20 * completed // total_batches
+    bar = "#" * filled + "." * (20 - filled)
+    line = (
+        f"Epoche {epoch}/{total_epochs} | {phase:11s} "
+        f"[{bar}] {percent:3d}% ({completed}/{total_batches} Batches) "
+        f"Loss {running_loss:.5f}"
+    )
+    if sys.stdout.isatty():
+        print(f"\r{line}", end="", flush=True)
+    else:
+        bucket = percent // 10
+        if bucket != last_bucket or completed == total_batches:
+            print(line, flush=True)
+            last_bucket = bucket
+    return last_bucket
+
+
 def train_one_epoch(
     model,
     loader,
@@ -217,6 +239,8 @@ def train_one_epoch(
     cfg: Dict,
     encoder_frozen: bool = False,
     freeze_encoder_bn_eval: bool = True,
+    epoch_index: int = 1,
+    total_epochs: int = 1,
 ):
     model.train()
     if encoder_frozen and freeze_encoder_bn_eval:
@@ -238,7 +262,9 @@ def train_one_epoch(
         "valid_pixels": 0,
     }
 
-    for x, y, _meta in loader:
+    last_bucket = -1
+    total_batches = len(loader)
+    for batch_index, (x, y, _meta) in enumerate(loader, start=1):
         x = x.to(device, non_blocking=device.startswith("cuda"))
         y = y.to(device, non_blocking=device.startswith("cuda")).long()
 
@@ -258,16 +284,23 @@ def train_one_epoch(
         counts = compute_mos_counts(logits.detach(), y.detach(), ignore_index=ignore_index)
         for k in agg:
             agg[k] += int(counts[k])
+        last_bucket = _print_batch_progress(
+            "Training", epoch_index, total_epochs, batch_index, total_batches,
+            loss_sum / sample_count, last_bucket,
+        )
 
     if sample_count == 0:
         raise RuntimeError("Train loader produced zero samples.")
+    if sys.stdout.isatty():
+        print()
 
     mean_loss = loss_sum / float(sample_count)
     metrics = metrics_from_counts(agg)
     return mean_loss, agg, metrics
 
 
-def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict):
+def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict,
+                       epoch_index: int = 1, total_epochs: int = 1):
     model.eval()
 
     ignore_index = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
@@ -283,8 +316,10 @@ def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict):
         "valid_pixels": 0,
     }
 
+    last_bucket = -1
+    total_batches = len(loader)
     with torch.no_grad():
-        for x, y, _meta in loader:
+        for batch_index, (x, y, _meta) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=device.startswith("cuda"))
             y = y.to(device, non_blocking=device.startswith("cuda")).long()
 
@@ -298,9 +333,15 @@ def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict):
             counts = compute_mos_counts(logits, y, ignore_index=ignore_index)
             for k in agg:
                 agg[k] += int(counts[k])
+            last_bucket = _print_batch_progress(
+                "Validierung", epoch_index, total_epochs, batch_index, total_batches,
+                loss_sum / sample_count, last_bucket,
+            )
 
     if sample_count == 0:
         raise RuntimeError("Validation loader produced zero samples.")
+    if sys.stdout.isatty():
+        print()
 
     mean_loss = loss_sum / float(sample_count)
     metrics = metrics_from_counts(agg)
@@ -798,6 +839,16 @@ def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_overr
     if load_decoder:
         decoder_state = _extract_decoder_state_from_checkpoint(ckpt)
 
+    cross_attention_state = None
+    if hasattr(model, "cross_attention"):
+        backbone = ckpt.get("backbone_state_dict", {}) if isinstance(ckpt, dict) else {}
+        cross_attention_state = ckpt.get("cross_attention_state_dict", backbone.get("cross_attention"))
+        if cross_attention_state is None:
+            raise KeyError("T-MAE checkpoint lacks cross_attention_state_dict")
+
+    load_kwargs = {}
+    if cross_attention_state is not None:
+        load_kwargs["cross_attention_state_dict"] = cross_attention_state
     model.load_pretrained_backbone(
         encoder_state_dict=encoder_state,
         decoder_state_dict=decoder_state,
@@ -806,6 +857,7 @@ def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_overr
         adapt_input_channels=adapt_input_channels,
         init_new_channels=init_new_channels,
         skip_decoder_head=skip_decoder_head,
+        **load_kwargs,
     )
     return True
 
@@ -914,6 +966,7 @@ def main():
     mlog = cfg["mos_log_params"]
 
     mdata.setdefault("input_mode", "range_residual")
+    mdata.setdefault("previous_offset", 3)
     mdata.setdefault("residual_offsets", [1])
     mdata.setdefault("mos_label_folder", "mos_labels")
     mdata.setdefault("ignore_index", -1)
@@ -928,6 +981,7 @@ def main():
 
     mmodel.setdefault("name", "unet_small")
     mmodel.setdefault("base_channels", 32)
+    mmodel.setdefault("cross_attention_heads", 8)
     mmodel.setdefault("dropout", 0.1)
     mmodel.setdefault("norm", "batch")
 
@@ -1003,6 +1057,12 @@ def main():
     if mtrain.get("pretrained_backbone_path") and mtrain.get("pretrained_encoder_path"):
         raise ValueError("Set either pretrained_backbone_path or pretrained_encoder_path, not both.")
 
+    if str(mmodel["name"]).lower() == "salsanext_temporal_mos":
+        if mdata["input_mode"] != "range_xyz_normal":
+            raise ValueError("Temporal MOS requires input_mode=range_xyz_normal")
+        if mtrain.get("pretrained_backbone_path") and not bool(mtrain.get("pretrained_load_encoder", True)):
+            raise ValueError("Temporal MOS checkpoint transfer needs pretrained_load_encoder=true")
+
     in_channels = compute_in_channels(str(mdata["input_mode"]), mdata["residual_offsets"])
     mmodel["in_channels"] = int(in_channels)
     mmodel["num_classes"] = 2
@@ -1023,7 +1083,8 @@ def main():
     train_sequences = select_sequences(all_sequences, mdata["train_sequences"], "train")
     val_sequences = select_sequences(all_sequences, mdata["val_sequences"], "val")
 
-    train_dataset = MOSFrameDataset(
+    dataset_class = TemporalMOSDataset if str(mmodel["name"]).lower() == "salsanext_temporal_mos" else MOSFrameDataset
+    train_dataset = dataset_class(
         sequences=train_sequences,
         cfg=cfg,
         split="train",
@@ -1033,7 +1094,7 @@ def main():
         require_moving=bool(mdata["require_moving_train"]),
         min_moving_pixels=int(mdata["min_moving_pixels"]),
     )
-    val_dataset = MOSFrameDataset(
+    val_dataset = dataset_class(
         sequences=val_sequences,
         cfg=cfg,
         split="val",
@@ -1260,6 +1321,8 @@ def main():
             cfg=cfg,
             encoder_frozen=encoder_frozen,
             freeze_encoder_bn_eval=freeze_encoder_bn_eval,
+            epoch_index=epoch,
+            total_epochs=epochs,
         )
         val_loss, val_counts, val_metrics = validate_one_epoch(
             model=model,
@@ -1267,6 +1330,8 @@ def main():
             criterion=criterion,
             device=device,
             cfg=cfg,
+            epoch_index=epoch,
+            total_epochs=epochs,
         )
 
         step_scheduler_if_needed(

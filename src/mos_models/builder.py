@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .mos_unet import MOSUNetSmall
 from .salsanext_mos import SalsaNextMOS
+from .salsanext_temporal_mos import SalsaNextTemporalMOS
 
 
 def build_mos_model(cfg):
@@ -28,6 +29,12 @@ def build_mos_model(cfg):
             in_channels=in_channels,
             num_classes=num_classes,
             dropout=dropout,
+        )
+
+    if name == "salsanext_temporal_mos":
+        return SalsaNextTemporalMOS(
+            in_channels=in_channels, num_classes=num_classes, dropout=dropout,
+            cross_attention_heads=int(params.get("cross_attention_heads", 8)),
         )
 
     raise ValueError(f"Unknown MOS model name: {name}")

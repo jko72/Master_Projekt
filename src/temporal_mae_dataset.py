@@ -14,6 +14,43 @@ from mae_dataset import select_sequences
 from utils_torch import spherical_projection
 
 
+def project_range_features(
+    points: np.ndarray, height: int, width: int, theta_range,
+    min_range: float, max_range: float | None, surface_normals_enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    projected, _, _, _ = spherical_projection(
+        points.astype(np.float32),
+        height=height,
+        width=width,
+        theta_range=theta_range,
+        max_range=max_range,
+    )
+    if projected.shape[:2] != (height, width) or projected.shape[-1] < 3:
+        raise ValueError(
+            f"Unexpected projection shape {projected.shape}; expected [H,W,>=3] "
+            f"with H,W={(height, width)}."
+        )
+
+    xyz_img = projected[..., :3].astype(np.float32)
+    xyz = torch.from_numpy(xyz_img).permute(2, 0, 1).contiguous()
+    range_channel = torch.linalg.vector_norm(xyz, dim=0)
+    xyz_is_zero = torch.all(xyz == 0.0, dim=0)
+    finite = torch.isfinite(xyz).all(dim=0) & torch.isfinite(range_channel)
+    valid = finite & (~xyz_is_zero) & (range_channel > min_range)
+
+    feature = torch.cat((xyz, range_channel.unsqueeze(0)), dim=0)
+    if surface_normals_enabled:
+        from helper.normal_helper import build_normal_xyz
+
+        normals_np = build_normal_xyz(xyz_img)
+        normals = torch.from_numpy(normals_np).permute(2, 0, 1).contiguous()
+        normals = torch.where(valid.unsqueeze(0), normals, torch.zeros_like(normals))
+        feature = torch.cat((feature, normals), dim=0)
+    feature = torch.where(valid.unsqueeze(0), feature, torch.zeros_like(feature))
+    return feature.float(), valid.unsqueeze(0).float()
+
+
+
 class TemporalRangeMAEDataset(Dataset):
     """Build short aligned range-view histories with current residual targets."""
 
@@ -41,7 +78,10 @@ class TemporalRangeMAEDataset(Dataset):
 
         self.height = int(model_cfg.get("grid_height", 64))
         self.width = int(model_cfg.get("grid_width", 512))
-        self.input_horizon = int(model_cfg.get("input_horizon", temporal_cfg.get("input_horizon", 5)))
+        self.input_horizon = int(model_cfg.get("input_horizon", 2))
+        self.previous_offset = int(temporal_cfg.get("previous_offset", 3))
+        offset_range = temporal_cfg.get("previous_offset_range", [self.previous_offset, self.previous_offset])
+        self.previous_offset_min, self.previous_offset_max = (int(v) for v in offset_range)
         self.fov_up = float(model_cfg.get("FOV_UP", 3.0))
         self.fov_down = float(model_cfg.get("FOV_DOWN", -25.0))
         self.theta_range = (
@@ -65,8 +105,8 @@ class TemporalRangeMAEDataset(Dataset):
                 f"got {grid_channels}, expected {self.num_channels}."
             )
 
-        self.residual_enabled = bool(residual_cfg.get("enabled", True))
-        self.residual_offsets = [int(v) for v in residual_cfg.get("offsets", [1])]
+        self.residual_enabled = bool(residual_cfg.get("enabled", False))
+        self.residual_offsets = [int(v) for v in residual_cfg.get("offsets", [])] if self.residual_enabled else []
         if self.residual_enabled and not self.residual_offsets:
             raise ValueError("pretrain_params.residual_targets.offsets must contain at least one offset.")
         if any(offset <= 0 for offset in self.residual_offsets):
@@ -80,22 +120,26 @@ class TemporalRangeMAEDataset(Dataset):
         self.mask_type = str(mask_cfg.get("type", "patch")).lower()
         self.patch_h = int(mask_cfg.get("patch_h", 4))
         self.patch_w = int(mask_cfg.get("patch_w", 16))
-        self.mask_ratio = float(mask_cfg.get("mask_ratio", 0.5))
+        self.mask_ratio = float(mask_cfg.get("mask_ratio", 0.75))
         self.mask_only_valid = bool(mask_cfg.get("mask_only_valid", True))
         self.mask_apply_to = str(mask_cfg.get("apply_to", "current")).lower()
         self.seed = int(train_cfg.get("seed", 42) if seed is None else seed)
         self.epoch = 0
 
-        if self.input_horizon <= 0:
-            raise ValueError(f"input_horizon must be positive, got {self.input_horizon}.")
+        if self.input_horizon != 2 or self.previous_offset <= 0:
+            raise ValueError("T-MAE requires input_horizon=2 and positive previous_offset")
+        if self.previous_offset_min <= 0 or self.previous_offset_max < self.previous_offset_min:
+            raise ValueError("previous_offset_range must contain positive [min,max]")
+        if not self.align_history_to_current:
+            raise ValueError("T-MAE requires ego-motion alignment of the previous scan")
         if self.mask_type != "patch":
             raise ValueError(f"Unsupported mask type '{self.mask_type}'. Currently supported: 'patch'.")
         if self.patch_h <= 0 or self.patch_w <= 0:
             raise ValueError("patch_h and patch_w must be positive.")
         if not 0.0 <= self.mask_ratio <= 1.0:
             raise ValueError(f"mask_ratio must be in [0,1], got {self.mask_ratio}.")
-        if self.mask_apply_to not in {"current", "all"}:
-            raise ValueError("pretrain_params.mask.apply_to must be 'current' or 'all'.")
+        if self.mask_apply_to != "current":
+            raise ValueError("T-MAE masks only the current scan")
 
         self.samples: list[dict] = []
         self._build_index()
@@ -122,7 +166,7 @@ class TemporalRangeMAEDataset(Dataset):
                 raise ValueError(f"Sequence {seq_id} has {len(paths)} paths but only {len(poses)} poses.")
 
             for frame_index, path_entry in enumerate(paths):
-                if frame_index < self.input_horizon - 1 or frame_index < max_offset:
+                if frame_index < max(self.previous_offset, self.previous_offset_max) or frame_index < max_offset:
                     continue
                 scan_path = self._extract_scan_path(path_entry)
                 if scan_path is None:
@@ -132,7 +176,7 @@ class TemporalRangeMAEDataset(Dataset):
                 missing = [path for path in residual_paths if not os.path.isfile(path)]
                 if missing and not self.allow_missing_residuals:
                     continue
-                history_indices = list(range(frame_index - self.input_horizon + 1, frame_index + 1))
+                history_indices = [frame_index - self.previous_offset, frame_index]
                 self.samples.append(
                     {
                         "seq": seq,
@@ -178,9 +222,16 @@ class TemporalRangeMAEDataset(Dataset):
         current_index = int(sample["frame_index"])
         current_pose = np.asarray(seq["poses"][current_index], dtype=np.float64)
 
+        history_indices = sample["history_indices"]
+        if self.split == "train" and self.previous_offset_max > self.previous_offset_min:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + 1_000_003 * self.epoch + 9_973 * int(index))
+            offset = int(torch.randint(self.previous_offset_min, self.previous_offset_max + 1, (1,), generator=generator))
+            history_indices = [current_index - offset, current_index]
+
         features = []
         current_valid_mask = None
-        for hist_index in sample["history_indices"]:
+        for hist_index in history_indices:
             scan_path = self._extract_scan_path(seq["paths"][hist_index])
             if scan_path is None:
                 raise FileNotFoundError(f"Missing scan path for sequence {sample['seq_id']} frame {hist_index}.")
@@ -228,7 +279,7 @@ class TemporalRangeMAEDataset(Dataset):
                 "seq_id": sample["seq_id"],
                 "frame_index": current_index,
                 "frame_stem": sample["frame_stem"],
-                "history_indices": list(sample["history_indices"]),
+                "history_indices": list(history_indices),
                 "channel_names": list(self.channel_names),
                 "residual_names": list(self.residual_names),
             },
@@ -244,36 +295,10 @@ class TemporalRangeMAEDataset(Dataset):
         return points.reshape(-1, 4)
 
     def _project_features(self, points: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        projected, _, _, _ = spherical_projection(
-            points.astype(np.float32),
-            height=self.height,
-            width=self.width,
-            theta_range=self.theta_range,
-            max_range=self.max_range,
+        return project_range_features(
+            points, self.height, self.width, self.theta_range,
+            self.min_range, self.max_range, self.surface_normals_enabled,
         )
-        if projected.shape[:2] != (self.height, self.width) or projected.shape[-1] < 3:
-            raise ValueError(
-                f"Unexpected projection shape {projected.shape}; expected [H,W,>=3] "
-                f"with H,W={(self.height, self.width)}."
-            )
-
-        xyz_img = projected[..., :3].astype(np.float32)
-        xyz = torch.from_numpy(xyz_img).permute(2, 0, 1).contiguous()
-        range_channel = torch.linalg.vector_norm(xyz, dim=0)
-        xyz_is_zero = torch.all(xyz == 0.0, dim=0)
-        finite = torch.isfinite(xyz).all(dim=0) & torch.isfinite(range_channel)
-        valid = finite & (~xyz_is_zero) & (range_channel > self.min_range)
-
-        feature = torch.cat((xyz, range_channel.unsqueeze(0)), dim=0)
-        if self.surface_normals_enabled:
-            from helper.normal_helper import build_normal_xyz
-
-            normals_np = build_normal_xyz(xyz_img)
-            normals = torch.from_numpy(normals_np).permute(2, 0, 1).contiguous()
-            normals = torch.where(valid.unsqueeze(0), normals, torch.zeros_like(normals))
-            feature = torch.cat((feature, normals), dim=0)
-        feature = torch.where(valid.unsqueeze(0), feature, torch.zeros_like(feature))
-        return feature.float(), valid.unsqueeze(0).float()
 
     def _load_residual_targets(self, residual_paths: Sequence[str]) -> torch.Tensor:
         residuals = []

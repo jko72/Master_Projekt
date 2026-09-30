@@ -24,7 +24,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from helper.dataloader_helper import make_sequences
-from mos_dataset import MOSFrameDataset
+from mos_dataset import MOSFrameDataset, TemporalMOSDataset
 from mos_models import build_mos_model
 
 
@@ -395,7 +395,8 @@ def main():
     selected_sequences = select_sequences(all_sequences, requested_sequences, args.split)
     selected_seq_ids = [normalize_seq_id(s.get("seq_id", "")) for s in selected_sequences]
 
-    eval_dataset = MOSFrameDataset(
+    dataset_class = TemporalMOSDataset if str(mmodel["name"]).lower() == "salsanext_temporal_mos" else MOSFrameDataset
+    eval_dataset = dataset_class(
         sequences=selected_sequences,
         cfg=cfg,
         split=args.split,
