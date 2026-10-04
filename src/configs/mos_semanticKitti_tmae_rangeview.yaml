@@ -11,7 +11,7 @@ model_params:
   max_range: 80.0
 mos_data_params:
   input_mode: "range_xyz"
-  residual_offsets: []
+  residual_offsets: [1]
   previous_offset: 3
   mos_label_folder: "mos_labels"
   ignore_index: -1

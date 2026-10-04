@@ -140,6 +140,22 @@ def compute_counts_from_pred_target(pred: torch.Tensor, target: torch.Tensor, ig
         }
 
 
+def apply_history_mode(x: torch.Tensor, mode: str) -> torch.Tensor:
+    """Change only the previous scan of a temporal [B,2,C,H,W] batch."""
+    if mode == "normal":
+        return x
+    if x.ndim != 5 or x.shape[1] != 2:
+        raise ValueError(f"history_mode={mode} requires a temporal [B,2,C,H,W] batch, got {tuple(x.shape)}")
+    changed = x.clone()
+    if mode == "zero":
+        changed[:, 0].zero_()
+    elif mode == "copy_current":
+        changed[:, 0].copy_(x[:, 1])
+    else:
+        raise ValueError(f"Unknown history_mode: {mode}")
+    return changed
+
+
 def metrics_from_counts(counts: Dict[str, int], eps: float = 1e-8) -> Dict[str, float]:
     tp_m = float(counts["tp_moving"])
     fp_m = float(counts["fp_moving"])
@@ -326,6 +342,10 @@ def main():
     parser.add_argument("--max_visuals", type=int, default=50)
     parser.add_argument("--visual_stride", type=int, default=20)
     parser.add_argument("--save_per_frame_csv", type=str2bool, default=False)
+    parser.add_argument(
+        "--history_mode", choices=["normal", "zero", "copy_current"], default="normal",
+        help="Temporal MOS: keep the previous scan, remove it, or replace it with the current scan.",
+    )
     args = parser.parse_args()
 
     checkpoint_path = os.path.abspath(args.checkpoint)
@@ -338,13 +358,6 @@ def main():
         run_dir = os.path.dirname(ckpt_parent)
     else:
         run_dir = ckpt_parent
-
-    output_dir = (
-        os.path.abspath(args.output_dir)
-        if args.output_dir is not None
-        else os.path.join(run_dir, "eval", f"{ckpt_name}_{args.split}")
-    )
-    os.makedirs(output_dir, exist_ok=True)
 
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     if "cfg" not in ckpt:
@@ -363,6 +376,19 @@ def main():
     mdata = cfg["mos_data_params"]
     mmodel = cfg["mos_model_params"]
     mtrain = cfg["mos_train_params"]
+    is_temporal = str(mmodel.get("name", "")).lower() == "salsanext_temporal_mos"
+    if args.history_mode != "normal" and not is_temporal:
+        raise ValueError("--history_mode zero/copy_current requires a salsanext_temporal_mos checkpoint")
+
+    output_dir = (
+        os.path.abspath(args.output_dir)
+        if args.output_dir is not None
+        else os.path.join(
+            run_dir, "eval",
+            f"{ckpt_name}_{args.split}_history_{args.history_mode}" if is_temporal else f"{ckpt_name}_{args.split}",
+        )
+    )
+    os.makedirs(output_dir, exist_ok=True)
 
     dataset_path = cfg.get("dataset_path", None)
     if not dataset_path:
@@ -395,7 +421,7 @@ def main():
     selected_sequences = select_sequences(all_sequences, requested_sequences, args.split)
     selected_seq_ids = [normalize_seq_id(s.get("seq_id", "")) for s in selected_sequences]
 
-    dataset_class = TemporalMOSDataset if str(mmodel["name"]).lower() == "salsanext_temporal_mos" else MOSFrameDataset
+    dataset_class = TemporalMOSDataset if is_temporal else MOSFrameDataset
     eval_dataset = dataset_class(
         sequences=selected_sequences,
         cfg=cfg,
@@ -461,6 +487,7 @@ def main():
     print(f"selected_sequences : {selected_seq_ids}")
     print(f"input_mode         : {input_mode}")
     print(f"model_name         : {mmodel.get('name', 'unknown')}")
+    print(f"history_mode       : {args.history_mode}")
     print(f"num_frames         : {len(eval_dataset)}")
     print(f"output_dir         : {output_dir}")
 
@@ -484,6 +511,7 @@ def main():
         for x, y, meta in eval_loader:
             x = x.to(device, non_blocking=pin_memory)
             y = y.to(device, non_blocking=pin_memory).long()
+            x = apply_history_mode(x, args.history_mode)
 
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -524,6 +552,7 @@ def main():
                             "seq_id": str(get_meta_value(meta, "seq_id", i)),
                             "frame_stem": str(get_meta_value(meta, "frame_stem", i)),
                             "frame_index": int(get_meta_value(meta, "frame_index", i)),
+                            "history_mode": args.history_mode,
                             "moving_pixels": int(get_meta_value(meta, "moving_pixels", i)),
                             "static_pixels": int(get_meta_value(meta, "static_pixels", i)),
                             "ignore_pixels": int(get_meta_value(meta, "ignore_pixels", i)),
@@ -576,6 +605,7 @@ def main():
         "checkpoint_path": checkpoint_path,
         "checkpoint_epoch": int(ckpt.get("epoch", -1)),
         "split": str(args.split),
+        "history_mode": args.history_mode,
         "model_name": str(mmodel.get("name", "unknown")),
         "input_mode": str(input_mode),
         "residual_offsets": str(list(residual_offsets)),
@@ -609,6 +639,7 @@ def main():
             "seq_id",
             "frame_stem",
             "frame_index",
+            "history_mode",
             "moving_pixels",
             "static_pixels",
             "ignore_pixels",
@@ -636,6 +667,7 @@ def main():
             "checkpoint_path": checkpoint_path,
             "checkpoint_epoch": int(ckpt.get("epoch", -1)),
             "split": str(args.split),
+            "history_mode": args.history_mode,
             "device": device,
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),

@@ -51,10 +51,10 @@ data_params:
   test_sequences: ["07"]
 
 train_params:
-  run_name: "tmae_rangeview_semanticKitti_Baseline"
+  run_name: "tmae_rangeview_semanticKitti_Basis"
   batch_size: 4
   num_workers: 4
-  num_total_epochs: 50
+  num_total_epochs: 25
   learning_rate: 5.0e-4
   learning_rate_min: 5.0e-6
   num_warmup_epochs: 2
@@ -67,5 +67,5 @@ train_params:
   with_save: true
   logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs"
   use_tensorboard: true
-  save_visualizations: true
+  save_visualizations: false
   visualization_interval_epochs: 5
