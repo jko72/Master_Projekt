@@ -1,0 +1,71 @@
+# Single-frame MAE control for the 2D T-MAE experiment.
+# Both SiamWCA branches receive the same masked current scan, so neither branch sees hidden targets.
+
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+
+model_params:
+  name: "salsanext_temporal_mae"
+  grid_height: 64
+  grid_width: 512
+  grid_channels: 5  # x,y,z,range,intensity
+  output_channels: 4  # reconstruct x,y,z,range
+  input_horizon: 2
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.1
+  max_range: 80.0
+  dropout_prob: 0.2
+  cross_attention_heads: 8
+
+pretrain_params:
+  task: "singleframe_mae_control"
+  temporal:
+    align_history_to_current: true
+    previous_offset: 3
+    previous_offset_range: [2, 4]  # preserves the same eligible frames as T-MAE
+    reference_mode: "masked_current"
+  mask:
+    type: "patch"
+    patch_h: 16
+    patch_w: 16
+    mask_ratio: 0.75
+    mask_only_valid: true
+    apply_to: "current"
+  loss:
+    name: "smooth_l1"
+    xyz_weight: 0.5
+    range_weight: 1.0
+    loss_on_mask_only: true
+    min_range: 0.1
+  residual_targets:
+    enabled: false
+    offsets: []
+  auxiliary_tasks:
+    residual_reconstruction:
+      enabled: false
+
+data_params:
+  split_type: "predefined"
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+
+train_params:
+  run_name: "singleframe_mae_control_semanticKitti"
+  batch_size: 4
+  num_workers: 4
+  num_total_epochs: 25
+  learning_rate: 5.0e-4
+  learning_rate_min: 5.0e-6
+  num_warmup_epochs: 2
+  weight_decay: 1.0e-4
+  clip_grad_norm: 5.0
+  optimizer: "adamw"
+  scheduler: "warmup_cosine"
+  seed: 42
+  deterministic: false
+  with_save: true
+  logs_save_dir: "/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs"
+  use_tensorboard: true
+  save_visualizations: false
+  visualization_interval_epochs: 5

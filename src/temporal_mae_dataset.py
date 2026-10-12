@@ -89,6 +89,7 @@ class TemporalRangeMAEDataset(Dataset):
         self.max_range = None if max_range is None else float(max_range)
 
         self.align_history_to_current = bool(temporal_cfg.get("align_history_to_current", True))
+        self.reference_mode = str(temporal_cfg.get("reference_mode", "history")).lower()
         self.channel_names = ["x", "y", "z", "range", "intensity"]
         self.target_names = ["x", "y", "z", "range"]
         self.num_channels = len(self.channel_names)
@@ -126,6 +127,8 @@ class TemporalRangeMAEDataset(Dataset):
             raise ValueError("previous_offset_range must contain positive [min,max]")
         if not self.align_history_to_current:
             raise ValueError("T-MAE requires ego-motion alignment of the previous scan")
+        if self.reference_mode not in {"history", "masked_current"}:
+            raise ValueError("pretrain_params.temporal.reference_mode must be 'history' or 'masked_current'")
         if self.mask_type != "patch":
             raise ValueError(f"Unsupported mask type '{self.mask_type}'. Currently supported: 'patch'.")
         if self.patch_h <= 0 or self.patch_w <= 0:
@@ -147,6 +150,7 @@ class TemporalRangeMAEDataset(Dataset):
         print(f"channels={self.channel_names}")
         print(f"targets={target_names}")
         print(f"align_history_to_current={self.align_history_to_current}")
+        print(f"reference_mode={self.reference_mode}")
 
     def _build_index(self) -> None:
         max_offset = max(self.residual_offsets) if self.residual_offsets else 0
@@ -222,6 +226,8 @@ class TemporalRangeMAEDataset(Dataset):
             generator.manual_seed(self.seed + 1_000_003 * self.epoch + 9_973 * int(index))
             offset = int(torch.randint(self.previous_offset_min, self.previous_offset_max + 1, (1,), generator=generator))
             history_indices = [current_index - offset, current_index]
+        if self.reference_mode == "masked_current":
+            history_indices = [current_index, current_index]
 
         features = []
         current_valid_mask = None
@@ -255,6 +261,9 @@ class TemporalRangeMAEDataset(Dataset):
                 mask_bool.expand_as(masked_hist_features[-1]),
                 0.0,
             )
+            if self.reference_mode == "masked_current":
+                # Match the visible current pixels exactly; an unmasked copy would leak the target.
+                masked_hist_features[0] = masked_hist_features[-1].clone()
         else:
             masked_hist_features = masked_hist_features.masked_fill(
                 mask_bool.unsqueeze(0).expand_as(masked_hist_features),
