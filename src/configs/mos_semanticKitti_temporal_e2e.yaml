@@ -1,0 +1,50 @@
+# Supervised range-view MOS adaptation inspired by T-MAE, trained from scratch.
+# Frame offsets become approximate seconds using SemanticKITTI's nominal 10 Hz.
+dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
+model_params:
+  grid_height: 64
+  grid_width: 512
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.1
+  max_range: 80.0
+mos_data_params:
+  input_mode: range_xyz
+  previous_offsets: [5]
+  scan_rate_hz: 10.0
+  mos_label_folder: mos_labels
+  ignore_index: -1
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+mos_model_params:
+  name: salsanext_temporal_e2e
+  in_channels: 4
+  num_classes: 2
+  dropout: 0.1
+  attention_heads: 8
+  radius: 1
+  compare_channels: 64
+  fusion: bottleneck_only
+mos_train_params:
+  seed: 42
+  deterministic: false
+  epochs: 50
+  batch_size: 4
+  num_workers: 4
+  optimizer: adamw
+  learning_rate: 0.0005
+  learning_rate_min: 0.000005
+  weight_decay: 0.0001
+  scheduler: cosine
+  clip_grad_norm: 5.0
+  static_class_weight: 1.0
+  moving_class_weight: 10.0
+  gradient_accumulation: 1
+  amp: true
+  amp_dtype: bfloat16  # RTX 4070 Ti supports BF16; wider exponent range than float16
+  pretrained_path: null
+mos_log_params:
+  log_root: /home/devuser/workspace/LidarGaussianVideoView/mos_logs
+  run_name: MOS_temporal_e2e_scratch_drop_off5
+  use_tensorboard: true

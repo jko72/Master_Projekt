@@ -17,9 +17,17 @@ from utils_torch import spherical_projection
 def project_range_features(
     points: np.ndarray, height: int, width: int, theta_range,
     min_range: float, max_range: float | None, include_intensity: bool = False,
+    explicit_occupancy: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # The extra constant channel survives the same collision resolution as XYZ.
+    # Existing MAE callers keep their original projection and validity behavior.
+    projection_points = points.astype(np.float32)
+    if explicit_occupancy:
+        projection_points = np.concatenate(
+            (projection_points, np.ones((len(points), 1), dtype=np.float32)), axis=1
+        )
     projected, _, _, _ = spherical_projection(
-        points.astype(np.float32),
+        projection_points,
         height=height,
         width=width,
         theta_range=theta_range,
@@ -37,7 +45,8 @@ def project_range_features(
     range_channel = torch.linalg.vector_norm(xyz, dim=0)
     xyz_is_zero = torch.all(xyz == 0.0, dim=0)
     finite = torch.isfinite(xyz).all(dim=0) & torch.isfinite(range_channel)
-    valid = finite & (~xyz_is_zero) & (range_channel > min_range)
+    occupied = torch.from_numpy(projected[..., -1].copy()) > 0.5 if explicit_occupancy else ~xyz_is_zero
+    valid = finite & occupied & (range_channel > min_range)
 
     feature = torch.cat((xyz, range_channel.unsqueeze(0)), dim=0)
     if include_intensity:
