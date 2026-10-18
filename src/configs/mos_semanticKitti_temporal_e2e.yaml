@@ -10,7 +10,7 @@ model_params:
   max_range: 80.0
 mos_data_params:
   input_mode: range_xyz
-  previous_offsets: [5]
+  previous_offsets: [5, 2]
   scan_rate_hz: 10.0
   mos_label_folder: mos_labels
   ignore_index: -1
@@ -46,5 +46,5 @@ mos_train_params:
   pretrained_path: null
 mos_log_params:
   log_root: /home/devuser/workspace/LidarGaussianVideoView/mos_logs
-  run_name: MOS_temporal_e2e_scratch_drop_off5
+  run_name: MOS_temporal_e2e_scratch_off5_2
   use_tensorboard: true
