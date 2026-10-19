@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from utils_torch import spherical_projection
+from helper.mos_input import channel_count, normalization, normalize_channels
 
 
 class MOSFrameDataset(Dataset):
@@ -20,10 +21,12 @@ class MOSFrameDataset(Dataset):
         "range_residual",
         "range_xyz",
         "range_xyz_residual",
+        "range_xyz_intensity",
+        "range_xyz_intensity_residual",
         "range_xyz_normal",
         "range_xyz_normal_residual",
     }
-    RESIDUAL_INPUT_MODES = {"residual", "range_residual", "range_xyz_residual", "range_xyz_normal_residual"}
+    RESIDUAL_INPUT_MODES = {"residual", "range_residual", "range_xyz_residual", "range_xyz_intensity_residual", "range_xyz_normal_residual"}
     ALLOWED_LABEL_VALUES = {-1, 0, 1}
 
     def __init__(
@@ -49,6 +52,7 @@ class MOSFrameDataset(Dataset):
         self.require_moving = bool(require_moving)
         self.min_moving_pixels = int(min_moving_pixels)
         self.allow_missing_labels = bool(allow_missing_labels)
+        self.normalization = normalization(cfg, self.input_mode)
 
         if self.input_mode not in self.ALLOWED_INPUT_MODES:
             raise ValueError(
@@ -91,6 +95,9 @@ class MOSFrameDataset(Dataset):
         )
         if self.input_mode in {"range_xyz", "range_xyz_residual"}:
             print("[MOSFrameDataset] channel convention for range_xyz* modes: [x,y,z,range,(residuals...)]")
+        if "intensity" in self.input_mode:
+            print("[MOSFrameDataset] channels: [x,y,z,range,intensity,(residuals...)] "
+                  f"normalization={self.normalization}")
         if self.input_mode in {"range_xyz_normal", "range_xyz_normal_residual"}:
             print(
                 "[MOSFrameDataset] channel convention for range_xyz_normal* modes: "
@@ -113,6 +120,10 @@ class MOSFrameDataset(Dataset):
             range_img, x_img, y_img, z_img = self._load_projected_xyzd(sample["scan_path"])
             x_channels.extend([x_img, y_img, z_img, range_img])
             channel_names.extend(["x", "y", "z", "range"])
+        elif self.input_mode in {"range_xyz_intensity", "range_xyz_intensity_residual"}:
+            range_img, x_img, y_img, z_img, intensity = self._load_projected_xyzdi(sample["scan_path"])
+            x_channels.extend([x_img, y_img, z_img, range_img, intensity])
+            channel_names.extend(["x", "y", "z", "range", "intensity"])
         elif self.input_mode in {"range_xyz_normal", "range_xyz_normal_residual"}:
             range_img, x_img, y_img, z_img, nx_img, ny_img, nz_img = self._load_projected_xyzd_normals(
                 sample["scan_path"]
@@ -131,6 +142,9 @@ class MOSFrameDataset(Dataset):
                 x_channels.append(self._load_residual_image(res_path))
                 channel_names.append(f"residual_{int(off)}")
 
+        if self.normalization["mode"] != "none":
+            valid = (x_channels[3] > 0) & np.isfinite(x_channels[4])
+            normalize_channels(x_channels, channel_names, valid, self.normalization)
         x = torch.from_numpy(np.stack(x_channels, axis=0).astype(np.float32))
 
         mos_label_path = os.path.join(sample["seq_dir"], self.mos_label_folder, f"{sample['frame_stem']}.npy")
@@ -147,6 +161,7 @@ class MOSFrameDataset(Dataset):
             "mos_label_path": mos_label_path,
             "input_mode": self.input_mode,
             "channel_names": channel_names,
+            "normalization": self.normalization["mode"],
             "moving_pixels": int(pix_stats["moving_pixels"]),
             "static_pixels": int(pix_stats["static_pixels"]),
             "ignore_pixels": int(pix_stats["ignore_pixels"]),
@@ -204,24 +219,7 @@ class MOSFrameDataset(Dataset):
 
     @property
     def channel_count(self) -> int:
-        if self.input_mode == "range":
-            return 1
-        if self.input_mode == "residual":
-            return len(self.residual_offsets)
-        if self.input_mode == "range_residual":
-            return 1 + len(self.residual_offsets)
-        if self.input_mode == "range_xyz":
-            return 4
-        if self.input_mode == "range_xyz_residual":
-            return 4 + len(self.residual_offsets)
-        if self.input_mode == "range_xyz_normal":
-            return 7
-        if self.input_mode == "range_xyz_normal_residual":
-            return 7 + len(self.residual_offsets)
-        raise ValueError(
-            f"Unsupported input_mode='{self.input_mode}'. "
-            f"Use one of {sorted(self.ALLOWED_INPUT_MODES)}."
-        )
+        return channel_count(self.input_mode, self.residual_offsets)
 
     @staticmethod
     def _parse_residual_offsets(residual_offsets) -> List[int]:
@@ -356,6 +354,22 @@ class MOSFrameDataset(Dataset):
         return range_img.astype(np.float32), x_img.astype(np.float32), y_img.astype(np.float32), z_img.astype(
             np.float32
         )
+
+    def _load_projected_xyzdi(self, scan_path: str):
+        if not os.path.isfile(scan_path):
+            raise FileNotFoundError(f"Scan file not found: {scan_path}")
+        points = np.fromfile(scan_path, dtype=np.float32)
+        if points.size % 4:
+            raise ValueError(f"Scan file has invalid float count: {scan_path}")
+        projected, _, _, _ = spherical_projection(points.reshape(-1, 4), height=self.H,
+                                                   width=self.W, theta_range=self.theta_range)
+        if projected.shape != (self.H, self.W, 4):
+            raise ValueError(f"Unexpected XYZI projection shape {projected.shape} for {scan_path}")
+        xyz = projected[..., :3]
+        distance = np.sqrt(np.sum(xyz * xyz, axis=-1))
+        valid = np.isfinite(projected).all(axis=-1) & np.isfinite(distance) & (distance > 0)
+        channels = [distance, xyz[..., 0], xyz[..., 1], xyz[..., 2], projected[..., 3]]
+        return tuple(np.where(valid, c, 0).astype(np.float32) for c in channels)
 
     def _load_projected_xyzd_normals(
         self,
@@ -500,8 +514,8 @@ class TemporalMOSDataset(MOSFrameDataset):
     def __init__(self, sequences, cfg, split="train", input_mode="range_xyz",
                  residual_offsets=(1,), mos_label_folder="mos_labels", device="cpu",
                  require_moving=False, min_moving_pixels=1, allow_missing_labels=False):
-        if input_mode != "range_xyz":
-            raise ValueError("Temporal T-MAE MOS requires input_mode=range_xyz")
+        if input_mode not in {"range_xyz", "range_xyz_intensity"}:
+            raise ValueError("Temporal T-MAE MOS requires range_xyz or range_xyz_intensity")
         self.sequence_map = {self._normalize_seq_id(s["seq_id"]): s for s in sequences}
         self.previous_offset = int(cfg.get("mos_data_params", {}).get("previous_offset", 3))
         if self.previous_offset <= 0:
@@ -529,9 +543,15 @@ class TemporalMOSDataset(MOSFrameDataset):
         previous_pose = np.asarray(seq["poses"][previous_idx], dtype=np.float64)
         previous_points = transform_points(previous_points, np.linalg.inv(current_pose) @ previous_pose)
         past, _ = project_range_features(previous_points, self.H, self.W, self.theta_range,
-                                         self.min_range, self.max_range, include_intensity=False)
+                                         self.min_range, self.max_range, include_intensity="intensity" in self.input_mode)
         current, _ = project_range_features(current_points, self.H, self.W, self.theta_range,
-                                            self.min_range, self.max_range, include_intensity=False)
+                                            self.min_range, self.max_range, include_intensity="intensity" in self.input_mode)
+        if self.normalization["mode"] != "none":
+            from helper.mos_input import normalize_feature_tensor
+            past_valid = (past[3] > 0) & torch.isfinite(past).all(dim=0)
+            current_valid = (current[3] > 0) & torch.isfinite(current).all(dim=0)
+            past = normalize_feature_tensor(past, past_valid, self.normalization)
+            current = normalize_feature_tensor(current, current_valid, self.normalization)
         x = torch.stack((past, current), dim=0)
         y_np = self._load_mos_label(sample["mos_label_path"])
         y = torch.from_numpy(y_np.astype(np.int64))
@@ -542,7 +562,8 @@ class TemporalMOSDataset(MOSFrameDataset):
             "scan_path": sample["scan_path"],
             "previous_scan_path": previous_path,
             "previous_offset": self.previous_offset,
-            "channel_names": ["x", "y", "z", "range"],
+            "channel_names": ["x", "y", "z", "range"] + (["intensity"] if "intensity" in self.input_mode else []),
+            "normalization": self.normalization["mode"],
             "moving_pixels": int((y_np == 1).sum()),
             "static_pixels": int((y_np == 0).sum()),
             "ignore_pixels": int((y_np == -1).sum()),

@@ -14,6 +14,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from mos_models import build_mos_model
+from helper.mos_input import channel_count
 
 
 def _resolve_cfg_path(cfg_path: str) -> str:
@@ -42,21 +43,7 @@ def _count_params(model: torch.nn.Module):
 
 
 def _compute_in_channels(input_mode: str, residual_offsets) -> int:
-    residual_offsets = [int(v) for v in residual_offsets]
-    if input_mode == "range":
-        return 1
-    if input_mode == "residual":
-        return len(residual_offsets)
-    if input_mode == "range_residual":
-        return 1 + len(residual_offsets)
-    if input_mode == "range_xyz":
-        return 4
-    if input_mode == "range_xyz_residual":
-        return 4 + len(residual_offsets)
-    raise ValueError(
-        f"Unsupported input_mode='{input_mode}'. "
-        "Use one of ['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual']."
-    )
+    return channel_count(input_mode, [int(v) for v in residual_offsets])
 
 
 def main():

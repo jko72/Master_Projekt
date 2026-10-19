@@ -25,6 +25,7 @@ if SRC_DIR not in sys.path:
 from helper.dataloader_helper import make_sequences
 from mos_dataset import MOSFrameDataset, TemporalMOSDataset
 from mos_models import build_mos_model
+from helper.mos_input import channel_count, normalization
 
 
 def parse_residual_offsets(value) -> List[int]:
@@ -85,25 +86,7 @@ def set_seed(seed: int, deterministic: bool):
 
 
 def compute_in_channels(input_mode: str, residual_offsets: Sequence[int]) -> int:
-    if input_mode == "range":
-        return 1
-    if input_mode == "residual":
-        return len(residual_offsets)
-    if input_mode == "range_residual":
-        return 1 + len(residual_offsets)
-    if input_mode == "range_xyz":
-        return 4
-    if input_mode == "range_xyz_residual":
-        return 4 + len(residual_offsets)
-    if input_mode == "range_xyz_normal":
-        return 7
-    if input_mode == "range_xyz_normal_residual":
-        return 7 + len(residual_offsets)
-    raise ValueError(
-        "Invalid input_mode='{0}'. Supported: "
-        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual', "
-        "'range_xyz_normal', 'range_xyz_normal_residual']".format(input_mode)
-    )
+    return channel_count(input_mode, residual_offsets)
 
 
 def select_sequences(all_sequences: List[Dict], requested_ids: Sequence[str], split_name: str) -> List[Dict]:
@@ -803,6 +786,41 @@ def _extract_decoder_state_from_checkpoint(ckpt) -> Dict[str, torch.Tensor]:
     raise KeyError("Could not find decoder weights in checkpoint.")
 
 
+def _check_pretrain_channels(ckpt, target_cfg, adapt):
+    """Reject ambiguous transfers before an encoder tensor is changed or loaded."""
+    state = _extract_encoder_state_from_checkpoint(ckpt)
+    key = next((k for k in state if k.endswith("down_cntx.conv1.weight")), None)
+    if key is None:
+        raise ValueError("Pretraining checkpoint lacks down_cntx.conv1.weight; cannot verify input channels")
+    source_channels = int(state[key].shape[1])
+    target_channels = int(target_cfg["mos_model_params"]["in_channels"])
+    source_cfg = ckpt.get("cfg", ckpt.get("config", {})) if isinstance(ckpt, dict) else {}
+    source_names = ckpt.get("channel_names") if isinstance(ckpt, dict) else None
+    if source_names is None and isinstance(source_cfg, dict):
+        source_names = source_cfg.get("channel_names")
+        if source_names is None and source_channels == 5:
+            # Only the repository's temporal MAE dataset has exactly five XYZR(I) inputs.
+            source_model = source_cfg.get("model_params", {})
+            source_pretrain = source_cfg.get("pretrain_params", {})
+            if (int(source_model.get("grid_channels", -1)) == 5
+                    and source_model.get("name") == "salsanext_temporal_mae"
+                    and source_pretrain.get("task") == "tmae_rangeview"):
+                source_names = ["x", "y", "z", "range", "intensity"]
+    target_mode = target_cfg["mos_data_params"]["input_mode"]
+    target_names = ["x", "y", "z", "range", "intensity"] if "intensity" in target_mode else None
+    if source_channels != target_channels and not adapt:
+        raise ValueError(f"Pretraining encoder has {source_channels} channels, MOS expects {target_channels}. "
+                         "Set pretrained_encoder_adapt_input_channels: true explicitly to adapt it.")
+    if target_names and source_channels == 5 and list(source_names or []) != target_names:
+        raise ValueError("Five-channel pretraining order is unverified or differs from "
+                         "[x,y,z,range,intensity]; refusing transfer.")
+    if target_names and source_channels == 4 and adapt:
+        if target_mode != "range_xyz_intensity":
+            raise ValueError("Four-to-five pretraining adaptation requires range_xyz_intensity without residuals")
+        print("[PRETRAIN MOS] Explicit four-to-five transfer: first four filters retained; "
+              "intensity filter initialized by pretrained_encoder_init_new_channels")
+
+
 def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_override: str | None = None):
     mtrain = (cfg or {}).get("mos_train_params", {}) or {}
     ckpt_path = path_override if path_override is not None else mtrain.get("pretrained_backbone_path", None)
@@ -822,7 +840,7 @@ def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_overr
     load_decoder = bool(mtrain.get("pretrained_load_decoder", False))
     skip_decoder_head = bool(mtrain.get("pretrained_skip_decoder_head", True))
     strict_encoder = bool(mtrain.get("pretrained_encoder_strict", True))
-    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", True))
+    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", False))
     init_new_channels = str(mtrain.get("pretrained_encoder_init_new_channels", "zero"))
 
     print(f"[PRETRAIN MOS] Loading pretrained backbone from: {ckpt_path}")
@@ -831,6 +849,8 @@ def maybe_load_pretrained_backbone(model: torch.nn.Module, cfg: Dict, path_overr
         f"load_decoder={load_decoder} skip_decoder_head={skip_decoder_head}"
     )
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    if load_encoder:
+        _check_pretrain_channels(ckpt, cfg, adapt_input_channels)
 
     encoder_state = None
     decoder_state = None
@@ -874,11 +894,12 @@ def maybe_load_pretrained_encoder(model: torch.nn.Module, cfg: Dict, path_overri
         raise FileNotFoundError(f"Pretrained encoder checkpoint not found: {ckpt_path}")
 
     strict = bool(mtrain.get("pretrained_encoder_strict", True))
-    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", True))
+    adapt_input_channels = bool(mtrain.get("pretrained_encoder_adapt_input_channels", False))
     init_new_channels = str(mtrain.get("pretrained_encoder_init_new_channels", "mean"))
 
     print(f"[PRETRAIN MOS] Loading pretrained encoder from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    _check_pretrain_channels(ckpt, cfg, adapt_input_channels)
     encoder_state = _extract_encoder_state_from_checkpoint(ckpt)
 
     if hasattr(model, "load_pretrained_encoder"):
@@ -1015,7 +1036,7 @@ def main():
     mtrain.setdefault("pretrained_load_decoder", False)
     mtrain.setdefault("pretrained_skip_decoder_head", True)
     mtrain.setdefault("pretrained_encoder_strict", True)
-    mtrain.setdefault("pretrained_encoder_adapt_input_channels", True)
+    mtrain.setdefault("pretrained_encoder_adapt_input_channels", False)
     mtrain.setdefault("pretrained_encoder_init_new_channels", "mean")
 
     mlog.setdefault("log_root", "/home/devuser/workspace/LidarGaussianVideoView/mos_logs")
@@ -1058,12 +1079,17 @@ def main():
         raise ValueError("Set either pretrained_backbone_path or pretrained_encoder_path, not both.")
 
     if str(mmodel["name"]).lower() == "salsanext_temporal_mos":
-        if mdata["input_mode"] != "range_xyz":
-            raise ValueError("Temporal MOS requires input_mode=range_xyz")
+        if mdata["input_mode"] not in {"range_xyz", "range_xyz_intensity"}:
+            raise ValueError("Temporal MOS requires range_xyz or range_xyz_intensity")
         if mtrain.get("pretrained_backbone_path") and not bool(mtrain.get("pretrained_load_encoder", True)):
             raise ValueError("Temporal MOS checkpoint transfer needs pretrained_load_encoder=true")
 
     in_channels = compute_in_channels(str(mdata["input_mode"]), mdata["residual_offsets"])
+    normalization(cfg, str(mdata["input_mode"]))
+    configured_channels = mmodel.get("in_channels")
+    if configured_channels is not None and int(configured_channels) != in_channels:
+        raise ValueError(f"mos_model_params.in_channels={configured_channels} conflicts with "
+                         f"input_mode={mdata['input_mode']} ({in_channels} channels)")
     mmodel["in_channels"] = int(in_channels)
     mmodel["num_classes"] = 2
 
@@ -1459,6 +1485,7 @@ def main():
                 "val_counts": val_counts,
                 "model_name": mmodel.get("name"),
                 "input_mode": mdata.get("input_mode"),
+                "input_normalization": normalization(cfg, mdata["input_mode"]),
                 "residual_offsets": mdata.get("residual_offsets"),
             }
             if is_best_moving_iou:

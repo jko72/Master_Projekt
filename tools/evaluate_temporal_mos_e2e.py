@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from helper.mos_eval_utils import add_counts, compute_counts_from_pred_target, empty_counts, metrics_from_counts
 from mos_models import build_mos_model
+from helper.mos_input import normalization
 from train_temporal_mos_e2e import check_splits, make_criterion, make_loader
 
 
@@ -93,7 +94,8 @@ def main():
     loader = make_loader(cfg, args.split, args.batch_size, args.num_workers, device)
     result = evaluate(model, loader, make_criterion(cfg, device), device, args.history_mode, args.max_batches)
     result = {"split": args.split, "history_mode": args.history_mode,
-              "checkpoint": str(checkpoint.resolve()), "checkpoint_epoch": payload["epoch"], **result}
+              "checkpoint": str(checkpoint.resolve()), "checkpoint_epoch": payload["epoch"],
+              "normalization": normalization(cfg, cfg["mos_data_params"]["input_mode"])["mode"], **result}
     output = checkpoint.parent.parent / "eval"
     output.mkdir(exist_ok=True)
     csv_path = output / f"{args.split}_{args.history_mode}.csv"

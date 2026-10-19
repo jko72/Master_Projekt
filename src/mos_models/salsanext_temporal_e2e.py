@@ -14,16 +14,17 @@ class SalsaNextTemporalE2E(nn.Module):
     def __init__(self, in_channels=4, num_classes=2, dropout=0.1,
                  attention_heads=8, radius=1, compare_channels=64):
         super().__init__()
-        if in_channels != 4 or num_classes != 2:
-            raise ValueError("Temporal E2E MOS requires four XYZR channels and two logits")
+        if in_channels not in {4, 5} or num_classes != 2:
+            raise ValueError("Temporal E2E MOS requires four XYZR or five XYZRI channels and two logits")
+        self.in_channels = in_channels
         self.encoder = SalsaNextEncoder(in_channels, dropout)
         self.temporal = LocalHistoricalAttention(256, attention_heads, radius, compare_channels)
         self.decoder = SalsaNextDecoder(num_classes, dropout)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor, dt: torch.Tensor,
                 return_diagnostics: bool = False):
-        if x.ndim != 5 or x.shape[1] < 2 or x.shape[2] != 4:
-            raise ValueError("x must be [B,T>=2,4,H,W]")
+        if x.ndim != 5 or x.shape[1] < 2 or x.shape[2] != self.in_channels:
+            raise ValueError(f"x must be [B,T>=2,{self.in_channels},H,W]")
         b, t, c, h, w = x.shape
         if h % 16 or w % 16:
             raise ValueError("SalsaNext requires H and W divisible by 16")

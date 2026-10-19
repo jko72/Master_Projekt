@@ -24,6 +24,7 @@ from helper.mos_eval_utils import compute_counts_from_pred_target, empty_counts,
 from helper.mos_point_projection import ProjectionConfig, unproject_prediction
 from helper.normal_helper import build_normal_xyz
 from helper.residual_helper import transform_points
+from helper.mos_input import channel_count, normalization, normalize_channels, normalize_feature_tensor
 from mos_models import build_mos_model
 from temporal_mae_dataset import project_range_features
 from utils_torch import spherical_projection
@@ -85,6 +86,9 @@ def frame_features(points, cfg, data):
         normals = build_normal_xyz(xyz)
         normals[invalid] = 0
         channels = [xyz[..., i] for i in range(3)] + [ranges] + [normals[..., i] for i in range(3)]
+    elif mode.startswith("range_xyz_intensity"):
+        invalid |= ~np.isfinite(projected[..., 3])
+        channels = [xyz[..., i] for i in range(3)] + [ranges, projected[..., 3].copy()]
     elif mode.startswith("range_xyz"):
         channels = [xyz[..., i] for i in range(3)] + [ranges]
     elif mode.startswith("range"):
@@ -95,6 +99,9 @@ def frame_features(points, cfg, data):
         raise ValueError(f"Unsupported input mode: {mode}")
     for channel in channels:
         channel[invalid] = 0
+    if "intensity" in mode:
+        normalize_channels(channels, ["x", "y", "z", "range", "intensity"], ~invalid,
+                           normalization(cfg, mode))
     return channels
 
 
@@ -142,7 +149,9 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e):
         if previous != index:
             pts = transform_points(pts, np.linalg.solve(poses[index], poses[previous]))
         feature, mask = project_range_features(pts, h, w, theta, min_range, max_range,
-                                                include_intensity=False, explicit_occupancy=e2e)
+                                                include_intensity="intensity" in data.get("input_mode", ""),
+                                                explicit_occupancy=e2e)
+        feature = normalize_feature_tensor(feature, mask[0], normalization(cfg, data.get("input_mode", "range_xyz")))
         features.append(feature)
         # E2E models require strictly negative past dt. Mark repeated scans as
         # absent history so their nominal dt cannot claim a real observation.
@@ -164,6 +173,12 @@ def load_adapter(path, device):
     name = cfg["mos_model_params"].get("name")
     if name not in {"salsanext_mos", "salsanext", "salsanext_temporal_mos", "salsanext_temporal_e2e", "unet_small"}:
         raise ValueError(f"Unsupported benchmark model: {name}")
+    mode = cfg["mos_data_params"].get("input_mode", "range_residual")
+    expected = channel_count(mode, cfg["mos_data_params"].get("residual_offsets", [1]))
+    actual = int(cfg["mos_model_params"].get("in_channels", -1))
+    if actual != expected:
+        raise ValueError(f"Checkpoint config: {mode} requires {expected} channels, model has {actual}")
+    normalization(cfg, mode)
     model = build_mos_model(cfg)
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.to(device).eval()
@@ -313,6 +328,8 @@ def main(argv=None):
         "checkpoint_train_sequences": cfg["mos_data_params"].get("train_sequences"),
         "eval_sequences": ids, "sequence_07_role": "internal_holdout_official_train",
         "dataset_root": str(root), "model": name, "input_mode": input_mode,
+        "channel_names": (["x", "y", "z", "range", "intensity"] if "intensity" in input_mode else None),
+        "normalization": normalization(cfg, input_mode),
         "projection": vars(projection), "history_init": args.history_init if temporal else None,
         "pose_source": "poses.txt + calib.txt (LiDAR frame)" if temporal else None,
         "gt_mapping": "PRBonn semantic-kitti-mos learning_map (local mos_label_helper)",

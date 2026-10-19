@@ -68,13 +68,8 @@ def set_seed(seed: int):
 
 
 def compute_expected_in_channels(input_mode: str, residual_offsets: List[int]) -> int:
-    if input_mode == "range":
-        return 1
-    if input_mode == "residual":
-        return len(residual_offsets)
-    if input_mode == "range_residual":
-        return 1 + len(residual_offsets)
-    raise ValueError(f"Unknown input_mode: {input_mode}")
+    from helper.mos_input import channel_count
+    return channel_count(input_mode, residual_offsets)
 
 
 def compute_mos_counts(logits: torch.Tensor, target: torch.Tensor, ignore_index: int = -1) -> Dict[str, int]:
@@ -150,7 +145,9 @@ def main():
         "--input_mode",
         type=str,
         default="range_residual",
-        choices=["range", "residual", "range_residual"],
+        choices=["range", "residual", "range_residual", "range_xyz", "range_xyz_residual",
+                 "range_xyz_intensity", "range_xyz_intensity_residual",
+                 "range_xyz_normal", "range_xyz_normal_residual"],
     )
     parser.add_argument("--residual_offsets", type=str, default="1")
     parser.add_argument("--mos_label_folder", type=str, default="mos_labels")

@@ -26,6 +26,7 @@ if SRC_DIR not in sys.path:
 from helper.dataloader_helper import make_sequences
 from mos_dataset import MOSFrameDataset, TemporalMOSDataset
 from mos_models import build_mos_model
+from helper.mos_input import channel_count, normalization
 
 
 def str2bool(value):
@@ -62,25 +63,7 @@ def parse_residual_offsets(value) -> List[int]:
 
 
 def compute_in_channels(input_mode: str, residual_offsets: Sequence[int]) -> int:
-    if input_mode == "range":
-        return 1
-    if input_mode == "residual":
-        return len(residual_offsets)
-    if input_mode == "range_residual":
-        return 1 + len(residual_offsets)
-    if input_mode == "range_xyz":
-        return 4
-    if input_mode == "range_xyz_residual":
-        return 4 + len(residual_offsets)
-    if input_mode == "range_xyz_normal":
-        return 7
-    if input_mode == "range_xyz_normal_residual":
-        return 7 + len(residual_offsets)
-    raise ValueError(
-        "Invalid input_mode='{0}'. Supported: "
-        "['range', 'residual', 'range_residual', 'range_xyz', 'range_xyz_residual', "
-        "'range_xyz_normal', 'range_xyz_normal_residual']".format(input_mode)
-    )
+    return channel_count(input_mode, residual_offsets)
 
 
 def select_sequences(all_sequences: List[Dict], requested_ids: Sequence[str], split_name: str) -> List[Dict]:
@@ -223,7 +206,7 @@ def select_visual_channels(x_chw: np.ndarray, input_mode: str, channel_names=Non
     else:
         if input_mode in {"range", "range_residual"}:
             range_idx = 0
-        elif input_mode in {"range_xyz", "range_xyz_residual", "range_xyz_normal", "range_xyz_normal_residual"}:
+        elif input_mode in {"range_xyz", "range_xyz_residual", "range_xyz_intensity", "range_xyz_intensity_residual", "range_xyz_normal", "range_xyz_normal_residual"}:
             range_idx = 3
 
         if input_mode == "residual":
@@ -232,6 +215,8 @@ def select_visual_channels(x_chw: np.ndarray, input_mode: str, channel_names=Non
             residual_idx = 1
         elif input_mode == "range_xyz_residual":
             residual_idx = 4
+        elif input_mode == "range_xyz_intensity_residual":
+            residual_idx = 5
         elif input_mode == "range_xyz_normal_residual":
             residual_idx = 7
 
@@ -328,6 +313,8 @@ def main():
             "range_residual",
             "range_xyz",
             "range_xyz_residual",
+            "range_xyz_intensity",
+            "range_xyz_intensity_residual",
             "range_xyz_normal",
             "range_xyz_normal_residual",
         ],
@@ -414,6 +401,7 @@ def main():
     mdata["input_mode"] = input_mode
     mdata["residual_offsets"] = list(residual_offsets)
     mmodel["in_channels"] = compute_in_channels(input_mode, residual_offsets)
+    normalization(cfg, input_mode)
     mos_label_folder = str(mdata.get("mos_label_folder", "mos_labels"))
     ignore_index = int(mdata.get("ignore_index", -1))
 
@@ -666,6 +654,7 @@ def main():
         "evaluation": {
             "checkpoint_path": checkpoint_path,
             "checkpoint_epoch": int(ckpt.get("epoch", -1)),
+            "input_normalization": normalization(cfg, input_mode),
             "split": str(args.split),
             "history_mode": args.history_mode,
             "device": device,

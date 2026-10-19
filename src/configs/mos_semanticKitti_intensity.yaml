@@ -1,0 +1,145 @@
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+
+model_params:
+  grid_height: 64
+  grid_width: 512
+  FOV_UP: 3.0
+  FOV_DOWN: -25.0
+  min_range: 0.0
+  max_range: 80.0
+
+mos_data_params:
+  input_mode: "range_xyz_intensity"
+  normalization: intensity_only  # XYZ and range retain the four-channel baseline scale
+  # Channel order: [x, y, z, range, intensity]
+  residual_offsets: []
+  residual_folder_template: "residual_images_{offset}"
+  mos_label_folder: "mos_labels"
+
+  ignore_index: -1
+  static_index: 0
+  moving_index: 1
+
+  train_sequences: ["00", "01", "02", "03", "04", "05", "06", "09", "10"]
+  val_sequences: ["08"]
+  test_sequences: ["07"]
+
+  require_moving_train: false
+  require_moving_val: false
+  min_moving_pixels: 1
+
+  use_moving_frame_sampler: false
+  moving_frame_weight: 5.0
+  static_frame_weight: 1.0
+
+mos_model_params:
+  name: "salsanext_mos"  # "unet_small"
+  in_channels: 5
+  num_classes: 2
+  base_channels: 32
+  dropout: 0.1
+  norm: "batch"
+
+mos_train_params:
+  batch_size: 12
+  num_workers: 6
+  epochs: 50
+
+  # Recommended pretrained finetuning:
+  # learning_rate: 0.0005
+  # encoder_learning_rate: 0.00005
+  # freeze_encoder_epochs: 5
+  #
+  # Scheduler options:
+  # scheduler: "none"
+  # scheduler: "cosine"
+  # scheduler: "linear"
+  # scheduler: "plateau"
+  #
+  # Cosine/linear:
+  # learning_rate_min: 0.000005
+  # encoder_learning_rate_min: 0.0000005
+  #
+  # Plateau:
+  # scheduler_monitor: "val_moving_iou"
+  # scheduler_mode: "max"
+  # scheduler_factor: 0.5
+  # scheduler_patience: 5
+
+  learning_rate: 0.0005
+  encoder_learning_rate: 0.00005
+  freeze_encoder_epochs: 0
+
+  weight_decay: 0.0001
+  clip_grad_norm: 5.0
+
+  static_class_weight: 1.0
+  moving_class_weight: 10.0
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+  learning_rate_min: 0.000005
+  encoder_learning_rate_min: 0.0000005
+  scheduler_monitor: "val_moving_iou"
+  scheduler_mode: "max"
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+  scheduler_threshold: 0.0001
+  scheduler_cooldown: 0
+  scheduler_start_epoch: 1
+
+  seed: 42
+  deterministic: false
+
+  # Base LR for decoder/head and for all parameters in scratch runs.
+  # Scratch: keep pretrained_encoder_path: null, encoder_learning_rate: null,
+  # and freeze_encoder_epochs: 0.
+  # Pretrained encoder example:
+  #   pretrained_encoder_path: "/path/to/forecasting_checkpoint.pt"
+  #   encoder_learning_rate: 0.00005
+  #   freeze_encoder_epochs: 5
+  #   pretrained_encoder_init_new_channels: "zero"
+  # Choose encoder_learning_rate smaller than learning_rate for finetuning,
+  # e.g. 0.00005 or 0.00001.
+
+  # Keep BatchNorm layers inside the frozen encoder in eval mode.
+  freeze_encoder_bn_eval: true
+
+  # Encoder-only pretraining:
+  #   pretrained_encoder_path: "/path/to/model_final.pt"
+  #   pretrained_backbone_path: null
+  #
+  # Encoder+Decoder backbone pretraining:
+  #   pretrained_encoder_path: null
+  #   pretrained_backbone_path: "/path/to/model_final.pt"
+  #   pretrained_load_encoder: true
+  #   pretrained_load_decoder: true
+  #   pretrained_skip_decoder_head: true
+  #
+  # The decoder head is skipped because forecasting uses 1 output channel,
+  # while MOS uses 2 classes.
+
+  # Optional: MAE/forecasting-pretrained SalsaNext encoder checkpoint (model_final.pt).
+  # The loader uses checkpoint["encoder_state_dict"] when available.
+  # T-MAE [x,y,z,range,intensity] transfers to MOS [x,y,z,range]
+  # by retaining the first four encoder input filters.
+  pretrained_encoder_path: null
+  pretrained_backbone_path: null #"/home/devuser/workspace/LidarGaussianVideoView/pretrain_logs/temporal_mae_normals_residual_semanticKitti_2026/checkpoints/model_final.pt"
+  pretrained_load_encoder: false
+  pretrained_load_decoder: false
+  pretrained_skip_decoder_head: true
+  pretrained_encoder_strict: true
+  pretrained_encoder_adapt_input_channels: false
+  pretrained_encoder_init_new_channels: "zero"
+
+mos_log_params:
+  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  # Override from CLI with --run_name for scratch/pretrained experiment names.
+  run_name: "MOS_semanticKitti_xyzri_scratch"
+  use_tensorboard: true
+
+
+  save_checkpoints: true
+  save_visuals: false
+  save_csv: true
+  save_config_copy: true

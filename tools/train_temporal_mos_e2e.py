@@ -26,6 +26,7 @@ from helper.dataloader_helper import make_sequences
 from helper.mos_eval_utils import add_counts, compute_counts_from_pred_target, empty_counts, metrics_from_counts, select_sequences
 from mos_models import build_mos_model
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
+from helper.mos_input import channel_count, normalization
 
 
 def read_config(path):
@@ -40,8 +41,14 @@ def read_config(path):
         raise ValueError("This scratch entry does not load a pretrained checkpoint")
     if cfg["mos_model_params"].get("fusion", "bottleneck_only") != "bottleneck_only":
         raise ValueError("Only bottleneck_only fusion is implemented")
-    if cfg["mos_data_params"].get("input_mode") != "range_xyz" or int(cfg["mos_data_params"].get("ignore_index", -1)) != -1:
-        raise ValueError("This path requires range_xyz input and ignore_index=-1")
+    mode = cfg["mos_data_params"].get("input_mode")
+    if mode not in {"range_xyz", "range_xyz_intensity"} or int(cfg["mos_data_params"].get("ignore_index", -1)) != -1:
+        raise ValueError("This path requires range_xyz or range_xyz_intensity input and ignore_index=-1")
+    expected = channel_count(mode)
+    if int(cfg["mos_model_params"].get("in_channels", expected)) != expected:
+        raise ValueError(f"mos_model_params.in_channels must be {expected} for {mode}")
+    cfg["mos_model_params"]["in_channels"] = expected
+    normalization(cfg, mode)
     if str(cfg["mos_train_params"].get("optimizer", "adamw")).lower() != "adamw":
         raise ValueError("This path supports AdamW")
     if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() != "cosine":
@@ -169,7 +176,7 @@ def synthetic_dry_run(cfg, device):
     model = build_mos_model(cfg).to(device)
     height, width = 32, 64
     t = len(cfg["mos_data_params"]["previous_offsets"]) + 1
-    x = torch.randn(1, t, 4, height, width, device=device)
+    x = torch.randn(1, t, int(cfg["mos_model_params"]["in_channels"]), height, width, device=device)
     valid = torch.ones(1, t, height, width, dtype=torch.bool, device=device)
     valid[:, 0, :4] = False
     offsets = sorted(cfg["mos_data_params"]["previous_offsets"], reverse=True)
@@ -277,6 +284,7 @@ def main():
                     writer.add_scalar(key, value, epoch)
         payload = {"epoch": epoch, "model_state_dict": model.state_dict(),
                    "optimizer_state_dict": optimizer.state_dict(), "config": cfg,
+                   "input_normalization": normalization(cfg, cfg["mos_data_params"]["input_mode"]),
                    "val_moving_iou": val["moving_iou"]}
         torch.save(payload, checkpoint_dir / "last.pt")
         if val["moving_iou"] > best_iou:
