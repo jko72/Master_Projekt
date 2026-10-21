@@ -31,7 +31,7 @@ mos_train_params:
   seed: 42
   deterministic: false
   epochs: 50
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   optimizer: adamw
   learning_rate: 0.0005
