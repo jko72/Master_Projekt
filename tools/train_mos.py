@@ -28,7 +28,7 @@ from mos_models import build_mos_model
 from helper.mos_input import channel_count, normalization
 
 
-def parse_residual_offsets(value) -> List[int]:
+def parse_residual_offsets(value, *, allow_empty: bool = False) -> List[int]:
     if isinstance(value, (int, np.integer)):
         vals = [int(value)]
     elif isinstance(value, str):
@@ -40,7 +40,7 @@ def parse_residual_offsets(value) -> List[int]:
         raise TypeError("residual_offsets must be int, str or iterable of ints.")
 
     vals = sorted(set(v for v in vals if v >= 1))
-    if not vals:
+    if not vals and not allow_empty:
         raise ValueError("residual_offsets must include at least one positive integer.")
     return vals
 
@@ -1060,10 +1060,10 @@ def main():
         mtrain["freeze_encoder_epochs"] = int(args.freeze_encoder_epochs)
     if args.input_mode is not None:
         mdata["input_mode"] = str(args.input_mode)
-    if args.residual_offsets is not None:
-        mdata["residual_offsets"] = parse_residual_offsets(args.residual_offsets)
-    else:
-        mdata["residual_offsets"] = parse_residual_offsets(mdata.get("residual_offsets", [1]))
+    offsets = args.residual_offsets if args.residual_offsets is not None else mdata.get("residual_offsets", [1])
+    mdata["residual_offsets"] = parse_residual_offsets(
+        offsets, allow_empty="residual" not in str(mdata["input_mode"])
+    )
     if args.moving_weight is not None:
         mtrain["moving_class_weight"] = float(args.moving_weight)
     if args.num_workers is not None:
