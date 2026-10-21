@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -19,8 +20,19 @@ sys.path.insert(0, str(ROOT / "tools"))
 from models.range_view_local_temporal_attention import LocalHistoricalAttention, local_candidates
 from mos_models import build_mos_model
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
-from train_temporal_mos_e2e import amp_settings, read_config
+from train_temporal_mos_e2e import amp_settings, read_config, dry_run_step, gradient_health
 from evaluate_temporal_mos_e2e import apply_history_mode
+
+
+class GradientTestModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = torch.nn.Conv2d(5, 4, 1)
+        self.temporal = torch.nn.Conv2d(4, 4, 1)
+        self.decoder = torch.nn.Conv2d(4, 2, 1)
+
+    def forward(self, x, valid, dt):
+        return self.decoder(self.temporal(self.encoder(x[:, -1])))
 
 
 class TemporalE2ETests(unittest.TestCase):
@@ -128,11 +140,59 @@ class TemporalE2ETests(unittest.TestCase):
     def test_amp_default(self):
         enabled, dtype = amp_settings(self.cfg, torch.device("cpu"))
         self.assertFalse(enabled)
-        self.assertEqual(dtype, torch.bfloat16)
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        self.assertEqual(dtype, torch.float16)
+        if torch.cuda.is_available():
             enabled, dtype = amp_settings(self.cfg, torch.device("cuda"))
             self.assertTrue(enabled)
-            self.assertEqual(dtype, torch.bfloat16)
+            self.assertEqual(dtype, torch.float16)
+
+    def test_dry_run_recovers_from_initial_gradient_overflow(self):
+        model = GradientTestModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        # Use a real CPU GradScaler and inject one overflow; no GPU is needed.
+        scaler = torch.amp.GradScaler("cpu", init_scale=65536)
+        calls = []
+
+        def overflow_once(gradient):
+            calls.append(1)
+            return torch.full_like(gradient, float("inf")) if len(calls) == 1 else gradient
+
+        hook = model.encoder.weight.register_hook(overflow_once)
+        x = torch.randn(1, 2, 5, 4, 8)
+        y = torch.randint(0, 2, (1, 4, 8))
+        with patch.object(optimizer, "step", wraps=optimizer.step) as step:
+            _, _, attempts = dry_run_step(model, x, None, None, y, torch.nn.CrossEntropyLoss(),
+                                           optimizer, scaler, torch.device("cpu"), False, torch.float16)
+            self.assertEqual(attempts, 2)
+            self.assertEqual(step.call_count, 1)
+        hook.remove()
+        self.assertEqual(scaler.get_scale(), 32768)
+        self.assertEqual(gradient_health(model), {"missing": [], "nonfinite": [], "inactive_modules": []})
+
+    def test_dry_run_persistent_overflow_still_fails(self):
+        model = GradientTestModel()
+        before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scaler = torch.amp.GradScaler("cpu", init_scale=65536)
+        hook = model.encoder.weight.register_hook(lambda gradient: torch.full_like(gradient, float("inf")))
+        with self.assertRaisesRegex(AssertionError, "remained non-finite after 3 attempts"):
+            dry_run_step(model, torch.randn(1, 2, 5, 4, 8), None, None,
+                         torch.randint(0, 2, (1, 4, 8)), torch.nn.CrossEntropyLoss(),
+                         optimizer, scaler, torch.device("cpu"), False, torch.float16, max_attempts=3)
+        hook.remove()
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, before[name])
+
+    def test_gradient_health_distinguishes_missing_zero_and_nan(self):
+        model = GradientTestModel()
+        self.assertTrue(gradient_health(model)["missing"])
+        for parameter in model.parameters():
+            parameter.grad = torch.zeros_like(parameter)
+        health = gradient_health(model)
+        self.assertFalse(health["missing"])
+        self.assertEqual(health["inactive_modules"], ["decoder", "encoder", "temporal"])
+        model.encoder.weight.grad.fill_(float("nan"))
+        self.assertIn("encoder.weight", gradient_health(model)["nonfinite"])
 
 
 if __name__ == "__main__":

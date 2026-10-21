@@ -20,7 +20,7 @@ from helper.mos_input import channel_count
 from evaluate_mos_benchmark import temporal_input, single_frame_input, load_adapter
 from train_temporal_mos_e2e import read_config
 from train_mos import _check_pretrain_channels
-from train_mos import train_one_epoch
+from train_mos import train_one_epoch, parse_residual_offsets
 
 
 def fixture_scan(tmp_path, n_frames=2):
@@ -208,6 +208,19 @@ def check_current_e2e_offsets_and_cpu_step(tmp_path):
 
 
 class MOSIntensityTests(unittest.TestCase):
+    def test_empty_offsets_only_for_inputs_without_residuals(self):
+        for mode in ("range_xyz_intensity", "range_xyz_intensity_residual"):
+            allow_empty = "residual" not in mode
+            if allow_empty:
+                self.assertEqual(parse_residual_offsets([], allow_empty=allow_empty), [])
+            else:
+                with self.assertRaisesRegex(ValueError, "at least one positive integer"):
+                    parse_residual_offsets([], allow_empty=allow_empty)
+            self.assertEqual(parse_residual_offsets("5,2,1,2,4,3", allow_empty=allow_empty),
+                             [1, 2, 3, 4, 5])
+        with self.assertRaises(ValueError):
+            parse_residual_offsets([])
+
     def _with_scan(self, check):
         with tempfile.TemporaryDirectory() as directory:
             check(Path(directory))

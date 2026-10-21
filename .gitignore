@@ -10,6 +10,9 @@ LidarGaussianVideoView/logs/
 LidarGaussianVideoView/
 *.log
 *.out
+*.err
+*.lock
+*.sif
 events.out.tfevents.*
 
 # --- Temporäre Trainings- oder Checkpoint-Dateien ---
