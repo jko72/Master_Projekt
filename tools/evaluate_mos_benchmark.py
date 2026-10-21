@@ -14,6 +14,7 @@ import torch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCAL_SEMANTICKITTI_VALIDATOR = ROOT / "third_party" / "semantic_kitti_api" / "validate_submission.py"
 sys.path.insert(0, str(ROOT / "src"))
 
 from helper.egoMotion_compensation_calib import parse_calibration, parse_poses
@@ -206,7 +207,7 @@ def main(argv=None):
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--official-api-dir", type=Path,
-                        help="SemanticKITTI API checkout; runs validate_submission.py after a ZIP export")
+                        help="Optional SemanticKITTI API checkout overriding the vendored official validator")
     parser.add_argument("--max-frames", type=int, help="Smoke test only; disables export")
     args = parser.parse_args(argv)
     ids = [str(s).zfill(2) for s in args.sequences]
@@ -306,12 +307,12 @@ def main(argv=None):
         validate_export(args.output_dir / "predictions", indexed)
     if args.submission_zip:
         write_submission_zip(args.output_dir / "submission.zip", args.output_dir / "predictions", indexed)
-        if args.official_api_dir:
-            validator = args.official_api_dir / "validate_submission.py"
-            if not validator.is_file():
-                raise FileNotFoundError(f"Official validator missing: {validator}")
-            subprocess.run([sys.executable, str(validator), "--zipfile", str(args.output_dir / "submission.zip"),
-                "--dataset", str(root.parent), "--task", "segmentation"], check=True)
+        validator = (args.official_api_dir / "validate_submission.py"
+                     if args.official_api_dir else LOCAL_SEMANTICKITTI_VALIDATOR)
+        if not validator.is_file():
+            raise FileNotFoundError(f"Official validator missing: {validator}")
+        subprocess.run([sys.executable, str(validator), str(args.output_dir / "submission.zip"),
+            str(root.parent), "--task", "segmentation"], check=True)
     if totals:
         save_csv(args.output_dir / "point_metrics.csv", [{"n_scans": total_scans, **totals, **point_metrics(totals)}])
         save_csv(args.output_dir / "point_per_sequence.csv", per_seq)
