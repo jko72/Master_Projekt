@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
+from torch.nn import functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -12,6 +14,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from helper.mos_benchmark_eval import (add_counts, point_counts, point_metrics,
     read_point_gt, validate_export, write_prediction, write_submission_zip)
+from helper.mos_knn_postprocess import knn_unproject_prediction
 from helper.mos_point_projection import ProjectionConfig, original_points_to_pixels, unproject_prediction
 from utils_torch import spherical_projection
 from evaluate_mos_benchmark import frame_features, index_sequences, load_adapter, load_poses, main, single_frame_input, temporal_input
@@ -67,6 +70,25 @@ class ProjectionTests(unittest.TestCase):
             for a, b in zip([existing[1], existing[2], existing[3], existing[0]], fresh):
                 np.testing.assert_array_equal(a, b)
 
+    def test_knn_range_is_in_metres_before_input_normalization(self):
+        """KNN must never receive a normalized input range channel."""
+        points = np.array([[3, 4, 0, 0.5]], dtype=np.float32)  # range = 5 m
+        data = {"input_mode": "range_xyz_intensity", "normalization": "intensity_only"}
+        base = {"model_params": {"grid_height": 64, "grid_width": 512,
+                                  "FOV_UP": 3, "FOV_DOWN": -25},
+                "mos_data_params": data}
+        channels, raw_range = frame_features(points, base, data, return_raw_range=True)
+        row, col, valid = original_points_to_pixels(points, self.cfg)
+        self.assertTrue(valid[0])
+        self.assertEqual(float(raw_range[row[0], col[0]]), 5.0)
+        self.assertEqual(float(channels[3][row[0], col[0]]), 5.0)
+
+        paper = {"input_mode": "range_xyz_intensity", "normalization": "paper_normalization"}
+        base["mos_data_params"] = paper
+        channels, raw_range = frame_features(points, base, paper, return_raw_range=True)
+        self.assertEqual(float(raw_range[row[0], col[0]]), 5.0)
+        self.assertNotEqual(float(channels[3][row[0], col[0]]), 5.0)
+
     def test_projected_winner_ids_match_vectorized_coordinates(self):
         rng = np.random.default_rng(31)
         points = rng.normal(size=(8000, 4)).astype(np.float32)
@@ -82,6 +104,108 @@ class ProjectionTests(unittest.TestCase):
         self.assertTrue(valid[selected].all())
         np.testing.assert_array_equal(rows[selected], actual_rows)
         np.testing.assert_array_equal(cols[selected], actual_cols)
+
+
+class KNNPostprocessTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = ProjectionConfig(5, 9, 10, -10)
+        self.point = np.array([[10, 0, 0, 0]], dtype=np.float32)
+        self.row, self.col, valid = original_points_to_pixels(self.point, self.cfg)
+        self.assertTrue(valid[0])
+
+    def _images(self, neighbor_range=10.0):
+        ranges = np.zeros((self.cfg.height, self.cfg.width), dtype=np.float32)
+        pred = np.zeros_like(ranges, dtype=np.uint8)
+        r, c = int(self.row[0]), int(self.col[0])
+        # Corners are farther in range, so LMNet's top-k contains the center
+        # plus all four cardinal votes without relying on top-k tie ordering.
+        ranges[r - 1:r + 2, c - 1:c + 2] = 20.0
+        ranges[r, c] = 10.0
+        ranges[r - 1, c] = ranges[r + 1, c] = neighbor_range
+        ranges[r, c - 1] = ranges[r, c + 1] = neighbor_range
+        # Center stays static. The four cardinal neighbors are moving.
+        pred[r - 1, c] = pred[r + 1, c] = 1
+        pred[r, c - 1] = pred[r, c + 1] = 1
+        return pred, ranges
+
+    def test_binary_static_and_moving_majority(self):
+        pred, ranges = self._images()
+        out, valid = knn_unproject_prediction(pred, ranges, self.point, self.cfg,
+                                               knn=5, search=3, sigma=1, cutoff=1)
+        self.assertTrue(valid[0])
+        # Static is class 0, and is included in the vote rather than ignored.
+        self.assertEqual(int(out[0]), 1)
+
+        # Reference the original LMNet procedure with its classes
+        # 0=ignore, 1=static, 2=moving. This window has no padded candidate
+        # among the five selected neighbors, so both sentinel conventions agree.
+        lmnet_labels = torch.from_numpy(np.where(pred == 1, 2, 1).astype(np.int64))
+        unfolded_range = F.unfold(torch.from_numpy(ranges)[None, None], 3, padding=1)
+        unfolded_label = F.unfold(lmnet_labels[None, None].float(), 3, padding=1).long()
+        index = int(self.row[0]) * self.cfg.width + int(self.col[0])
+        neighbors = unfolded_range[:, :, index:index + 1].clone()
+        depth = torch.tensor([10.0])
+        neighbors[:, 4, :] = depth
+        coord = torch.arange(3, dtype=torch.float32) - 1
+        yy, xx = torch.meshgrid(coord, coord, indexing="ij")
+        gauss = torch.exp(-(xx.square() + yy.square()) / 2)
+        gauss /= gauss.sum()
+        distances = (neighbors - depth).abs() * (1 - gauss.flatten()).view(1, -1, 1)
+        indices = distances.topk(5, dim=1, largest=False, sorted=False).indices
+        votes = torch.gather(unfolded_label[:, :, index:index + 1], 1, indices)
+        onehot = torch.zeros((1, 4, 1)).scatter_add_(1, votes, torch.ones_like(votes, dtype=torch.float32))
+        lmnet_out = int((onehot[:, 1:-1].argmax(dim=1) + 1).item()) - 1
+        self.assertEqual(int(out[0]), lmnet_out)
+
+    def test_cutoff_changes_vote_and_invalid_fallback_is_static(self):
+        pred, ranges = self._images(neighbor_range=20.0)
+        close_only, _ = knn_unproject_prediction(pred, ranges, self.point, self.cfg,
+                                                  knn=5, search=3, sigma=1, cutoff=0.1)
+        include_neighbors, _ = knn_unproject_prediction(pred, ranges, self.point, self.cfg,
+                                                         knn=5, search=3, sigma=1, cutoff=10.0)
+        self.assertEqual(int(close_only[0]), 0)
+        self.assertEqual(int(include_neighbors[0]), 1)
+        invalid = np.array([[np.nan, 0, 0, 0]], dtype=np.float32)
+        fallback, valid = knn_unproject_prediction(pred, ranges, invalid, self.cfg)
+        np.testing.assert_array_equal(fallback, [0])
+        np.testing.assert_array_equal(valid, [False])
+
+    def test_collision_order_and_chunking_are_stable(self):
+        colliding = np.array([[10, 0, 0, 0], [20, 0, 0, 0]], dtype=np.float32)
+        pred, ranges = self._images()
+        collision_out, collision_valid = knn_unproject_prediction(
+            pred, ranges, colliding, self.cfg, knn=5, search=3, sigma=1, cutoff=1,
+        )
+        self.assertEqual(len(collision_out), 2)
+        self.assertTrue(collision_valid.all())
+        # Both colliding original points survive. Their distinct true ranges
+        # intentionally permit different KNN neighborhoods and labels.
+        np.testing.assert_array_equal(collision_out, [1, 0])
+
+        rng = np.random.default_rng(7)
+        points = rng.normal(size=(101, 4)).astype(np.float32)
+        points[:, :3] *= rng.uniform(2, 40, size=(101, 1)).astype(np.float32)
+        rows, cols, valid = original_points_to_pixels(points, self.cfg)
+        ranges = np.zeros((self.cfg.height, self.cfg.width), dtype=np.float32)
+        depth = np.linalg.norm(points[:, :3], axis=1)
+        for i in np.flatnonzero(valid):
+            ranges[rows[i], cols[i]] = depth[i]
+        pred = rng.integers(0, 2, size=ranges.shape, dtype=np.uint8)
+        one, valid_one = knn_unproject_prediction(pred, ranges, points, self.cfg, chunk_size=1)
+        many, valid_many = knn_unproject_prediction(pred, ranges, points, self.cfg, chunk_size=128)
+        np.testing.assert_array_equal(one, many)
+        np.testing.assert_array_equal(valid_one, valid_many)
+        if torch.cuda.is_available():
+            gpu, gpu_valid = knn_unproject_prediction(pred, ranges, points, self.cfg, device="cuda", chunk_size=32)
+            np.testing.assert_array_equal(gpu, one)
+            np.testing.assert_array_equal(gpu_valid, valid_one)
+
+    def test_input_and_window_validation(self):
+        pred, ranges = self._images()
+        with self.assertRaisesRegex(ValueError, "odd"):
+            knn_unproject_prediction(pred, ranges, self.point, self.cfg, search=4)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            knn_unproject_prediction(pred, ranges[:, :-1], self.point, self.cfg)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -159,6 +283,16 @@ class BenchmarkTests(unittest.TestCase):
             self.assertTrue(pred.is_file())
             self.assertEqual(len(np.fromfile(pred, dtype="<u4")), 2)
             self.assertFalse((out / "point_metrics.csv").exists())
+            with (out / "benchmark_eval_config.yaml").open(encoding="utf-8") as handle:
+                self.assertEqual(yaml.safe_load(handle)["postprocessing"]["method"], "direct")
+            out_knn = root / "eval_knn"
+            main(["--checkpoint", str(ckpt), "--dataset-root", str(root / "dataset"),
+                  "--sequences", "11", "--mode", "point", "--export-predictions",
+                  "--postprocess", "knn", "--output-dir", str(out_knn), "--device", "cpu"])
+            with (out_knn / "benchmark_eval_config.yaml").open(encoding="utf-8") as handle:
+                knn_metadata = yaml.safe_load(handle)["postprocessing"]
+            self.assertEqual(knn_metadata["method"], "knn")
+            self.assertEqual(knn_metadata["knn"], 5)
             cfg["mos_data_params"] = {"input_mode": "range_residual", "residual_offsets": [1]}
             with self.assertRaisesRegex(FileNotFoundError, "residual image missing"):
                 single_frame_input(scan, cfg, scan_dir.parent, scan.stem)

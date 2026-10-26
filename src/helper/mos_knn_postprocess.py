@@ -47,8 +47,10 @@ def knn_unproject_prediction(
         raise ValueError("Expected 0=static, 1=moving predictions")
     if search < 1 or search % 2 != 1 or not (1 <= knn <= search * search):
         raise ValueError("Search must be odd and 1 <= knn <= search*search")
-    if sigma <= 0 or chunk_size < 1:
-        raise ValueError("Sigma and chunk_size must be positive")
+    if not np.isfinite(sigma) or sigma <= 0 or chunk_size < 1:
+        raise ValueError("Sigma must be finite and positive; chunk_size must be positive")
+    if not np.isfinite(cutoff):
+        raise ValueError("Cutoff must be finite")
 
     rows, cols, valid = original_points_to_pixels(points, cfg)
     point_pred = np.zeros(len(points), dtype=np.uint8)
@@ -57,6 +59,8 @@ def knn_unproject_prediction(
         return point_pred, valid
 
     dev = torch.device(device)
+    # Local projections use zero for an empty pixel, while LMNet's original
+    # projector uses a negative sentinel. Treat both as invalid before KNN.
     ranges_image = torch.as_tensor(proj_range, dtype=torch.float32, device=dev)
     label_image = torch.as_tensor(pred, dtype=torch.float32, device=dev)
     padding = search // 2

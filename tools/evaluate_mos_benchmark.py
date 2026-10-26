@@ -7,6 +7,7 @@ import argparse
 import csv
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from helper.mos_benchmark_eval import (TEST_SEQUENCES, add_counts, point_counts,
     point_metrics, read_point_gt, read_scan, validate_export, write_prediction,
     write_submission_zip)
 from helper.mos_eval_utils import compute_counts_from_pred_target, empty_counts, metrics_from_counts
+from helper.mos_knn_postprocess import knn_unproject_prediction
 from helper.mos_point_projection import ProjectionConfig, unproject_prediction
 from helper.normal_helper import build_normal_xyz
 from helper.residual_helper import transform_points
@@ -68,7 +70,7 @@ def load_poses(seq_dir, n_scans):
     return poses
 
 
-def frame_features(points, cfg, data):
+def frame_features(points, cfg, data, return_raw_range: bool = False):
     mp = cfg["model_params"]
     h, w = int(mp["grid_height"]), int(mp["grid_width"])
     theta = (np.deg2rad(float(mp.get("FOV_DOWN", -25))), np.deg2rad(float(mp.get("FOV_UP", 3))))
@@ -103,13 +105,21 @@ def frame_features(points, cfg, data):
     if "intensity" in mode:
         normalize_channels(channels, ["x", "y", "z", "range", "intensity"], ~invalid,
                            normalization(cfg, mode))
+    if return_raw_range:
+        # This is deliberately captured before input normalization. KNN must
+        # compare physical ranges in metres, never an input feature channel.
+        return channels, ranges.copy()
     return channels
 
 
-def single_frame_input(scan, cfg, seq_dir, stem):
+def single_frame_input(scan, cfg, seq_dir, stem, return_projected_range: bool = False):
     data = cfg["mos_data_params"]
     mode = data.get("input_mode", "range_residual")
-    channels = frame_features(read_scan(scan), cfg, data)
+    features = frame_features(read_scan(scan), cfg, data, return_raw_range=return_projected_range)
+    if return_projected_range:
+        channels, raw_range = features
+    else:
+        channels = features
     if "residual" in mode:
         offsets = data.get("residual_offsets", [1])
         if isinstance(offsets, int):
@@ -126,10 +136,11 @@ def single_frame_input(scan, cfg, seq_dir, stem):
             channels.append(residual.astype(np.float32))
     if not channels:
         raise ValueError("No input channels")
-    return torch.from_numpy(np.stack(channels).astype(np.float32))[None]
+    tensor = torch.from_numpy(np.stack(channels).astype(np.float32))[None]
+    return (tensor, raw_range) if return_projected_range else tensor
 
 
-def temporal_input(scans, index, poses, cfg, history_init, e2e):
+def temporal_input(scans, index, poses, cfg, history_init, e2e, return_projected_range: bool = False):
     data, mp = cfg["mos_data_params"], cfg["model_params"]
     offsets = sorted({int(v) for v in data.get("previous_offsets", [3])}, reverse=True) if e2e else [int(data.get("previous_offset", 3))]
     h, w = int(mp["grid_height"]), int(mp["grid_width"])
@@ -138,6 +149,7 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e):
     max_range = mp.get("max_range", mp.get("MAX_RANGE"))
     max_range = None if max_range is None else float(max_range)
     features, masks = [], []
+    current_raw_range = None
     bootstrapped = False
     for off in offsets + [0]:
         previous = index - off
@@ -152,6 +164,10 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e):
         feature, mask = project_range_features(pts, h, w, theta, min_range, max_range,
                                                 include_intensity="intensity" in data.get("input_mode", ""),
                                                 explicit_occupancy=e2e)
+        if off == 0:
+            # project_range_features builds [x, y, z, range, (intensity)]
+            # before normalization, so channel three is metres.
+            current_raw_range = feature[3].numpy().copy()
         feature = normalize_feature_tensor(feature, mask[0], normalization(cfg, data.get("input_mode", "range_xyz")))
         features.append(feature)
         # E2E models require strictly negative past dt. Mark repeated scans as
@@ -160,8 +176,14 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e):
     x = torch.stack(features)[None]
     if e2e:
         dt = torch.tensor([[-off / float(data.get("scan_rate_hz", 10)) for off in offsets] + [0.0]], dtype=torch.float32)
-        return (x, torch.stack(masks)[None], dt), bootstrapped
-    return (x,), bootstrapped
+        inputs = (x, torch.stack(masks)[None], dt)
+    else:
+        inputs = (x,)
+    if return_projected_range:
+        if current_raw_range is None:
+            raise RuntimeError("Current projected range was not constructed")
+        return inputs, bootstrapped, current_raw_range
+    return inputs, bootstrapped
 
 
 def load_adapter(path, device):
@@ -203,6 +225,15 @@ def main(argv=None):
     parser.add_argument("--mode", choices=["pixel", "point", "both"], default="point")
     parser.add_argument("--export-predictions", action="store_true")
     parser.add_argument("--submission-zip", action="store_true")
+    parser.add_argument("--postprocess", choices=("direct", "knn"), default="direct",
+                        help="Point-level range-view unprojection method")
+    parser.add_argument("--knn-k", type=int, default=5, help="LMNet KNN neighbors")
+    parser.add_argument("--knn-search", type=int, default=5, help="Odd LMNet KNN window width")
+    parser.add_argument("--knn-sigma", type=float, default=1.0, help="LMNet spatial Gaussian sigma")
+    parser.add_argument("--knn-cutoff", type=float, default=1.0,
+                        help="LMNet weighted-distance cutoff; <=0 disables filtering")
+    parser.add_argument("--knn-chunk-size", type=int, default=32768,
+                        help="Original points processed together during KNN unprojection")
     parser.add_argument("--history-init", choices=["repeat_earliest", "strict"], default="repeat_earliest")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -217,6 +248,14 @@ def main(argv=None):
         parser.error("--submission-zip requires export and all test sequences 11..21")
     if args.max_frames is not None and (args.max_frames < 1 or args.export_predictions):
         parser.error("--max-frames must be positive and cannot be used with export")
+    if args.knn_k < 1 or args.knn_search < 1 or args.knn_search % 2 != 1:
+        parser.error("--knn-k must be positive and --knn-search must be positive and odd")
+    if args.knn_k > args.knn_search * args.knn_search:
+        parser.error("--knn-k must not exceed --knn-search squared")
+    if args.knn_sigma <= 0 or not np.isfinite(args.knn_sigma) or not np.isfinite(args.knn_cutoff):
+        parser.error("--knn-sigma must be finite and positive; --knn-cutoff must be finite")
+    if args.knn_chunk_size < 1:
+        parser.error("--knn-chunk-size must be positive")
     root = sequence_root(args.dataset_root)
     output_dir = args.output_dir.expanduser().resolve()
     if output_dir == root.parent or root.parent in output_dir.parents:
@@ -248,6 +287,7 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True)
     totals, pixel_total, per_seq, seq_summary, coverage, pixel_rows = {}, empty_counts(), [], [], [], []
     total_scans = 0
+    point_postprocess_seconds = 0.0
     with torch.inference_mode():
         for seq, scans in indexed.items():
             seq_counts, seq_pixel = {}, empty_counts()
@@ -255,19 +295,45 @@ def main(argv=None):
             selected = scans[:args.max_frames] if args.max_frames else scans
             for index, scan in enumerate(selected):
                 if temporal:
-                    inputs, boot = temporal_input(scans, index, poses[seq], cfg, args.history_init, e2e)
+                    temporal_result = temporal_input(
+                        scans, index, poses[seq], cfg, args.history_init, e2e,
+                        return_projected_range=args.postprocess == "knn",
+                    )
+                    if args.postprocess == "knn":
+                        inputs, boot, projected_range = temporal_result
+                    else:
+                        inputs, boot = temporal_result
                     bootstrapped += int(boot)
                 else:
-                    inputs = (single_frame_input(scan, cfg, root / seq, scan.stem),)
+                    single_result = single_frame_input(
+                        scan, cfg, root / seq, scan.stem,
+                        return_projected_range=args.postprocess == "knn",
+                    )
+                    if args.postprocess == "knn":
+                        model_input, projected_range = single_result
+                    else:
+                        model_input = single_result
+                    inputs = (model_input,)
                 logits = model(*(part.to(device) for part in inputs))
                 if logits.shape != (1, 2, projection.height, projection.width):
                     raise ValueError(f"Unexpected model output shape: {tuple(logits.shape)}")
                 pred_hw = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
                 points = read_scan(scan)
-                pred, valid = unproject_prediction(pred_hw, points, projection)
+                postprocess_start = time.perf_counter()
+                if args.postprocess == "knn":
+                    pred, valid = knn_unproject_prediction(
+                        pred_hw, projected_range, points, projection, device=device,
+                        knn=args.knn_k, search=args.knn_search, sigma=args.knn_sigma,
+                        cutoff=args.knn_cutoff, chunk_size=args.knn_chunk_size,
+                    )
+                else:
+                    pred, valid = unproject_prediction(pred_hw, points, projection)
+                postprocess_seconds = time.perf_counter() - postprocess_start
+                point_postprocess_seconds += postprocess_seconds
                 coverage.append({"sequence": seq, "frame": scan.stem, "n_points": len(points),
                     "invalid_points": int((~valid).sum()), "fallback_points": int((~valid).sum()),
-                    "coverage_rate": float(valid.mean()) if len(valid) else 0.0})
+                    "coverage_rate": float(valid.mean()) if len(valid) else 0.0,
+                    "postprocess_seconds": postprocess_seconds})
                 gt_path = root / seq / "labels" / f"{scan.stem}.label"
                 if args.mode in {"point", "both"} and gt_path.is_file():
                     add_counts(seq_counts, point_counts(pred, read_point_gt(gt_path, len(points))))
@@ -335,6 +401,12 @@ def main(argv=None):
         "pose_source": "poses.txt + calib.txt (LiDAR frame)" if temporal else None,
         "gt_mapping": "PRBonn semantic-kitti-mos learning_map (local mos_label_helper)",
         "unmapped_point_fallback": "static", "n_scans": total_scans,
+        "point_postprocess_seconds_total": point_postprocess_seconds,
+        "point_postprocess_seconds_per_scan": point_postprocess_seconds / total_scans if total_scans else 0.0,
+        "postprocessing": {"method": args.postprocess,
+            **({"knn": args.knn_k, "search": args.knn_search, "sigma": args.knn_sigma,
+                "cutoff": args.knn_cutoff, "chunk_size": args.knn_chunk_size}
+               if args.postprocess == "knn" else {})},
         "partial_smoke_test": bool(args.max_frames), "pipeline_git_commit": git_commit}
     with (args.output_dir / "benchmark_eval_config.yaml").open("x", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
