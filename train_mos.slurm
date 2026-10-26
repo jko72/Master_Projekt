@@ -114,6 +114,27 @@ mkdir -p -- "$(dirname -- "$IMAGE")"
   fi
 )
 
+# Das SIF liegt auf dem Shared Storage. Apptainer greift darauf ueber ein
+# speicherabgebildetes squashfuse-Dateisystem zu. Eine lokale, job-eigene Kopie
+# vermeidet gemeinsame FUSE-/Storage-Zugriffe waehrend des Trainings.
+LOCAL_SIF_ROOT="${SLURM_TMPDIR:-/tmp}"
+LOCAL_SIF_DIR="${LOCAL_SIF_ROOT}/mos-sif-${RUN_ID}"
+LOCAL_IMAGE="${LOCAL_SIF_DIR}/$(basename -- "$IMAGE")"
+mkdir -p -- "$LOCAL_SIF_DIR"
+cleanup_local_sif() {
+  rm -f -- "$LOCAL_IMAGE"
+  rmdir -- "$LOCAL_SIF_DIR" 2>/dev/null || true
+}
+trap cleanup_local_sif EXIT
+echo "Kopiere SIF auf den lokalen Knoten: $LOCAL_IMAGE"
+cp -- "$IMAGE" "$LOCAL_IMAGE"
+cmp -s -- "$IMAGE" "$LOCAL_IMAGE" || {
+  echo "Fehler: Die lokale SIF-Kopie stimmt nicht mit dem Quellimage ueberein." >&2
+  exit 1
+}
+IMAGE="$LOCAL_IMAGE"
+printf 'node_local_image=%s\n' "$IMAGE" >> "$HOST_RUN_LOG_ROOT/job-info.txt"
+
 export APPTAINERENV_PYTHONUNBUFFERED=1
 export APPTAINERENV_OMP_NUM_THREADS=2
 export APPTAINERENV_USE_LIBUV=0

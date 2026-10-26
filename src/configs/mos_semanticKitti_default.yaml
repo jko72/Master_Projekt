@@ -1,4 +1,4 @@
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+dataset_path: "/hpc/SemanticKitti/dataset/sequences"
 
 model_params:
   grid_height: 64
@@ -132,7 +132,7 @@ mos_train_params:
   pretrained_encoder_init_new_channels: "zero"
 
 mos_log_params:
-  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  log_root: "/hpc/logs/mos"
   # Override from CLI with --run_name for scratch/pretrained experiment names.
   run_name: "Pretrained_MAE_MOS_Kitti_range_xyz_2026"
   use_tensorboard: true

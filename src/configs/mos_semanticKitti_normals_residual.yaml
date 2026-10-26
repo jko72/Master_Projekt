@@ -1,4 +1,4 @@
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+dataset_path: "/hpc/SemanticKitti/dataset/sequences"
 
 model_params:
   grid_height: 64
@@ -81,7 +81,7 @@ mos_train_params:
   pretrained_encoder_init_new_channels: "zero"
 
 mos_log_params:
-  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  log_root: "/hpc/logs/mos"
   run_name: "MOS_semanticKitti_range_xyz_normal_residual_12345"
   use_tensorboard: true
 

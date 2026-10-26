@@ -52,6 +52,64 @@ def batch(dataset, indices):
     return [torch.stack([item[column] for item in items]) for column in range(4)]
 
 
+def combined_distributed_check(rank, cfg, device):
+    """Compare DDP against global CE + mean of local Lovasz microbatches."""
+    import copy
+    cfg = copy.deepcopy(cfg)
+    cfg["mos_train_params"]["loss"] = dict(type="ce_lovasz", lovasz_weight=1.0)
+    criterion = trainer.make_criterion(cfg, device)
+    dataset = TinyDataset(cfg={"test_samples": 9})
+    # Equal training steps, distinct class proportions, short final group.
+    local_indices = ([0, 3, 6, 1, 2], [1, 2, 4, 5, 7])
+    loader = torch.utils.data.DataLoader(torch.utils.data.Subset(dataset, local_indices[rank]), batch_size=2)
+    model = trainer.wrap_distributed(TinyModel(), device)
+    reference = copy.deepcopy(trainer.unwrap_model(model))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    expected_ce_sum, expected_ce_weight, expected_lovasz_sum = 0., 0., 0.
+    for group in ((0, 1), (2,)):
+        reference_optimizer.zero_grad()
+        for step in group:
+            local = [batch(dataset, ids[step * 2:step * 2 + 2]) for ids in local_indices]
+            all_inputs = [torch.cat([values[column] for values in local]) for column in range(4)]
+            x, valid, dt, y = all_inputs
+            logits = reference(x, valid, dt)
+            ce = torch.nn.functional.cross_entropy(logits, y, weight=criterion.weight, ignore_index=-1)
+            ce_weight = criterion.weight[y[y != -1]].sum().item()
+            lovasz = torch.stack([criterion.lovasz(part, values[3])
+                                  for part, values in zip(logits.split([v[0].shape[0] for v in local]), local)]).mean()
+            expected_ce_sum += ce.item() * ce_weight
+            expected_ce_weight += ce_weight
+            expected_lovasz_sum += lovasz.item()
+            ((ce + lovasz) / len(group)).backward()
+        reference_optimizer.step()
+    result = trainer.run_phase(model, loader, criterion, device, optimizer,
+                               torch.amp.GradScaler("cuda", enabled=False), accumulation=2, clip=0)
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert abs(result["loss_ce"] - expected_ce_sum / expected_ce_weight) < 1e-6
+    assert abs(result["loss_lovasz"] - expected_lovasz_sum / 3) < 1e-6
+    assert abs(result["loss_total"] - result["loss_ce"] - result["loss_lovasz"]) < 1e-6
+    # Uneven validation, including a rank with no batches; no per-step collectives.
+    val_indices = ([0, 1, 2], [3, 4])
+    val_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(dataset, val_indices[rank]), batch_size=2)
+    expected_ce_sum, expected_ce_weight, local_lovasz = 0., 0., []
+    with torch.no_grad():
+        for ids in val_indices:
+            for start in range(0, len(ids), 2):
+                x, valid, dt, y = batch(dataset, ids[start:start + 2])
+                parts = criterion.components(reference(x, valid, dt), y)
+                weight = criterion.weight[y[y != -1]].sum().item()
+                expected_ce_sum += parts["loss_ce"].item() * weight
+                expected_ce_weight += weight
+                local_lovasz.append(parts["loss_lovasz"].item())
+    result = trainer.run_phase(model, val_loader, criterion, device)
+    assert abs(result["loss_ce"] - expected_ce_sum / expected_ce_weight) < 1e-6
+    assert abs(result["loss_lovasz"] - sum(local_lovasz) / len(local_lovasz)) < 1e-6
+    empty_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(dataset, [0] if rank == 0 else []))
+    assert trainer.run_phase(model, empty_loader, criterion, device)["samples"] == 1
+
+
 def distributed_worker(rank, directory):
     torch.set_num_threads(1)
     directory = Path(directory)
@@ -59,6 +117,7 @@ def distributed_worker(rank, directory):
     try:
         device = torch.device("cpu")
         _, cfg = trainer.read_config(ROOT / "src/configs/mos_semanticKitti_temporal_e2e_intensity.yaml")
+        combined_distributed_check(rank, cfg, device)
         cfg["test_samples"] = 5
         with patch.object(trainer, "make_sequences", return_value=[]), \
              patch.object(trainer, "select_sequences", return_value=[]), \
@@ -106,6 +165,8 @@ def distributed_worker(rank, directory):
             # Exercise accumulation (including a short final group), two epochs,
             # CLI overrides, single-writer output, and reloadable raw checkpoints.
             cfg["test_samples"] = 9
+            cfg["mos_train_params"]["loss"] = dict(type="ce_lovasz", lovasz_weight=1.0,
+                                                  lovasz_classes="present", lovasz_per_image=False)
             cfg["mos_train_params"].update(epochs=7, batch_size=8, num_workers=0, gradient_accumulation=2)
             cfg["mos_log_params"].update(log_root=str(directory / "runs"), use_tensorboard=False)
             config_path = directory / "config.yaml"
@@ -123,18 +184,26 @@ def distributed_worker(rank, directory):
                 run = runs[0]
                 checkpoint = torch.load(run / "checkpoints/last.pt", weights_only=False)
                 assert checkpoint["epoch"] == 2
+                assert checkpoint["config"]["mos_train_params"]["loss"]["type"] == "ce_lovasz"
                 TinyModel().load_state_dict(checkpoint["model_state_dict"], strict=True)
                 resolved = yaml.safe_load((run / "config.yaml").read_text())
                 assert resolved["mos_train_params"]["batch_size"] == 2
                 assert resolved["mos_train_params"]["epochs"] == 2
                 assert resolved["run_metadata"]["effective_global_batch_size"] == 8
                 with (run / "csv/epochs.csv").open() as handle:
-                    assert len(list(csv.DictReader(handle))) == 2
+                    rows = list(csv.DictReader(handle))
+                    assert len(rows) == 2
+                    for row in rows:
+                        for phase in ("train", "val"):
+                            assert abs(float(row[f"{phase}_loss_total"]) - float(row[f"{phase}_loss_ce"])
+                                       - float(row[f"{phase}_loss_lovasz"])) < 1e-6
                 assert (run / "checkpoints/best_moving_iou.pt").is_file()
 
         # The real temporal attention model must participate in two DDP backwards
         # without unused-parameter/reducer failures (both temporal input lengths).
         real_model = trainer.wrap_distributed(trainer.build_mos_model(cfg).to(device), device)
+        cfg["mos_train_params"]["loss"] = dict(type="ce_lovasz")
+        criterion = trainer.make_criterion(cfg, device)
         for frames in (2, 3):
             real_model.zero_grad(set_to_none=True)
             x = torch.randn(1, frames, 5, 16, 32)

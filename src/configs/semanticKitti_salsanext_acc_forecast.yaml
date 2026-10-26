@@ -1,4 +1,4 @@
-dataset_path: /home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences
+dataset_path: /hpc/SemanticKitti/dataset/sequences
 residual_params: {
   enabled: true,
   mode: "precompute",

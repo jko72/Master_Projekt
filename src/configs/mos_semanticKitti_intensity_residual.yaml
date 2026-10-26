@@ -1,4 +1,4 @@
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+dataset_path: "/hpc/SemanticKitti/dataset/sequences"
 
 model_params:
   grid_height: 64
@@ -41,12 +41,12 @@ mos_model_params:
   norm: "batch"
 
 mos_train_params:
-  batch_size: 16
+  batch_size: 8
   num_workers: 6
-  epochs: 50
+  epochs: 100
 
   learning_rate: 0.0005
-  encoder_learning_rate: 0.00005
+  encoder_learning_rate: null
   freeze_encoder_epochs: 0
 
   weight_decay: 0.0001
@@ -58,7 +58,7 @@ mos_train_params:
   optimizer: "adamw"
   scheduler: "cosine"
   learning_rate_min: 0.000005
-  encoder_learning_rate_min: 0.0000005
+  encoder_learning_rate_min: null
   scheduler_monitor: "val_moving_iou"
   scheduler_mode: "max"
   scheduler_factor: 0.5
@@ -82,8 +82,8 @@ mos_train_params:
   pretrained_encoder_init_new_channels: "zero"
 
 mos_log_params:
-  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
-  run_name: "MOS_semanticKitti_xyzri_residual_12345_scratch"
+  log_root: "/hpc/logs/mos"
+  run_name: "MOS_Baseline_XYZRI_Residual12345_Scratch_100Ep"
   use_tensorboard: true
 
   save_checkpoints: true

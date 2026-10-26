@@ -1,7 +1,7 @@
 # Temporal MOS scratch control with the same architecture and data split.
 # Encoder and decoder/head use the same learning-rate schedule.
 
-dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
+dataset_path: "/hpc/SemanticKitti/dataset/sequences"
 model_params:
   grid_height: 64
   grid_width: 512
@@ -54,7 +54,7 @@ mos_train_params:
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true  # drop the fifth intensity filter
 mos_log_params:
-  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
+  log_root: "/hpc/logs/mos"
   run_name: "MOS_TMAE_scratch_lr5e4"
   use_tensorboard: true
   save_checkpoints: true

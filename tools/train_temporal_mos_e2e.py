@@ -30,6 +30,7 @@ from helper.mos_eval_utils import add_counts, compute_counts_from_pred_target, e
 from mos_models import build_mos_model
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
 from helper.mos_input import channel_count, normalization
+from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
 
 
 def distributed():
@@ -89,6 +90,16 @@ def sync_buffers(model):
             dist.broadcast(buffer, src=0)
 
 
+def nonfinite_model_state(model):
+    """Return non-finite parameter and buffer names for phase diagnostics."""
+    raw_model = unwrap_model(model)
+    bad_parameters = [name for name, param in raw_model.named_parameters()
+                      if not torch.isfinite(param).all()]
+    bad_buffers = [name for name, buffer in raw_model.named_buffers()
+                   if not torch.isfinite(buffer).all()]
+    return bad_parameters, bad_buffers
+
+
 def read_config(path):
     path = Path(path)
     if not path.exists():
@@ -113,6 +124,7 @@ def read_config(path):
         raise ValueError("This path supports AdamW")
     if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() != "cosine":
         raise ValueError("This path supports cosine scheduling")
+    cfg["mos_train_params"]["loss"] = loss_settings(cfg["mos_train_params"].get("loss"))
     return path.resolve(), cfg
 
 
@@ -157,6 +169,10 @@ def make_criterion(cfg, device):
     train = cfg["mos_train_params"]
     weights = torch.tensor([train["static_class_weight"], train["moving_class_weight"]],
                            dtype=torch.float32, device=device)
+    settings = loss_settings(train.get("loss"))
+    if settings["type"] == "ce_lovasz":
+        return MOSCrossEntropyLovasz(weights, settings["lovasz_weight"],
+                                    settings["lovasz_classes"], settings["lovasz_per_image"])
     return torch.nn.CrossEntropyLoss(weight=weights, ignore_index=-1)
 
 
@@ -172,15 +188,31 @@ def amp_settings(cfg, device):
 
 
 def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
-              accumulation=1, amp=False, amp_dtype=torch.bfloat16, clip=5.0, max_batches=None):
+              accumulation=1, amp=False, amp_dtype=torch.bfloat16, clip=5.0, max_batches=None,
+              diagnose_validation=False):
     training = optimizer is not None
+    if diagnose_validation and not training:
+        print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+              "entering model.eval", flush=True)
     model.train(training)
     if not training:
+        if diagnose_validation:
+            print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+                  "synchronizing buffers", flush=True)
         sync_buffers(model)
+        if diagnose_validation:
+            bad_parameters, bad_buffers = nonfinite_model_state(model)
+            print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+                  f"buffers synchronized; nonfinite_parameters={bad_parameters[:10]} "
+                  f"nonfinite_buffers={bad_buffers[:10]}", flush=True)
+            if bad_parameters or bad_buffers:
+                raise FloatingPointError("Non-finite model state before validation")
     forward_model = model if training else unwrap_model(model)
     counts = empty_counts()
     total_loss = 0.0
     total_loss_weight = 0.0
+    total_lovasz = 0.0
+    loss_batches = 0
     samples = 0
     total_seconds = 0.0
     limit = min(len(loader), max_batches) if max_batches else len(loader)
@@ -188,9 +220,16 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         optimizer.zero_grad(set_to_none=True)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    for index, (x, valid, dt, y, _meta) in enumerate(loader):
-        if index >= limit:
-            break
+    iterator = iter(loader)
+    for index in range(limit):
+        if diagnose_validation and not training and index == 0:
+            print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+                  "fetching first validation batch", flush=True)
+        x, valid, dt, y, _meta = next(iterator)
+        if diagnose_validation and not training and index == 0:
+            sample_ids = list(zip(_meta["seq_id"], _meta["frame_stem"]))
+            print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+                  f"first validation batch loaded: samples={sample_ids}", flush=True)
         x = x.to(device, non_blocking=True)
         valid = valid.to(device, non_blocking=True)
         dt = dt.to(device, non_blocking=True)
@@ -206,7 +245,13 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=amp and device.type == "cuda"):
                 logits = forward_model(x, valid, dt)
-                loss = criterion(logits, y)
+                components = loss_components(criterion, logits, y)
+                loss_ce, loss_lovasz = components["loss_ce"], components["loss_lovasz"]
+                loss = components["loss_total"]
+            if diagnose_validation and not training and index == 0:
+                print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
+                      f"first validation forward complete: logits_finite={bool(torch.isfinite(logits).all())} "
+                    f"loss_finite={bool(torch.isfinite(loss))}", flush=True)
             if not torch.isfinite(loss):
                 bad_parameters = [name for name, param in model.named_parameters()
                                   if not torch.isfinite(param).all()]
@@ -222,11 +267,15 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
                 # CrossEntropyLoss(weight=...) divides by the local sum of class weights.
                 # Correct DDP's rank average to match a single global weighted batch.
                 loss_weight = criterion.weight[y[y != -1]].sum() if criterion.weight is not None else (y != -1).sum()
-                backward_loss = loss
+                backward_loss = loss_ce
                 if distributed():
                     global_weight = loss_weight.detach().clone()
                     dist.all_reduce(global_weight)
-                    backward_loss = loss * loss_weight * dist.get_world_size() / global_weight
+                    backward_loss = loss_ce * loss_weight * dist.get_world_size() / global_weight
+                # DDP already averages rank gradients. Lovasz is local and
+                # nonadditive: never apply CE's weight correction to it.
+                if isinstance(criterion, MOSCrossEntropyLovasz):
+                    backward_loss = backward_loss + criterion.lovasz_weight * loss_lovasz
                 group_size = min(accumulation, limit - (index // accumulation) * accumulation)
                 scaler.scale(backward_loss / group_size).backward()
                 if sync_step:
@@ -243,27 +292,38 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         total_seconds += time.perf_counter() - start
         n = x.shape[0]
         weight = float(criterion.weight[y[y != -1]].sum()) if criterion.weight is not None else int((y != -1).sum())
-        total_loss += float(loss.detach()) * weight
+        total_loss += float(loss_ce.detach()) * weight
         total_loss_weight += weight
+        total_lovasz += float(loss_lovasz.detach())
+        loss_batches += 1
         samples += n
         add_counts(counts, compute_counts_from_pred_target(logits.detach().argmax(1), y))
         if primary() and (index == 0 or (index + 1) % 20 == 0 or index + 1 == limit):
-            print(f"{'train' if training else 'val'} {index + 1}/{limit} loss={total_loss / total_loss_weight:.5f}", flush=True)
+            running_ce = total_loss / total_loss_weight
+            running_lovasz = total_lovasz / loss_batches
+            running_total = running_ce + getattr(criterion, "lovasz_weight", 0.0) * running_lovasz
+            print(f"{'train' if training else 'val'} {index + 1}/{limit} "
+                  f"loss={running_total:.5f} ce={running_ce:.5f} lovasz={running_lovasz:.5f}", flush=True)
     peak_vram = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     if distributed():
         keys = list(counts)
-        totals = torch.tensor([total_loss, total_loss_weight, samples, *[counts[k] for k in keys]],
+        totals = torch.tensor([total_loss, total_loss_weight, samples, total_lovasz, loss_batches, *[counts[k] for k in keys]],
                               dtype=torch.float64, device=device)
         dist.all_reduce(totals)
         total_loss, total_loss_weight, samples = totals[:3].tolist()
-        counts = {key: int(value) for key, value in zip(keys, totals[3:].tolist())}
+        total_lovasz, loss_batches = totals[3:5].tolist()
+        counts = {key: int(value) for key, value in zip(keys, totals[5:].tolist())}
         maxima = torch.tensor([total_seconds, peak_vram], dtype=torch.float64, device=device)
         dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
         total_seconds, peak_vram = maxima.tolist()
         samples = int(samples)
     if samples == 0:
         raise ValueError("DataLoader produced no batches")
-    result = {"loss": total_loss / total_loss_weight, **metrics_from_counts(counts),
+    mean_ce = total_loss / total_loss_weight
+    mean_lovasz = total_lovasz / loss_batches
+    mean_total = mean_ce + getattr(criterion, "lovasz_weight", 0.0) * mean_lovasz
+    result = {"loss": mean_total, "loss_ce": mean_ce, "loss_lovasz": mean_lovasz,
+              "loss_total": mean_total, **metrics_from_counts(counts),
               "samples": samples,
               ("step_seconds_per_sample" if training else "inference_seconds_per_sample"): total_seconds / samples,
               "peak_vram_bytes": int(peak_vram)}
@@ -368,6 +428,8 @@ def main():
     parser.add_argument("--num_workers", type=int, help="DataLoader workers per GPU/process")
     parser.add_argument("--max_batches", type=int, help="Limit train and val batches for a smoke run")
     parser.add_argument("--dry-run", action="store_true", help="One synthetic forward/backward, no dataset or logs")
+    parser.add_argument("--diagnose-validation", action="store_true",
+                        help="Log the transition to validation and the first validation forward pass")
     args = parser.parse_args()
     print(f"[startup] torch={torch.__version__} rank={os.environ.get('RANK', '0')} "
           f"world_size={os.environ.get('WORLD_SIZE', '1')} device={args.device}", flush=True)
@@ -448,7 +510,8 @@ def train(args, device):
                           accumulation, amp_enabled, amp_dtype,
                           float(train_cfg.get("clip_grad_norm", 5.0)), args.max_batches)
         val = run_phase(model, val_loader, criterion, device, max_batches=args.max_batches,
-                        amp=amp_enabled, amp_dtype=amp_dtype)
+                        amp=amp_enabled, amp_dtype=amp_dtype,
+                        diagnose_validation=getattr(args, "diagnose_validation", False))
         trained_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
         if not primary():
