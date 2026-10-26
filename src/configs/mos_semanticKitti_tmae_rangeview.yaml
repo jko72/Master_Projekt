@@ -1,7 +1,7 @@
 # Temporal MOS fine-tuning from semanticKitti_tmae_rangeview.yaml.
 # Set pretrained_backbone_path to the T-MAE best checkpoint before training.
 
-dataset_path: "/hpc/SemanticKitti/dataset/sequences"
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
 model_params:
   grid_height: 64
   grid_width: 512
@@ -54,7 +54,7 @@ mos_train_params:
   pretrained_encoder_strict: true
   pretrained_encoder_adapt_input_channels: true  # drop the fifth intensity filter
 mos_log_params:
-  log_root: "/hpc/logs/mos"
+  log_root: "/home/devuser/workspace/LidarGaussianVideoView/mos_logs"
   run_name: "MOS_semanticKitti_tmae_rangeview"
   use_tensorboard: true
   save_checkpoints: true

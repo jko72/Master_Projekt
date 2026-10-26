@@ -1,7 +1,7 @@
 # Single-frame MAE control for the 2D T-MAE experiment.
 # Both SiamWCA branches receive the same masked current scan, so neither branch sees hidden targets.
 
-dataset_path: "/hpc/SemanticKitti/dataset/sequences"
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
 
 model_params:
   name: "salsanext_temporal_mae"

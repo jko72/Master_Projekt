@@ -2,7 +2,7 @@
 # Previous scan is ego-motion aligned and complete; current scan is 75% masked.
 # Train: python src/train_temporal_mae.py --cfg_path configs/semanticKitti_tmae_rangeview.yaml
 
-dataset_path: "/hpc/SemanticKitti/dataset/sequences"
+dataset_path: "/home/devuser/workspace/data/datasets/SemanticKitti/dataset/sequences"
 
 model_params:
   name: "salsanext_temporal_mae"
