@@ -217,6 +217,54 @@ def save_csv(path, rows):
         writer.writerows(rows)
 
 
+SWEEP_THRESHOLDS = tuple([round(value * 0.05, 2) for value in range(1, 20)] + [0.975, 0.99])
+
+
+def moving_prediction_from_probability(moving_probability_hw, threshold: float):
+    """Convert moving probabilities to binary labels; ties stay static like argmax."""
+    probability = np.asarray(moving_probability_hw)
+    if probability.ndim != 2 or not np.isfinite(probability).all():
+        raise ValueError("Moving probability must be a finite [H,W] array")
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Moving threshold must be finite and within [0, 1]")
+    return (probability > threshold).astype(np.uint8)
+
+
+def moving_probability_from_logits(logits: torch.Tensor):
+    """Return [H,W] moving probabilities from a single two-class model inference."""
+    if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 2:
+        raise ValueError("Expected logits shaped [1,2,H,W]")
+    return torch.softmax(logits, dim=1)[0, 1].cpu().numpy()
+
+
+def threshold_sweep_rows(point_by_threshold, pixel_by_threshold):
+    """Produce aggregate rows using the established point and pixel metric helpers."""
+    rows = []
+    for threshold in SWEEP_THRESHOLDS:
+        point = point_by_threshold[threshold]
+        pixel = pixel_by_threshold[threshold]
+        point_row = point_metrics(point)
+        pixel_row = metrics_from_counts(pixel)
+        rows.append({
+            "threshold": threshold,
+            "point_tp_moving": point["tp_moving"], "point_fp_moving": point["fp_moving"],
+            "point_fn_moving": point["fn_moving"], "point_tn_static": point["tn_static"],
+            "point_n_gt_valid": point["n_gt_valid"], **point_row,
+            "pixel_tp_moving": pixel["tp_moving"], "pixel_fp_moving": pixel["fp_moving"],
+            "pixel_fn_moving": pixel["fn_moving"], "pixel_tn_static": pixel["tn_static"],
+            "pixel_valid_pixels": pixel["valid_pixels"],
+            **{f"pixel_{key}": value for key, value in pixel_row.items()},
+        })
+    return rows
+
+
+def select_best_threshold(rows):
+    """Maximize point moving IoU; resolve exact ties by proximity to 0.5."""
+    if not rows:
+        raise ValueError("No threshold rows to select from")
+    return max(rows, key=lambda row: (row["point_moving_iou"], -abs(row["threshold"] - 0.5)))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -225,6 +273,10 @@ def main(argv=None):
     parser.add_argument("--mode", choices=["pixel", "point", "both"], default="point")
     parser.add_argument("--export-predictions", action="store_true")
     parser.add_argument("--submission-zip", action="store_true")
+    parser.add_argument("--moving-threshold", type=float, default=0.5,
+                        help="Moving-class probability threshold (default: 0.5)")
+    parser.add_argument("--threshold-sweep", action="store_true",
+                        help="Evaluate fixed moving thresholds on validation sequence 08")
     parser.add_argument("--postprocess", choices=("direct", "knn"), default="direct",
                         help="Point-level range-view unprojection method")
     parser.add_argument("--knn-k", type=int, default=5, help="LMNet KNN neighbors")
@@ -248,6 +300,17 @@ def main(argv=None):
         parser.error("--submission-zip requires export and all test sequences 11..21")
     if args.max_frames is not None and (args.max_frames < 1 or args.export_predictions):
         parser.error("--max-frames must be positive and cannot be used with export")
+    if not np.isfinite(args.moving_threshold) or not 0.0 <= args.moving_threshold <= 1.0:
+        parser.error("--moving-threshold must be finite and within [0, 1]")
+    if args.threshold_sweep:
+        if ids != ["08"]:
+            parser.error("--threshold-sweep is restricted to validation sequence 08")
+        if args.mode != "both":
+            parser.error("--threshold-sweep requires --mode both for pixel and point metrics")
+        if args.postprocess != "direct":
+            parser.error("--threshold-sweep currently supports only --postprocess direct")
+        if args.export_predictions or args.submission_zip:
+            parser.error("--threshold-sweep does not export predictions or submissions")
     if args.knn_k < 1 or args.knn_search < 1 or args.knn_search % 2 != 1:
         parser.error("--knn-k must be positive and --knn-search must be positive and odd")
     if args.knn_k > args.knn_search * args.knn_search:
@@ -286,6 +349,8 @@ def main(argv=None):
         raise FileExistsError(f"Output directory already exists: {args.output_dir}")
     args.output_dir.mkdir(parents=True)
     totals, pixel_total, per_seq, seq_summary, coverage, pixel_rows = {}, empty_counts(), [], [], [], []
+    sweep_point = {threshold: {} for threshold in SWEEP_THRESHOLDS} if args.threshold_sweep else None
+    sweep_pixel = {threshold: empty_counts() for threshold in SWEEP_THRESHOLDS} if args.threshold_sweep else None
     total_scans = 0
     point_postprocess_seconds = 0.0
     with torch.inference_mode():
@@ -317,7 +382,10 @@ def main(argv=None):
                 logits = model(*(part.to(device) for part in inputs))
                 if logits.shape != (1, 2, projection.height, projection.width):
                     raise ValueError(f"Unexpected model output shape: {tuple(logits.shape)}")
-                pred_hw = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
+                # Softmax is computed once. A threshold of 0.5 with strict
+                # comparison is equivalent to two-class argmax, including ties.
+                moving_probability = moving_probability_from_logits(logits)
+                pred_hw = moving_prediction_from_probability(moving_probability, args.moving_threshold)
                 points = read_scan(scan)
                 postprocess_start = time.perf_counter()
                 if args.postprocess == "knn":
@@ -335,20 +403,33 @@ def main(argv=None):
                     "coverage_rate": float(valid.mean()) if len(valid) else 0.0,
                     "postprocess_seconds": postprocess_seconds})
                 gt_path = root / seq / "labels" / f"{scan.stem}.label"
-                if args.mode in {"point", "both"} and gt_path.is_file():
-                    add_counts(seq_counts, point_counts(pred, read_point_gt(gt_path, len(points))))
+                point_target = read_point_gt(gt_path, len(points)) if gt_path.is_file() else None
+                if args.mode in {"point", "both"} and point_target is not None:
+                    add_counts(seq_counts, point_counts(pred, point_target))
                     seq_counts["n_points"] = seq_counts.get("n_points", 0) + len(points)
                     seq_counts["fallback_points"] = seq_counts.get("fallback_points", 0) + int((~valid).sum())
+                pixel_target = None
                 if args.mode in {"pixel", "both"}:
-                    label = np.load(root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{scan.stem}.npy")
-                    if label.shape != pred_hw.shape or not np.isin(label, [-1, 0, 1]).all():
+                    pixel_target = np.load(root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{scan.stem}.npy")
+                    if pixel_target.shape != pred_hw.shape or not np.isin(pixel_target, [-1, 0, 1]).all():
                         raise ValueError(f"Invalid pixel GT: {seq}/{scan.stem}")
                     if e2e:
-                        label = label.copy()
-                        label[~inputs[1][0, -1].numpy()] = -1
-                    counts = compute_counts_from_pred_target(torch.from_numpy(pred_hw), torch.from_numpy(label))
+                        pixel_target = pixel_target.copy()
+                        pixel_target[~inputs[1][0, -1].numpy()] = -1
+                    counts = compute_counts_from_pred_target(torch.from_numpy(pred_hw), torch.from_numpy(pixel_target))
                     for key in seq_pixel:
                         seq_pixel[key] += counts[key]
+                if args.threshold_sweep:
+                    # No second model pass: each candidate uses these already computed probabilities.
+                    for threshold in SWEEP_THRESHOLDS:
+                        threshold_hw = moving_prediction_from_probability(moving_probability, threshold)
+                        threshold_point, _ = unproject_prediction(threshold_hw, points, projection)
+                        add_counts(sweep_point[threshold], point_counts(threshold_point, point_target))
+                        threshold_counts = compute_counts_from_pred_target(
+                            torch.from_numpy(threshold_hw), torch.from_numpy(pixel_target),
+                        )
+                        for key in sweep_pixel[threshold]:
+                            sweep_pixel[threshold][key] += threshold_counts[key]
                 if args.export_predictions:
                     dest = args.output_dir / "predictions" / "sequences" / seq / "predictions" / f"{scan.stem}.label"
                     write_prediction(dest, pred)
@@ -390,6 +471,28 @@ def main(argv=None):
         save_csv(args.output_dir / "pixel_metrics.csv", pixel_rows)
     save_csv(args.output_dir / "projection_coverage.csv", coverage)
     save_csv(args.output_dir / "sequence_summary.csv", seq_summary)
+    sweep_rows, best_threshold = None, None
+    if args.threshold_sweep:
+        sweep_rows = threshold_sweep_rows(sweep_point, sweep_pixel)
+        best_threshold = select_best_threshold(sweep_rows)
+        at_half = next(row for row in sweep_rows if row["threshold"] == 0.5)
+        best_yaml = {
+            "selection_sequence": "08",
+            "selection_metric": "point_moving_iou",
+            "tie_break": "closest_to_0.5",
+            "best_threshold": best_threshold["threshold"],
+            "best": best_threshold,
+            "threshold_0.5": at_half,
+            "improvement_vs_0.5": {
+                "point_moving_iou": best_threshold["point_moving_iou"] - at_half["point_moving_iou"],
+                "pixel_moving_iou": best_threshold["pixel_moving_iou"] - at_half["pixel_moving_iou"],
+            },
+        }
+        save_csv(args.output_dir / "threshold_sweep.csv", sweep_rows)
+        with (args.output_dir / "threshold_best.yaml").open("x", encoding="utf-8") as handle:
+            yaml.safe_dump(best_yaml, handle, sort_keys=False)
+        print(f"best_threshold={best_threshold['threshold']:.3f} "
+              f"point_moving_iou={best_threshold['point_moving_iou']:.9f}")
     git_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     metadata = {"checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": payload.get("epoch"),
         "checkpoint_train_sequences": cfg["mos_data_params"].get("train_sequences"),
@@ -397,6 +500,13 @@ def main(argv=None):
         "dataset_root": str(root), "model": name, "input_mode": input_mode,
         "channel_names": (["x", "y", "z", "range", "intensity"] if "intensity" in input_mode else None),
         "normalization": normalization(cfg, input_mode),
+        "moving_threshold": args.moving_threshold,
+        "threshold_sweep": ({"enabled": True, "selection_sequence": "08",
+            "thresholds": list(SWEEP_THRESHOLDS), "selection_metric": "point_moving_iou",
+            "tie_break": "closest_to_0.5", "best_threshold": best_threshold["threshold"],
+            "improvement_vs_0.5": best_threshold["point_moving_iou"] - next(
+                row["point_moving_iou"] for row in sweep_rows if row["threshold"] == 0.5)}
+            if args.threshold_sweep else {"enabled": False}),
         "projection": vars(projection), "history_init": args.history_init if temporal else None,
         "pose_source": "poses.txt + calib.txt (LiDAR frame)" if temporal else None,
         "gt_mapping": "PRBonn semantic-kitti-mos learning_map (local mos_label_helper)",

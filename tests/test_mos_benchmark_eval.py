@@ -17,7 +17,10 @@ from helper.mos_benchmark_eval import (add_counts, point_counts, point_metrics,
 from helper.mos_knn_postprocess import knn_unproject_prediction
 from helper.mos_point_projection import ProjectionConfig, original_points_to_pixels, unproject_prediction
 from utils_torch import spherical_projection
-from evaluate_mos_benchmark import frame_features, index_sequences, load_adapter, load_poses, main, single_frame_input, temporal_input
+from evaluate_mos_benchmark import (SWEEP_THRESHOLDS, frame_features, index_sequences,
+    load_adapter, load_poses, main, moving_prediction_from_probability,
+    moving_probability_from_logits, select_best_threshold, single_frame_input,
+    temporal_input, threshold_sweep_rows)
 from mos_dataset import MOSFrameDataset
 from mos_models import build_mos_model
 
@@ -208,6 +211,51 @@ class KNNPostprocessTests(unittest.TestCase):
             knn_unproject_prediction(pred, ranges[:, :-1], self.point, self.cfg)
 
 
+class ThresholdTests(unittest.TestCase):
+    def test_half_threshold_matches_binary_argmax_including_ties(self):
+        logits = torch.tensor([[[[2.0, -1.0, 0.0, 5.0]],
+                                [[1.0, 3.0, 0.0, -4.0]]]])
+        probability = moving_probability_from_logits(logits)
+        prediction = moving_prediction_from_probability(probability, 0.5)
+        expected = logits.argmax(1)[0].numpy().astype(np.uint8)
+        np.testing.assert_array_equal(prediction, expected)
+        self.assertEqual(int(prediction[0, 2]), 0)  # Equal logits: argmax chooses static.
+
+    def test_threshold_and_direct_point_unprojection(self):
+        cfg = ProjectionConfig(8, 16, 3, -25)
+        points = np.array([[5, 0, 0, 0], [0, 5, 0, 0]], dtype=np.float32)
+        rows, cols, valid = original_points_to_pixels(points, cfg)
+        probability = np.zeros((8, 16), dtype=np.float32)
+        probability[rows[0], cols[0]] = 0.7
+        probability[rows[1], cols[1]] = 0.3
+        point_pred, point_valid = unproject_prediction(
+            moving_prediction_from_probability(probability, 0.5), points, cfg,
+        )
+        np.testing.assert_array_equal(point_pred, [1, 0])
+        np.testing.assert_array_equal(point_valid, valid)
+        np.testing.assert_array_equal(moving_prediction_from_probability(probability, 0.7)[rows, cols], [0, 0])
+
+    def test_sweep_aggregation_ignores_labels_and_selects_tie_near_half(self):
+        point = {threshold: {
+            "tp_moving": 2, "fp_moving": 1, "fn_moving": 1,
+            "tn_static": 4, "n_gt_valid": 8,
+        } for threshold in SWEEP_THRESHOLDS}
+        pixel = {threshold: {
+            "tp_moving": 1, "fp_moving": 0, "fn_moving": 1,
+            "tn_static": 2, "correct": 3, "valid_pixels": 4,
+        } for threshold in SWEEP_THRESHOLDS}
+        rows = threshold_sweep_rows(point, pixel)
+        half = next(row for row in rows if row["threshold"] == 0.5)
+        self.assertEqual(half["point_n_gt_valid"], 8)
+        self.assertEqual(half["point_tp_moving"], 2)
+        self.assertAlmostEqual(half["point_moving_iou"], 0.5)
+        self.assertAlmostEqual(half["pixel_moving_iou"], 0.5)
+        tied = [{"threshold": 0.3, "point_moving_iou": 0.6},
+                {"threshold": 0.5, "point_moving_iou": 0.6},
+                {"threshold": 0.7, "point_moving_iou": 0.6}]
+        self.assertEqual(select_best_threshold(tied)["threshold"], 0.5)
+
+
 class BenchmarkTests(unittest.TestCase):
     def test_gt_mapping_and_global_iou(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -296,6 +344,42 @@ class BenchmarkTests(unittest.TestCase):
             cfg["mos_data_params"] = {"input_mode": "range_residual", "residual_offsets": [1]}
             with self.assertRaisesRegex(FileNotFoundError, "residual image missing"):
                 single_frame_input(scan, cfg, scan_dir.parent, scan.stem)
+
+    def test_threshold_sweep_writes_validation_artifacts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            seq = root / "dataset" / "sequences" / "08"
+            scan_dir = seq / "velodyne"
+            scan_dir.mkdir(parents=True)
+            points = np.array([[2, 0, 0, 1], [3, 1, 0, 1]], np.float32)
+            points.tofile(scan_dir / "000000.bin")
+            (seq / "labels").mkdir()
+            np.array([9, 251], dtype="<u4").tofile(seq / "labels" / "000000.label")
+            (seq / "mos_labels").mkdir()
+            pixel_gt = np.full((16, 32), -1, dtype=np.int8)
+            rows, cols, _ = original_points_to_pixels(points, ProjectionConfig(16, 32, 3, -25))
+            pixel_gt[rows[0], cols[0]], pixel_gt[rows[1], cols[1]] = 0, 1
+            np.save(seq / "mos_labels" / "000000.npy", pixel_gt)
+            cfg = {"model_params": {"grid_height": 16, "grid_width": 32, "FOV_UP": 3, "FOV_DOWN": -25},
+                   "mos_model_params": {"name": "unet_small", "in_channels": 4, "num_classes": 2,
+                                        "base_channels": 8},
+                   "mos_data_params": {"input_mode": "range_xyz", "train_sequences": ["00"]}}
+            checkpoint = root / "model.pt"
+            torch.save({"cfg": cfg, "model_state_dict": build_mos_model(cfg).state_dict()}, checkpoint)
+            output = root / "sweep"
+            main(["--checkpoint", str(checkpoint), "--dataset-root", str(root / "dataset"),
+                  "--sequences", "08", "--mode", "both", "--threshold-sweep",
+                  "--output-dir", str(output), "--device", "cpu"])
+            with (output / "threshold_sweep.csv").open(encoding="utf-8") as handle:
+                self.assertEqual(len(handle.readlines()), len(SWEEP_THRESHOLDS) + 1)
+            with (output / "threshold_best.yaml").open(encoding="utf-8") as handle:
+                best = yaml.safe_load(handle)
+            self.assertEqual(best["selection_sequence"], "08")
+            self.assertIn("point_moving_iou", best["improvement_vs_0.5"])
+            with (output / "benchmark_eval_config.yaml").open(encoding="utf-8") as handle:
+                metadata = yaml.safe_load(handle)
+            self.assertTrue(metadata["threshold_sweep"]["enabled"])
+            self.assertEqual(metadata["postprocessing"]["method"], "direct")
 
 
 if __name__ == "__main__":
