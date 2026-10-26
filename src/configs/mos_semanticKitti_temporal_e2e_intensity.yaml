@@ -11,7 +11,7 @@ model_params:
 mos_data_params:
   input_mode: range_xyz_intensity
   normalization: intensity_only
-  previous_offsets: [5, 2]
+  previous_offsets: [5, 1]
   scan_rate_hz: 10.0
   mos_label_folder: mos_labels
   ignore_index: -1
