@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from copy import deepcopy
 import sys
 import time
 from pathlib import Path
@@ -91,7 +92,10 @@ def main():
     model = build_mos_model(cfg)
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.to(device)
-    loader = make_loader(cfg, args.split, args.batch_size, args.num_workers, device)
+    # Evaluation also supports --split=train: never augment evaluation inputs.
+    eval_cfg = deepcopy(cfg)
+    eval_cfg["mos_augmentation"] = {"enabled": False}
+    loader = make_loader(eval_cfg, args.split, args.batch_size, args.num_workers, device)
     result = evaluate(model, loader, make_criterion(cfg, device), device, args.history_mode, args.max_batches)
     result = {"split": args.split, "history_mode": args.history_mode,
               "checkpoint": str(checkpoint.resolve()), "checkpoint_epoch": payload["epoch"],

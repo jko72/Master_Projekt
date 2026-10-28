@@ -30,6 +30,7 @@ from helper.mos_eval_utils import add_counts, compute_counts_from_pred_target, e
 from mos_models import build_mos_model
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
 from helper.mos_input import channel_count, normalization
+from helper.mos_augmentation import augmentation_settings
 from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
 
 
@@ -120,6 +121,7 @@ def read_config(path):
         raise ValueError(f"mos_model_params.in_channels must be {expected} for {mode}")
     cfg["mos_model_params"]["in_channels"] = expected
     normalization(cfg, mode)
+    cfg["mos_augmentation"] = augmentation_settings(cfg.get("mos_augmentation"), mode)
     if str(cfg["mos_train_params"].get("optimizer", "adamw")).lower() != "adamw":
         raise ValueError("This path supports AdamW")
     if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() != "cosine":

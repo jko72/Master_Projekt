@@ -7,6 +7,7 @@ import torch
 
 from helper.residual_helper import transform_points
 from helper.mos_input import normalization, normalize_feature_tensor
+from helper.mos_augmentation import augmentation_settings, TemporalMOSAugmentation
 from mos_dataset import MOSFrameDataset
 from temporal_mae_dataset import project_range_features
 
@@ -32,6 +33,8 @@ class TemporalMOSE2EDataset(MOSFrameDataset):
         self.temporal_input_mode = data.get("input_mode", "range_xyz")
         if self.temporal_input_mode not in {"range_xyz", "range_xyz_intensity"}:
             raise ValueError("Temporal E2E input_mode must be range_xyz or range_xyz_intensity")
+        self.augmentation = TemporalMOSAugmentation(
+            augmentation_settings(cfg.get("mos_augmentation"), self.temporal_input_mode), split)
         super().__init__(sequences, cfg, split=split, input_mode=self.temporal_input_mode,
                          residual_offsets=(), mos_label_folder=data.get("mos_label_folder", "mos_labels"),
                          **kwargs)
@@ -73,7 +76,7 @@ class TemporalMOSE2EDataset(MOSFrameDataset):
             path = self._extract_scan_path(seq["paths"][past_i])
             points = self._read_points(path)
             transform = np.linalg.solve(current_pose, self._pose(seq, past_i))
-            scans.append(transform_points(points, transform))
+            scans.append(self.augmentation.drop_history(transform_points(points, transform)))
             paths.append(path)
         scans.append(self._read_points(sample["scan_path"]))
         paths.append(sample["scan_path"])
@@ -81,12 +84,13 @@ class TemporalMOSE2EDataset(MOSFrameDataset):
             points, self.H, self.W, self.theta_range, self.min_range,
             self.max_range, include_intensity="intensity" in self.temporal_input_mode, explicit_occupancy=True,
         ) for points in scans))
+        y = torch.from_numpy(self._load_mos_label(sample["mos_label_path"]).astype(np.int64))
+        features, masks, y = self.augmentation.range_views(features, masks, y)
         spec = normalization(self.cfg, self.temporal_input_mode)
         x = torch.stack([normalize_feature_tensor(feature, mask, spec)
                          for feature, mask in zip(features, masks)])
         valid = torch.stack(masks)[:, 0].bool()
         dt = torch.tensor([-off / self.scan_rate_hz for off in self.offsets] + [0.0], dtype=torch.float32)
-        y = torch.from_numpy(self._load_mos_label(sample["mos_label_path"]).astype(np.int64))
         y = y.masked_fill(~valid[-1], -1)
         if not torch.isfinite(x).all():
             raise ValueError(f"Non-finite projection at {sample['scan_path']}")
