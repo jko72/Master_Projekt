@@ -5,6 +5,7 @@ import argparse
 import csv
 import copy
 import datetime as dt
+from datetime import timedelta
 import math
 import os
 import random
@@ -13,8 +14,10 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import yaml
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -26,6 +29,84 @@ from helper.dataloader_helper import make_sequences
 from mos_dataset import MOSFrameDataset, TemporalMOSDataset
 from mos_models import build_mos_model
 from helper.mos_input import channel_count, normalization
+from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
+
+
+def distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def primary():
+    return not distributed() or dist.get_rank() == 0
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+
+def setup_device(requested):
+    device = torch.device(requested)
+    if device.type == "cuda":
+        local_rank = int(os.environ.get("LOCAL_RANK", device.index or 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        torch.ones(1, device=device).add_(1)
+        torch.cuda.synchronize(device)
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        dist.init_process_group("nccl" if device.type == "cuda" else "gloo",
+                                timeout=timedelta(seconds=120))
+    return str(device)
+
+
+def make_criterion(cfg, device):
+    train = cfg["mos_train_params"]
+    weights = torch.tensor([train["static_class_weight"], train["moving_class_weight"]],
+                           dtype=torch.float32, device=device)
+    settings = loss_settings(train.get("loss"))
+    ignore_index = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
+    if settings["type"] == "ce_lovasz":
+        if ignore_index != -1:
+            raise ValueError("CE + Lovasz requires ignore_index=-1")
+        return MOSCrossEntropyLovasz(weights, settings["lovasz_weight"],
+                                    settings["lovasz_classes"], settings["lovasz_per_image"])
+    return torch.nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+
+
+def amp_settings(cfg, device):
+    params = cfg.get("mos_train_params", {})
+    enabled = bool(params.get("amp", False)) and torch.device(device).type == "cuda"
+    name = str(params.get("amp_dtype", "float16")).lower()
+    if name not in {"float16", "bfloat16"}:
+        raise ValueError("amp_dtype must be float16 or bfloat16")
+    if enabled and name == "bfloat16" and not torch.cuda.is_bf16_supported():
+        raise ValueError("GPU does not support bfloat16; use amp_dtype: float16")
+    return enabled, torch.float16 if name == "float16" else torch.bfloat16
+
+
+def make_grad_scaler(cfg, device):
+    enabled, dtype = amp_settings(cfg, device)
+    # A modest initial FP16 scale reduces startup overflows with weighted MOS.
+    return torch.amp.GradScaler("cuda", enabled=enabled and dtype == torch.float16,
+                                init_scale=128.0)
+
+
+def shard_validation(dataset):
+    # No padding: every validation frame contributes exactly once.
+    if distributed():
+        return Subset(dataset, range(dist.get_rank(), len(dataset), dist.get_world_size()))
+    return dataset
+
+
+def _smoke_sequences(sequences, limit):
+    result = []
+    for sequence in sequences:
+        if limit <= 0:
+            break
+        count = min(limit, len(sequence["paths"]))
+        result.append({**sequence, "paths": sequence["paths"][:count],
+                       "poses": sequence["poses"][:count]})
+        limit -= count
+    return result
 
 
 def parse_residual_offsets(value, *, allow_empty: bool = False) -> List[int]:
@@ -195,6 +276,8 @@ def build_moving_frame_sampler(dataset: MOSFrameDataset, moving_weight: float, s
 def _print_batch_progress(phase: str, epoch: int, total_epochs: int,
                           completed: int, total_batches: int, running_loss: float,
                           last_bucket: int) -> int:
+    if not primary():
+        return last_bucket
     percent = 100 * completed // total_batches
     filled = 20 * completed // total_batches
     bar = "#" * filled + "." * (20 - filled)
@@ -224,111 +307,138 @@ def train_one_epoch(
     freeze_encoder_bn_eval: bool = True,
     epoch_index: int = 1,
     total_epochs: int = 1,
+    scaler=None,
 ):
-    model.train()
-    if encoder_frozen and freeze_encoder_bn_eval:
-        if not hasattr(model, "encoder") or not isinstance(model.encoder, torch.nn.Module):
-            raise RuntimeError("Cannot keep frozen encoder in eval mode because model has no encoder module.")
-        model.encoder.eval()
-
-    clip_grad_norm = float(cfg.get("mos_train_params", {}).get("clip_grad_norm", 0.0))
-    ignore_index = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
-
-    loss_sum = 0.0
-    sample_count = 0
-    agg = {
-        "tp_moving": 0,
-        "fp_moving": 0,
-        "fn_moving": 0,
-        "tn_static": 0,
-        "correct": 0,
-        "valid_pixels": 0,
-    }
-
-    last_bucket = -1
-    total_batches = len(loader)
-    for batch_index, (x, y, _meta) in enumerate(loader, start=1):
-        x = x.to(device, non_blocking=device.startswith("cuda"))
-        y = y.to(device, non_blocking=device.startswith("cuda")).long()
-
-        logits = model(x)
-        loss = criterion(logits, y)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if clip_grad_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
-        optimizer.step()
-
-        bs = int(x.shape[0])
-        loss_sum += float(loss.item()) * bs
-        sample_count += bs
-
-        counts = compute_mos_counts(logits.detach(), y.detach(), ignore_index=ignore_index)
-        for k in agg:
-            agg[k] += int(counts[k])
-        last_bucket = _print_batch_progress(
-            "Training", epoch_index, total_epochs, batch_index, total_batches,
-            loss_sum / sample_count, last_bucket,
-        )
-
-    if sample_count == 0:
-        raise RuntimeError("Train loader produced zero samples.")
-    if sys.stdout.isatty():
-        print()
-
-    mean_loss = loss_sum / float(sample_count)
-    metrics = metrics_from_counts(agg)
-    return mean_loss, agg, metrics
+    return _run_epoch(model, loader, criterion, device, cfg, optimizer=optimizer,
+                      encoder_frozen=encoder_frozen, freeze_encoder_bn_eval=freeze_encoder_bn_eval,
+                      epoch_index=epoch_index, total_epochs=total_epochs, scaler=scaler)
 
 
 def validate_one_epoch(model, loader, criterion, device: str, cfg: Dict,
                        epoch_index: int = 1, total_epochs: int = 1):
-    model.eval()
+    return _run_epoch(model, loader, criterion, device, cfg,
+                      epoch_index=epoch_index, total_epochs=total_epochs)
 
-    ignore_index = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
 
-    loss_sum = 0.0
-    sample_count = 0
-    agg = {
-        "tp_moving": 0,
-        "fp_moving": 0,
-        "fn_moving": 0,
-        "tn_static": 0,
-        "correct": 0,
-        "valid_pixels": 0,
-    }
-
+def _run_epoch(model, loader, criterion, device, cfg, optimizer=None,
+               encoder_frozen=False, freeze_encoder_bn_eval=True,
+               epoch_index=1, total_epochs=1, scaler=None):
+    training = optimizer is not None
+    amp_enabled, amp_dtype = amp_settings(cfg, device)
+    if scaler is None:
+        scaler = make_grad_scaler(cfg, device)
+    model.train(training)
+    raw_model = unwrap_model(model)
+    if training and encoder_frozen and freeze_encoder_bn_eval:
+        if not hasattr(raw_model, "encoder"):
+            raise RuntimeError("Cannot freeze encoder BatchNorm: model has no encoder")
+        raw_model.encoder.eval()
+    # Unequal validation shards must not enter DDP forward collectives. Broadcast
+    # running BN statistics once, then evaluate each shard on the unwrapped model.
+    if not training and distributed():
+        for buffer in raw_model.buffers():
+            dist.broadcast(buffer, src=0)
+    forward_model = model if training else raw_model
+    ignore = int(cfg.get("mos_data_params", {}).get("ignore_index", -1))
+    clip = float(cfg.get("mos_train_params", {}).get("clip_grad_norm", 0.0))
+    agg = dict(tp_moving=0, fp_moving=0, fn_moving=0, tn_static=0, correct=0, valid_pixels=0)
+    ce_numerator = ce_denominator = lovasz_sum = legacy_sum = 0.0
+    sample_count = batch_count = optimizer_steps = skipped_steps = 0
+    peak_vram = 0
+    if torch.device(device).type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     last_bucket = -1
-    total_batches = len(loader)
-    with torch.no_grad():
-        for batch_index, (x, y, _meta) in enumerate(loader, start=1):
-            x = x.to(device, non_blocking=device.startswith("cuda"))
-            y = y.to(device, non_blocking=device.startswith("cuda")).long()
-
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            bs = int(x.shape[0])
-            loss_sum += float(loss.item()) * bs
-            sample_count += bs
-
-            counts = compute_mos_counts(logits, y, ignore_index=ignore_index)
-            for k in agg:
-                agg[k] += int(counts[k])
-            last_bucket = _print_batch_progress(
-                "Validierung", epoch_index, total_epochs, batch_index, total_batches,
-                loss_sum / sample_count, last_bucket,
-            )
-
-    if sample_count == 0:
-        raise RuntimeError("Validation loader produced zero samples.")
-    if sys.stdout.isatty():
+    for index, (x, y, _meta) in enumerate(loader, 1):
+        x = x.to(device, non_blocking=str(device).startswith("cuda"))
+        y = y.to(device, non_blocking=str(device).startswith("cuda")).long()
+        valid = y != ignore
+        with torch.set_grad_enabled(training):
+            with torch.autocast(device_type=torch.device(device).type, dtype=amp_dtype,
+                                enabled=amp_enabled):
+                logits = forward_model(x)
+                # Native weighted CE autocasts to FP32; Lovasz explicitly uses FP32.
+                if valid.any():
+                    parts = loss_components(criterion, logits, y)
+                else:
+                    zero = logits.float().reshape(-1)[:0].sum()
+                    parts = dict(loss_ce=zero, loss_lovasz=zero, loss_total=zero)
+            # Never cast the CE denominator to FP16: class-weight sums at full
+            # resolution readily exceed FP16's maximum finite value (65504).
+            denominator = (criterion.weight[y[valid]].float().sum() if criterion.weight is not None
+                           else valid.sum().float())
+            if training:
+                global_denominator = denominator.detach().clone()
+                finite = torch.isfinite(parts["loss_total"]).to(dtype=torch.int32)
+                if distributed():
+                    dist.all_reduce(global_denominator)
+                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                if not finite.item() or global_denominator.item() <= 0:
+                    raise FloatingPointError("Training batch has non-finite loss or no supervised pixels")
+                # DDP averages rank gradients; correct weighted CE to the global
+                # denominator. Lovasz remains the mean of local batch objectives.
+                world = dist.get_world_size() if distributed() else 1
+                objective = parts["loss_ce"]
+                if distributed():
+                    objective = objective * denominator * world / global_denominator
+                objective = objective + getattr(criterion, "lovasz_weight", 0.0) * parts["loss_lovasz"]
+                optimizer.zero_grad(set_to_none=True)
+                previous_scale = scaler.get_scale()
+                scaler.scale(objective).backward()
+                scaler.unscale_(optimizer)
+                if clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip,
+                                                  error_if_nonfinite=not scaler.is_enabled())
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() < previous_scale:
+                    skipped_steps += 1
+                    if primary():
+                        print(f"[AMP] Gradient overflow: skipped update, scale={previous_scale:g}->{scaler.get_scale():g}", flush=True)
+                else:
+                    optimizer_steps += 1
+            elif not torch.isfinite(parts["loss_total"]):
+                raise FloatingPointError("Validation produced non-finite loss")
+        bs = int(x.shape[0])
+        ce_numerator += float(parts["loss_ce"].detach()) * float(denominator)
+        ce_denominator += float(denominator)
+        lovasz_sum += float(parts["loss_lovasz"].detach())
+        legacy_sum += float(parts["loss_total"].detach()) * bs
+        sample_count += bs
+        batch_count += 1
+        counts = compute_mos_counts(logits.detach(), y, ignore_index=ignore)
+        for key in agg:
+            agg[key] += counts[key]
+        last_bucket = _print_batch_progress(
+            "Training" if training else "Validierung", epoch_index, total_epochs,
+            index, len(loader), legacy_sum / sample_count, last_bucket)
+    if torch.device(device).type == "cuda":
+        peak_vram = torch.cuda.max_memory_allocated(device)
+    totals = torch.tensor([ce_numerator, ce_denominator, lovasz_sum, batch_count,
+                           legacy_sum, sample_count, *agg.values()], dtype=torch.float64, device=device)
+    if distributed():
+        dist.all_reduce(totals)
+    if distributed():
+        maximum = torch.tensor(peak_vram, dtype=torch.float64, device=device)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        peak_vram = int(maximum.item())
+    values = totals.tolist()
+    ce_numerator, ce_denominator, lovasz_sum, batch_count, legacy_sum, sample_count = values[:6]
+    agg = {key: int(value) for key, value in zip(agg, values[6:])}
+    if not sample_count or not ce_denominator:
+        raise RuntimeError("Loader produced no supervised samples")
+    ce = ce_numerator / ce_denominator
+    lovasz = lovasz_sum / batch_count
+    total = ce + getattr(criterion, "lovasz_weight", 0.0) * lovasz
+    # Preserve legacy single-process CE-only epoch logging.
+    reported = total if isinstance(criterion, MOSCrossEntropyLovasz) or distributed() else legacy_sum / sample_count
+    metrics = {**metrics_from_counts(agg), "loss_ce": ce, "loss_lovasz": lovasz, "loss_total": total,
+               "optimizer_steps": optimizer_steps, "amp_skipped_steps": skipped_steps,
+               "amp_scale": scaler.get_scale(), "peak_vram_bytes": peak_vram}
+    if training and cfg.get("run_metadata", {}).get("smoke_test") and optimizer_steps == 0:
+        raise RuntimeError("GPU smoke test completed without a successful optimizer update")
+    if primary() and sys.stdout.isatty():
         print()
-
-    mean_loss = loss_sum / float(sample_count)
-    metrics = metrics_from_counts(agg)
-    return mean_loss, agg, metrics
+    return reported, agg, metrics
 
 
 def count_params(module: torch.nn.Module) -> int:
@@ -930,6 +1040,8 @@ def main():
     parser.add_argument("--cfg_path", type=str, required=True, help="Path to MOS YAML config")
     parser.add_argument("--device", type=str, default=None, help="cuda/cpu. Default: cuda if available else cpu")
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--log_root", default=None)
+    parser.add_argument("--smoke_test", action="store_true", help="One epoch on a small subset; separate smoke logs")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -1019,6 +1131,7 @@ def main():
     mtrain.setdefault("clip_grad_norm", 5.0)
     mtrain.setdefault("static_class_weight", 1.0)
     mtrain.setdefault("moving_class_weight", 10.0)
+    mtrain["loss"] = loss_settings(mtrain.get("loss"))
     mtrain.setdefault("optimizer", "adamw")
     mtrain.setdefault("scheduler", "none")
     mtrain.setdefault("scheduler_monitor", "val_moving_iou")
@@ -1102,12 +1215,29 @@ def main():
     set_seed(seed, deterministic)
 
     device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    device = str(device)
+    if int(mtrain.get("gradient_accumulation", 1)) != 1:
+        raise ValueError("Baseline trainer requires gradient_accumulation=1")
+    device = setup_device(device)
+    if distributed() and (int(mtrain.get("freeze_encoder_epochs", 0)) > 0
+                          or bool(mdata.get("use_moving_frame_sampler", False))):
+        raise ValueError("DDP baseline does not support encoder freezing or moving-frame sampling")
+    if args.log_root:
+        mlog["log_root"] = args.log_root
+    if args.smoke_test:
+        mtrain["epochs"] = 1
+        mlog["run_name"] = str(mlog["run_name"]) + "_SMOKE"
+    cfg.setdefault("run_metadata", {})["smoke_test"] = args.smoke_test
     pin_memory = device.startswith("cuda")
 
     all_sequences = make_sequences(dataset_path)
     train_sequences = select_sequences(all_sequences, mdata["train_sequences"], "train")
     val_sequences = select_sequences(all_sequences, mdata["val_sequences"], "val")
+
+    if args.smoke_test:
+        world = dist.get_world_size() if distributed() else 1
+        limit = int(mtrain["batch_size"]) * world
+        train_sequences = _smoke_sequences(train_sequences, 2 * limit)
+        val_sequences = _smoke_sequences(val_sequences, limit + 1)
 
     dataset_class = TemporalMOSDataset if str(mmodel["name"]).lower() == "salsanext_temporal_mos" else MOSFrameDataset
     train_dataset = dataset_class(
@@ -1155,6 +1285,10 @@ def main():
         )
         train_shuffle = False
 
+    if distributed():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
+        train_shuffle = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1166,7 +1300,7 @@ def main():
         persistent_workers=(num_workers > 0),
     )
     val_loader = DataLoader(
-        val_dataset,
+        shard_validation(val_dataset),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -1190,15 +1324,9 @@ def main():
         )
     n_params = count_trainable_params(model)
 
-    class_weights = torch.tensor(
-        [float(mtrain["static_class_weight"]), float(mtrain["moving_class_weight"])],
-        dtype=torch.float32,
-        device=device,
-    )
-    criterion = torch.nn.CrossEntropyLoss(
-        ignore_index=int(mdata["ignore_index"]),
-        weight=class_weights,
-    )
+    criterion = make_criterion(cfg, device)
+    scaler = make_grad_scaler(cfg, device)
+    amp_enabled, amp_dtype = amp_settings(cfg, device)
 
     optimizer = build_optimizer_with_param_groups(model, cfg)
     epochs = int(mtrain["epochs"])
@@ -1207,12 +1335,17 @@ def main():
     log_root = os.path.abspath(str(mlog.get("log_root", "/home/devuser/workspace/LidarGaussianVideoView/mos_logs")))
     run_name = str(mlog.get("run_name", "mos_baseline"))
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if distributed():
+        shared_timestamp = [timestamp if primary() else None]
+        dist.broadcast_object_list(shared_timestamp, src=0)
+        timestamp = shared_timestamp[0]
     log_dir = os.path.join(log_root, f"{run_name}_{timestamp}")
-    os.makedirs(log_dir, exist_ok=True)
+    if primary():
+        os.makedirs(log_dir, exist_ok=True)
 
-    save_checkpoints = bool(mlog.get("save_checkpoints", True))
-    save_csv = bool(mlog.get("save_csv", True))
-    save_config_copy = bool(mlog.get("save_config_copy", True))
+    save_checkpoints = primary() and bool(mlog.get("save_checkpoints", True))
+    save_csv = primary() and bool(mlog.get("save_csv", True))
+    save_config_copy = primary() and bool(mlog.get("save_config_copy", True))
 
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
     best_ckpt_path = os.path.join(checkpoint_dir, "best_moving_iou.pt")
@@ -1228,6 +1361,11 @@ def main():
     cfg["run_metadata"]["log_dir"] = log_dir
     cfg["run_metadata"]["timestamp"] = timestamp
     cfg["run_metadata"]["cli_args"] = vars(args)
+    world = dist.get_world_size() if distributed() else 1
+    cfg["run_metadata"].update(world_size=world, per_gpu_batch_size=batch_size,
+                               global_batch_size=batch_size * world,
+                               lovasz_reduction="mean_of_local_batches",
+                               amp_enabled=amp_enabled, amp_dtype=str(amp_dtype))
 
     if save_config_copy:
         with open(config_copy_path, "w", encoding="utf-8") as f:
@@ -1244,6 +1382,10 @@ def main():
             "lr_decoder_head",
             "train_loss",
             "val_loss",
+            "train_optimizer_steps", "train_amp_skipped_steps", "train_amp_scale",
+            "train_peak_vram_bytes", "val_peak_vram_bytes",
+            "train_loss_ce", "train_loss_lovasz", "train_loss_total",
+            "val_loss_ce", "val_loss_lovasz", "val_loss_total",
             "train_moving_iou",
             "train_moving_precision",
             "train_moving_recall",
@@ -1277,7 +1419,7 @@ def main():
         metrics_file.flush()
 
     writer = None
-    if bool(mlog.get("use_tensorboard", True)):
+    if primary() and bool(mlog.get("use_tensorboard", True)):
         writer = SummaryWriter(log_dir=log_dir)
         writer.add_scalar("Data/train_num_samples", len(train_dataset), 0)
         writer.add_scalar("Data/val_num_samples", len(val_dataset), 0)
@@ -1299,7 +1441,10 @@ def main():
     print(f"num_classes       : {int(mmodel['num_classes'])}")
     print(f"base_channels     : {int(mmodel.get('base_channels', 32))}")
     print(f"trainable_params  : {n_params}")
-    print(f"batch_size        : {batch_size}")
+    print(f"batch_size/GPU    : {batch_size}")
+    print(f"world_size        : {world}; global_batch_size: {batch_size * world}")
+    print(f"loss_settings     : {mtrain['loss']}")
+    print(f"AMP               : {amp_enabled}; dtype={amp_dtype}; scale={scaler.get_scale():g}")
     print(f"epochs            : {int(mtrain['epochs'])}")
     print(f"lr                : {float(mtrain['learning_rate'])}")
     print(f"encoder_lr        : {mtrain.get('encoder_learning_rate', None)}")
@@ -1324,11 +1469,15 @@ def main():
 
     best_moving_iou = -1.0
     best_epoch = -1
+    if distributed():
+        model = DDP(model, device_ids=[torch.device(device).index] if pin_memory else None)
     prev_encoder_frozen = None
     for epoch in range(1, epochs + 1):
+        if isinstance(train_sampler, DistributedSampler):
+            train_sampler.set_epoch(epoch)
         encoder_frozen = is_encoder_frozen_for_epoch(epoch, freeze_encoder_epochs)
         set_encoder_trainable(
-            model,
+            unwrap_model(model),
             trainable=not encoder_frozen,
             bn_eval=freeze_encoder_bn_eval,
         )
@@ -1343,6 +1492,7 @@ def main():
             loader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
+            scaler=scaler,
             device=device,
             cfg=cfg,
             encoder_frozen=encoder_frozen,
@@ -1390,9 +1540,19 @@ def main():
             f"encoder_lr={format_lr_for_print(lr_encoder)}"
         )
 
+        print(f"[MEMORY/AMP] peak_train={train_metrics['peak_vram_bytes'] / 2**30:.2f} GiB "
+              f"peak_val={val_metrics['peak_vram_bytes'] / 2**30:.2f} GiB "
+              f"optimizer_steps={train_metrics['optimizer_steps']} "
+              f"skipped_steps={train_metrics['amp_skipped_steps']} scale={train_metrics['amp_scale']:g}")
         if writer is not None:
+            for key in ("optimizer_steps", "amp_skipped_steps", "amp_scale", "peak_vram_bytes"):
+                writer.add_scalar(f"Train/{key}", train_metrics[key], epoch)
+            writer.add_scalar("Val/peak_vram_bytes", val_metrics["peak_vram_bytes"], epoch)
             writer.add_scalar("Loss/train", train_loss, epoch)
             writer.add_scalar("Loss/val", val_loss, epoch)
+            for phase, metrics in (("train", train_metrics), ("val", val_metrics)):
+                for component in ("loss_ce", "loss_lovasz", "loss_total"):
+                    writer.add_scalar(f"Loss/{phase}_{component}", metrics[component], epoch)
 
             writer.add_scalar("Train/moving_iou", train_metrics["moving_iou"], epoch)
             writer.add_scalar("Train/moving_precision", train_metrics["moving_precision"], epoch)
@@ -1465,6 +1625,12 @@ def main():
                 "best_moving_iou_so_far": float(best_moving_iou),
                 "best_epoch_so_far": int(best_epoch),
             }
+            for phase, metrics in (("train", train_metrics), ("val", val_metrics)):
+                for component in ("loss_ce", "loss_lovasz", "loss_total"):
+                    row[f"{phase}_{component}"] = float(metrics[component])
+            for key in ("optimizer_steps", "amp_skipped_steps", "amp_scale", "peak_vram_bytes"):
+                row[f"train_{key}"] = train_metrics[key]
+            row["val_peak_vram_bytes"] = val_metrics["peak_vram_bytes"]
             metrics_writer.writerow(row)
             metrics_file.flush()
 
@@ -1473,8 +1639,9 @@ def main():
                 "epoch": int(epoch),
                 "best_epoch": int(best_epoch),
                 "best_moving_iou": float(best_moving_iou),
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": unwrap_model(model).state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                 "cfg": cfg,
                 "train_loss": float(train_loss),
@@ -1505,6 +1672,13 @@ def main():
     if metrics_file is not None:
         metrics_file.flush()
         metrics_file.close()
+
+    was_primary = primary()
+    if distributed():
+        dist.barrier()
+        dist.destroy_process_group()
+    if not was_primary:
+        return
 
     print("Training finished.")
     print(f"Best moving_iou: {best_moving_iou:.6f} at epoch {best_epoch}")
