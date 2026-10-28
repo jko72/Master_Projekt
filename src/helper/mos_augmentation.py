@@ -99,7 +99,7 @@ class TemporalMOSAugmentation:
             feature[1, valid] = s * x + c * yy
             rotated.append(feature)
             rolled_masks.append(mask)
-        return rotated, rolled_masks, torch.roll(y, shift, dims=-1)
+        return rotated, rolled_masks, (torch.roll(y, shift, dims=-1) if y is not None else None)
 
     def range_views(self, features, masks, y):
         features = [self.jitter(feature, mask) for feature, mask in zip(features, masks)]

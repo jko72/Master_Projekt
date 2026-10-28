@@ -1,4 +1,4 @@
-"""Scratch supervised temporal MOS with shared SalsaNext and local change fusion."""
+"""Shared temporal E2E architecture for MOS and masked five-channel reconstruction."""
 
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ class SalsaNextTemporalE2E(nn.Module):
     def __init__(self, in_channels=4, num_classes=2, dropout=0.1,
                  attention_heads=8, radius=1, compare_channels=64):
         super().__init__()
-        if in_channels not in {4, 5} or num_classes != 2:
-            raise ValueError("Temporal E2E MOS requires four XYZR or five XYZRI channels and two logits")
+        if in_channels not in {4, 5} or num_classes not in {2, 5} or (num_classes == 5 and in_channels != 5):
+            raise ValueError("Temporal E2E requires XYZR/XYZRI MOS (2 outputs) or XYZRI reconstruction (5 outputs)")
         self.in_channels = in_channels
+        self.num_classes = num_classes
         self.encoder = SalsaNextEncoder(in_channels, dropout)
         self.temporal = LocalHistoricalAttention(256, attention_heads, radius, compare_channels)
         self.decoder = SalsaNextDecoder(num_classes, dropout)
@@ -47,6 +48,6 @@ class SalsaNextTemporalE2E(nn.Module):
             fused = result
         current_skips = tuple(s.reshape(b, t, *s.shape[1:])[:, -1] for s in skips)
         logits = self.decoder(fused, current_skips)
-        if logits.shape != (b, 2, h, w):
+        if logits.shape != (b, self.num_classes, h, w):
             raise RuntimeError(f"Unexpected decoder output {tuple(logits.shape)}")
         return (logits, diagnostics) if return_diagnostics else logits
