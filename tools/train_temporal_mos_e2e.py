@@ -30,6 +30,8 @@ from helper.mos_eval_utils import add_counts, compute_counts_from_pred_target, e
 from mos_models import build_mos_model
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
 from helper.mos_input import channel_count, normalization
+from helper.mos_augmentation import augmentation_settings
+from helper.temporal_e2e_transfer import load_mae_weights
 from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
 
 
@@ -108,8 +110,8 @@ def read_config(path):
         cfg = yaml.safe_load(handle)
     if cfg["mos_model_params"]["name"] != "salsanext_temporal_e2e":
         raise ValueError("This entry requires mos_model_params.name=salsanext_temporal_e2e")
-    if cfg["mos_train_params"].get("pretrained_path") is not None:
-        raise ValueError("This scratch entry does not load a pretrained checkpoint")
+    if int(cfg["mos_model_params"].get("num_classes", 2)) != 2:
+        raise ValueError("Supervised MOS requires num_classes=2; use the MAE entry for reconstruction")
     if cfg["mos_model_params"].get("fusion", "bottleneck_only") != "bottleneck_only":
         raise ValueError("Only bottleneck_only fusion is implemented")
     mode = cfg["mos_data_params"].get("input_mode")
@@ -120,6 +122,7 @@ def read_config(path):
         raise ValueError(f"mos_model_params.in_channels must be {expected} for {mode}")
     cfg["mos_model_params"]["in_channels"] = expected
     normalization(cfg, mode)
+    cfg["mos_augmentation"] = augmentation_settings(cfg.get("mos_augmentation"), mode)
     if str(cfg["mos_train_params"].get("optimizer", "adamw")).lower() != "adamw":
         raise ValueError("This path supports AdamW")
     if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() != "cosine":
@@ -421,6 +424,7 @@ def synthetic_dry_run(cfg, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cfg_path", default="src/configs/mos_semanticKitti_temporal_e2e.yaml")
+    parser.add_argument("--pretrained_path", help="Full Temporal E2E MAE checkpoint; replaces only the output head")
     parser.add_argument("--log_root", help="Override mos_log_params.log_root for this run")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int)
@@ -445,6 +449,8 @@ def train(args, device):
     cfg_path, cfg = read_config(args.cfg_path)
     if args.log_root is not None:
         cfg["mos_log_params"]["log_root"] = args.log_root
+    if getattr(args, "pretrained_path", None) is not None:
+        cfg["mos_train_params"]["pretrained_path"] = args.pretrained_path
     check_splits(cfg["mos_data_params"])
     train_cfg = cfg["mos_train_params"]
     rank = dist.get_rank() if distributed() else 0
@@ -474,7 +480,10 @@ def train(args, device):
               f"amp={amp_enabled} amp_dtype={amp_dtype}", flush=True)
     train_loader = make_loader(cfg, "train", batch_size, workers, device)
     val_loader = make_loader(cfg, "val", batch_size, workers, device)
-    model = wrap_distributed(build_mos_model(cfg).to(device), device)
+    model = build_mos_model(cfg)
+    if train_cfg.get("pretrained_path") is not None:
+        cfg["pretraining_transfer"] = load_mae_weights(model, train_cfg["pretrained_path"], cfg)
+    model = wrap_distributed(model.to(device), device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=float(train_cfg["learning_rate"]),
                                   weight_decay=float(train_cfg["weight_decay"]))

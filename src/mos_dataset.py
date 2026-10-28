@@ -52,6 +52,7 @@ class MOSFrameDataset(Dataset):
         self.require_moving = bool(require_moving)
         self.min_moving_pixels = int(min_moving_pixels)
         self.allow_missing_labels = bool(allow_missing_labels)
+        self.strict_residuals = bool(cfg.get("mos_data_params", {}).get("strict_residuals", False))
         self.normalization = normalization(cfg, self.input_mode)
 
         if self.input_mode not in self.ALLOWED_INPUT_MODES:
@@ -444,18 +445,24 @@ class MOSFrameDataset(Dataset):
 
     def _load_residual_image(self, residual_path: str) -> np.ndarray:
         if not os.path.isfile(residual_path):
+            if self.strict_residuals:
+                raise FileNotFoundError(f"Required residual image missing: {residual_path}")
             if residual_path not in self._missing_residual_warned:
                 warnings.warn(f"Missing residual file: {residual_path}. Using zeros.", RuntimeWarning)
                 self._missing_residual_warned.add(residual_path)
             return np.zeros((self.H, self.W), dtype=np.float32)
         arr = np.load(residual_path).astype(np.float32)
         if arr.shape != (self.H, self.W):
+            if self.strict_residuals:
+                raise ValueError(f"Residual shape mismatch at {residual_path}: got {arr.shape}, expected {(self.H, self.W)}")
             warnings.warn(
                 f"Residual shape mismatch at {residual_path}: got {arr.shape}, expected {(self.H, self.W)}. "
                 "Using zeros.",
                 RuntimeWarning,
             )
             return np.zeros((self.H, self.W), dtype=np.float32)
+        if self.strict_residuals and not np.isfinite(arr).all():
+            raise ValueError(f"Non-finite residual values: {residual_path}")
         return arr
 
     def _load_mos_label(self, mos_label_path: str) -> np.ndarray:
