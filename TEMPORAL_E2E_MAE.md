@@ -10,10 +10,10 @@ Die Beispiele `[5,1]` aus der Aufgabenbeschreibung ersetzen diesen Offset nicht.
 
 Neue Konfigurationen:
 
-- `src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug.yaml`:
+- `src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p2.yaml`:
   50 Epochen Pretraining, Batch 8 pro GPU, AdamW, LR 0.0005 → 0.000005,
   Weight Decay 0.0001, 2 Warmup-Epochen, Clip 5, Seed 42, BF16-AMP.
-- `src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug_p1_2gpu_fp32.yaml`:
+- `src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p1.yaml`:
   gleiche MAE-Konfiguration, AMP deaktiviert für P1/P100 ohne natives BF16.
   `amp_dtype: float16` ist bei deaktiviertem AMP ohne Rechenwirkung.
 - `src/configs/mos_semanticKitti_temporal_e2e_mae_intensity_off8_64x512_lovasz_w290_aug.yaml`:
@@ -154,14 +154,14 @@ beiden erlaubten Skripte begrenzten `TEMPORAL_TRAIN_ENTRY`; ohne diesen Wert
 bleibt der bisherige MOS-Start unverändert. Batch 8 pro GPU ergibt global 16.
 Die generischen Launch-Logs liegen weiterhin unter `/hpc/logs/mos/CONFIG/job-ID/`,
 während die MAE-Checkpoints/CSV/TensorBoard dort in eindeutig benannten
-`Temporal_E2E_MAE_...`-Runverzeichnissen liegen. Bei direktem Start verwendet
+`MAE_Pretrain_temporal_e2e_...`-Runverzeichnissen liegen. Bei direktem Start verwendet
 MAE die eigene Logwurzel `/hpc/logs/temporal_e2e_mae`.
 
 Auf einer BF16-kompatiblen GPU direkt im Container:
 
 ```bash
 python tools/train_temporal_e2e_mae.py \
-  --cfg_path src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug.yaml \
+  --cfg_path src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p2.yaml \
   --device cuda
 ```
 
@@ -182,7 +182,7 @@ Kurzer P1-Smoke-Job (nur nach eigenem Start):
 
 ```bash
 bash submit_temporal_e2e_mae_p1_2gpu.sh \
-  src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug_p1_2gpu_fp32.yaml \
+  src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p1.yaml \
   --epochs 1 --batch_size 1 --num_workers 0 --max_batches 1
 ```
 

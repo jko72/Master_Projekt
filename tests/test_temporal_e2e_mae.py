@@ -24,7 +24,7 @@ from temporal_e2e_mae_dataset import TemporalE2EMAEDataset, masked_input, mask_s
 from temporal_mos_e2e_dataset import TemporalMOSE2EDataset
 from loss_temporal_e2e_mae import reconstruction_loss, reconstruction_settings
 
-CONFIG = ROOT/'src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug.yaml'
+CONFIG = ROOT/'src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p2.yaml'
 BASELINE = ROOT/'src/configs/mos_semanticKitti_temporal_e2e_intensity_off8_64x512_lovasz_w290_aug.yaml'
 FINETUNE = ROOT/'src/configs/mos_semanticKitti_temporal_e2e_mae_intensity_off8_64x512_lovasz_w290_aug.yaml'
 

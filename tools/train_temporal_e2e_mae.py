@@ -368,7 +368,7 @@ def train(args, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--cfg_path', default='src/configs/semanticKitti_temporal_e2e_mae_intensity_off8_64x512_aug.yaml')
+    parser.add_argument('--cfg_path', default='src/configs/semanticKitti_MAE_Pretrain_temporal_e2e_p2.yaml')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log_root')
     parser.add_argument('--epochs', type=int)
