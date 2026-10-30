@@ -71,6 +71,25 @@ def load_poses(seq_dir, n_scans):
 
 
 def frame_features(points, cfg, data, return_raw_range: bool = False):
+    from helper.mos_projection import projection_mode, project_features
+    if projection_mode(cfg) == 'lmnet':
+        mp = cfg['model_params']
+        theta = np.deg2rad([mp.get('FOV_DOWN', -25), mp.get('FOV_UP', 3)])
+        feature, mask, _ = project_features(points, int(mp['grid_height']), int(mp['grid_width']), theta, True)
+        raw_range = feature[3].numpy().copy()
+        mode = data.get('input_mode', 'range_residual')
+        feature = normalize_feature_tensor(feature, mask, normalization(cfg, mode))
+        if mode.startswith('range_xyz_intensity'):
+            channels = list(feature.numpy())
+        elif mode.startswith('range_xyz') and 'normal' not in mode:
+            channels = list(feature[:4].numpy())
+        elif mode in {'range', 'range_residual'}:
+            channels = [raw_range]
+        elif mode == 'residual':
+            channels = []
+        else:
+            raise ValueError(f'Unsupported LMNet input mode: {mode}')
+        return (channels, raw_range) if return_raw_range else channels
     mp = cfg["model_params"]
     h, w = int(mp["grid_height"]), int(mp["grid_width"])
     theta = (np.deg2rad(float(mp.get("FOV_DOWN", -25))), np.deg2rad(float(mp.get("FOV_UP", 3))))
@@ -113,10 +132,12 @@ def frame_features(points, cfg, data, return_raw_range: bool = False):
 
 
 def single_frame_input(scan, cfg, seq_dir, stem, return_projected_range: bool = False):
+    from helper.mos_projection import projection_mode
+    lmnet = projection_mode(cfg) == 'lmnet'
     data = cfg["mos_data_params"]
     mode = data.get("input_mode", "range_residual")
-    features = frame_features(read_scan(scan), cfg, data, return_raw_range=return_projected_range)
-    if return_projected_range:
+    features = frame_features(read_scan(scan), cfg, data, return_raw_range=return_projected_range or lmnet)
+    if return_projected_range or lmnet:
         channels, raw_range = features
     else:
         channels = features
@@ -126,21 +147,31 @@ def single_frame_input(scan, cfg, seq_dir, stem, return_projected_range: bool = 
             offsets = [offsets]
         for off in sorted({int(v) for v in offsets}):
             template = data.get("residual_folder_template", "residual_images_{offset}")
+            from helper.mos_cache import check_cache
+            check_cache(seq_dir / template.format(offset=off), cfg, 'residual', seq_dir, off)
             path = seq_dir / template.format(offset=off) / f"{stem}.npy"
             if not path.is_file():
                 raise FileNotFoundError(f"Required residual image missing: {path}")
             residual = np.load(path)
+            if lmnet and not np.isfinite(residual).all():
+                raise ValueError(f'Non-finite LMNet residual cache: {path}')
             expected_shape = (int(cfg["model_params"]["grid_height"]), int(cfg["model_params"]["grid_width"]))
             if residual.shape != expected_shape:
                 raise ValueError(f"Residual shape mismatch: {path}")
             channels.append(residual.astype(np.float32))
     if not channels:
         raise ValueError("No input channels")
+    if lmnet:
+        channels = [np.where(raw_range > 0, channel, 0).astype(np.float32) for channel in channels]
+        if not all(np.isfinite(channel).all() for channel in channels):
+            raise ValueError(f'Non-finite LMNet features: {scan}')
     tensor = torch.from_numpy(np.stack(channels).astype(np.float32))[None]
     return (tensor, raw_range) if return_projected_range else tensor
 
 
 def temporal_input(scans, index, poses, cfg, history_init, e2e, return_projected_range: bool = False):
+    from helper.mos_projection import projection_mode
+    lmnet = projection_mode(cfg) == 'lmnet'
     data, mp = cfg["mos_data_params"], cfg["model_params"]
     offsets = sorted({int(v) for v in data.get("previous_offsets", [3])}, reverse=True) if e2e else [int(data.get("previous_offset", 3))]
     h, w = int(mp["grid_height"]), int(mp["grid_width"])
@@ -154,6 +185,11 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e, return_projected
     for off in offsets + [0]:
         previous = index - off
         missing_history = previous < 0
+        if missing_history and lmnet:
+            features.append(torch.zeros((5 if 'intensity' in data.get('input_mode', '') else 4, h, w)))
+            masks.append(torch.zeros((h, w), dtype=torch.bool))
+            bootstrapped = True
+            continue
         if missing_history:
             if history_init == "strict":
                 raise ValueError(f"Missing history at frame {index}, offset {off}")
@@ -163,7 +199,7 @@ def temporal_input(scans, index, poses, cfg, history_init, e2e, return_projected
             pts = transform_points(pts, np.linalg.solve(poses[index], poses[previous]))
         feature, mask = project_range_features(pts, h, w, theta, min_range, max_range,
                                                 include_intensity="intensity" in data.get("input_mode", ""),
-                                                explicit_occupancy=e2e)
+                                                explicit_occupancy=e2e, projection_mode=projection_mode(cfg))
         if off == 0:
             # project_range_features builds [x, y, z, range, (intensity)]
             # before normalization, so channel three is metres.
@@ -327,6 +363,10 @@ def main(argv=None):
     indexed = index_sequences(root, ids)
     device = torch.device(args.device)
     model, cfg, payload = load_adapter(args.checkpoint, device)
+    from helper.mos_projection import projection_mode
+    from helper.mos_cache import check_cache
+    if projection_mode(cfg) == 'lmnet' and (args.threshold_sweep or args.moving_threshold != .5):
+        parser.error('LMNet primary evaluation requires fixed threshold 0.5, no sweep')
     name = cfg["mos_model_params"]["name"]
     temporal = name in {"salsanext_temporal_mos", "salsanext_temporal_e2e"}
     e2e = name == "salsanext_temporal_e2e"
@@ -336,9 +376,12 @@ def main(argv=None):
         float(mp.get("FOV_UP", 3)), float(mp.get("FOV_DOWN", -25)),
         float(mp.get("min_range", mp.get("MIN_RANGE", 0))) if (temporal or "normal" in input_mode) else 0.0,
         float(mp.get("max_range", mp.get("MAX_RANGE"))) if (temporal or "normal" in input_mode) and mp.get("max_range", mp.get("MAX_RANGE")) is not None else None,
-        temporal)
+        temporal, projection_mode(cfg))
     poses = {seq: load_poses(root / seq, len(scans)) for seq, scans in indexed.items()} if temporal else {}
     for seq, scans in indexed.items():
+        if args.mode in {'pixel', 'both'}:
+            check_cache(root / seq / cfg['mos_data_params'].get('mos_label_folder', 'mos_labels'),
+                        cfg, 'labels', root / seq)
         if args.mode in {"point", "both"} and any(not (root / seq / "labels" / f"{p.stem}.label").is_file() for p in scans):
             if not args.export_predictions or seq not in TEST_SEQUENCES:
                 raise FileNotFoundError(f"Original point GT missing for {seq}; use --export-predictions with --mode point for test 11..21")
@@ -399,6 +442,7 @@ def main(argv=None):
                 postprocess_seconds = time.perf_counter() - postprocess_start
                 point_postprocess_seconds += postprocess_seconds
                 coverage.append({"sequence": seq, "frame": scan.stem, "n_points": len(points),
+                    'history_available': ([index >= off for off in sorted(cfg['mos_data_params'].get('previous_offsets', []), reverse=True)] if e2e else []),
                     "invalid_points": int((~valid).sum()), "fallback_points": int((~valid).sum()),
                     "coverage_rate": float(valid.mean()) if len(valid) else 0.0,
                     "postprocess_seconds": postprocess_seconds})
@@ -496,7 +540,8 @@ def main(argv=None):
     git_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     metadata = {"checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": payload.get("epoch"),
         "checkpoint_train_sequences": cfg["mos_data_params"].get("train_sequences"),
-        "eval_sequences": ids, "sequence_07_role": "internal_holdout_official_train",
+        "eval_sequences": ids, "sequence_07_role": next((role for role in ('train', 'val', 'test')
+            if '07' in {str(s).zfill(2) for s in cfg['mos_data_params'].get(role+'_sequences', [])}), 'unused'),
         "dataset_root": str(root), "model": name, "input_mode": input_mode,
         "channel_names": (["x", "y", "z", "range", "intensity"] if "intensity" in input_mode else None),
         "normalization": normalization(cfg, input_mode),
@@ -507,7 +552,7 @@ def main(argv=None):
             "improvement_vs_0.5": best_threshold["point_moving_iou"] - next(
                 row["point_moving_iou"] for row in sweep_rows if row["threshold"] == 0.5)}
             if args.threshold_sweep else {"enabled": False}),
-        "projection": vars(projection), "history_init": args.history_init if temporal else None,
+        "projection": vars(projection), "history_init": ('zero_missing' if projection_mode(cfg) == 'lmnet' else args.history_init) if temporal else None,
         "pose_source": "poses.txt + calib.txt (LiDAR frame)" if temporal else None,
         "gt_mapping": "PRBonn semantic-kitti-mos learning_map (local mos_label_helper)",
         "unmapped_point_fallback": "static", "n_scans": total_scans,

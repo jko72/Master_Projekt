@@ -138,6 +138,8 @@ def main():
     with open(args.cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
     cfg = _ensure_mos_defaults(cfg)
+    from helper.mos_projection import projection_mode
+    from helper.mos_cache import check_cache
 
     mosp = cfg["mos_label_params"]
     if not mosp.get("enabled", True):
@@ -165,10 +167,14 @@ def main():
     all_stats = []
 
     for seq in seqs:
+        if projection_mode(cfg) == 'lmnet' and int(seq['seq_id']) >= 11:
+            print(f"{seq['seq_id']}: official test sequence; no GT cache generated")
+            continue
         _print_seq_header(seq, cfg)
         seq_paths = seq["paths"]
         seq_dir = os.path.abspath(os.path.join(os.path.dirname(seq_paths[0][0]), ".."))
         out_dir = os.path.join(seq_dir, mosp["folder_name"])
+        check_cache(out_dir, cfg, 'labels', seq_dir, create=True)
         os.makedirs(out_dir, exist_ok=True)
 
         n_frames = len(seq_paths)
@@ -201,6 +207,8 @@ def main():
             semantic_labels, _ = split_semantic_instance(raw_labels)
 
             if points_xyzi.shape[0] != semantic_labels.shape[0]:
+                if projection_mode(cfg) == 'lmnet':
+                    raise ValueError(f'Point/label length mismatch: {scan_path}')
                 print(
                     f"[WARN] Point/label length mismatch in seq={seq['seq_id']} frame={frame_stem}: "
                     f"points={points_xyzi.shape[0]} labels={semantic_labels.shape[0]}. Truncating to min length."

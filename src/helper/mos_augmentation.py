@@ -4,10 +4,26 @@ import math
 from numbers import Real
 
 import torch
+import numpy as np
 
 
 def augmentation_settings(value=None, input_mode="range_xyz"):
     """Resolve defaults and reject invalid/unknown parameters, even when disabled."""
+    if value is not None and not isinstance(value, dict):
+        raise ValueError('mos_augmentation must be a mapping')
+    value = {} if value is None else value.copy()
+    mode = value.pop('mode', None)
+    if mode not in (None, 'none', 'custom', 'lmnet'):
+        raise ValueError('mos_augmentation.mode must be none, custom or lmnet')
+    if mode in {'none', 'lmnet'}:
+        if value.get('enabled') is not None and value['enabled'] != (mode == 'lmnet'):
+            raise ValueError('Conflicting augmentation mode and enabled flag')
+        if any(not isinstance(value.get(k, {}), dict) for k in
+               ('azimuth_rotation', 'historical_point_dropout', 'intensity_jitter')):
+            raise ValueError('Augmentation operations must be mappings')
+        if any(value.get(k, {}).get('enabled', False) for k in
+               ('azimuth_rotation', 'historical_point_dropout', 'intensity_jitter')):
+            raise ValueError('LMNet/none cannot be combined with custom augmentation')
     defaults = {
         "enabled": False,
         "azimuth_rotation": {"enabled": False, "probability": 0.5},
@@ -39,7 +55,11 @@ def augmentation_settings(value=None, input_mode="range_xyz"):
             result[key] = item
         return result
 
-    settings = resolve({} if value is None else value, defaults, "mos_augmentation")
+    if mode is not None:
+        value.setdefault('enabled', mode != 'none')
+    settings = resolve(value, defaults, "mos_augmentation")
+    if mode is not None:
+        settings['mode'] = mode
     if settings["enabled"] and settings["intensity_jitter"]["enabled"] and "intensity" not in input_mode:
         raise ValueError("mos_augmentation.intensity_jitter requires input_mode=range_xyz_intensity")
     return settings
@@ -53,7 +73,7 @@ class TemporalMOSAugmentation:
     def applies(self, name):
         spec = self.settings[name]
         # Short circuit before drawing: disabled augmentation consumes no RNG state.
-        return self.training and spec["enabled"] and spec["probability"] > 0 and bool(
+        return self.settings.get('mode') != 'lmnet' and self.training and spec["enabled"] and spec["probability"] > 0 and bool(
             torch.rand(()) < spec["probability"])
 
     def drop_history(self, points):
@@ -107,3 +127,35 @@ class TemporalMOSAugmentation:
             shift = int(torch.randint(features[0].shape[-1], ()))
             return self.rotate(features, masks, y, shift)
         return features, masks, y
+
+    def raw_scans(self, scans, labels=None, parameters=None):
+        """One geometry draw for all already aligned scans; deletion only current.
+
+        parameters supports deterministic tests: flip, translation, drop_indices.
+        Sampling follows parser.py/laserscan.py distributions, not its RNG stream.
+        """
+        if not self.training or self.settings.get('mode') != 'lmnet':
+            return scans, labels
+        if parameters is None:
+            if float(torch.rand(())) >= .5:
+                return scans, labels
+            translate = float(torch.rand(())) < .5
+            flip = float(torch.rand(())) < .5
+            delta = np.array([float(torch.rand(()))*10-5, float(torch.rand(()))*6-3,
+                              float(torch.rand(()))-1], np.float32) if translate else np.zeros(3, np.float32)
+            n = len(scans[-1])
+            q = float(torch.rand(()))*.5
+            drops = torch.randint(n-1, (int(n*q),)).numpy() if n > 1 else np.empty(0, np.int64)
+            parameters = dict(flip=flip, translation=delta, drop_indices=drops)
+        transformed = []
+        for points in scans:
+            points = points.copy()
+            if parameters['flip']:
+                points[:, 1] *= -1
+            points[:, :3] += np.asarray(parameters['translation'], np.float32)
+            transformed.append(points)
+        drops = np.asarray(parameters['drop_indices'], np.int64)
+        transformed[-1] = np.delete(transformed[-1], drops, axis=0)
+        if labels is not None:
+            labels = np.delete(labels, drops)
+        return transformed, labels

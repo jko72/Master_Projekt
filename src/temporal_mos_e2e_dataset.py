@@ -40,6 +40,11 @@ class TemporalMOSE2EDataset(TemporalE2EInputMixin, MOSFrameDataset):
         for sample in self.samples:
             seq = self.sequence_map[sample["seq_id"]]
             i = sample["frame_index"]
+            if self.lmnet:
+                if i >= len(seq['poses']):
+                    raise ValueError(f'Missing current pose: {sample["scan_path"]}')
+                kept.append(sample)
+                continue
             if i < max(self.offsets) or i >= len(seq["poses"]):
                 continue
             if all(self._extract_scan_path(seq["paths"][i - off]) is not None
@@ -50,5 +55,7 @@ class TemporalMOSE2EDataset(TemporalE2EInputMixin, MOSFrameDataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        if self.lmnet:
+            return self._load_lmnet_temporal_input(sample)
         y = torch.from_numpy(self._load_mos_label(sample["mos_label_path"]).astype(np.int64))
         return self._load_temporal_input(sample, y)

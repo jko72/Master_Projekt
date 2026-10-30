@@ -18,7 +18,14 @@ def project_range_features(
     points: np.ndarray, height: int, width: int, theta_range,
     min_range: float, max_range: float | None, include_intensity: bool = False,
     explicit_occupancy: bool = False,
+    projection_mode: str = "legacy",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if projection_mode == "lmnet":
+        from helper.mos_projection import project_features
+        features, mask, _ = project_features(points, height, width, theta_range, include_intensity)
+        return features, mask
+    if projection_mode != "legacy":
+        raise ValueError("Unknown projection mode")
     # The extra constant channel survives the same collision resolution as XYZ.
     # Existing MAE callers keep their original projection and validity behavior.
     projection_points = points.astype(np.float32)

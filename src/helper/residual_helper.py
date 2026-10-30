@@ -34,6 +34,13 @@ def project_range_for_residual(points_xyzi, cfg) -> np.ndarray:
     rp = cfg["residual_params"]
     H = int(mp["grid_height"])
     W = int(mp["grid_width"])
+    from helper.mos_projection import projection_mode, lmnet_projection
+    if projection_mode(cfg) == 'lmnet':
+        result = lmnet_projection(points_xyzi, H, W, mp.get('FOV_UP', 3), mp.get('FOV_DOWN', -25),
+                                  min_range=2., max_range=50., check_intensity=False)
+        image = np.zeros((H, W), np.float32)
+        image[result.occupied] = result.ranges[result.indices[result.occupied]]
+        return image
     theta_range = _theta_range_from_cfg(cfg)
     pj_img, _, _, _ = spherical_projection(
         points_xyzi.astype(np.float32),

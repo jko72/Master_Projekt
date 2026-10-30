@@ -4,9 +4,15 @@ import warnings
 
 import torch
 from helper.mos_input import BASE_CHANNELS, normalization
+from helper.mos_projection import projection_mode
 
 FORMAT = 'temporal_e2e_masked_reconstruction_v1'
+LMNET_FORMAT = 'temporal_e2e_masked_reconstruction_lmnet_v2'
 HEAD = {'decoder.logits.weight', 'decoder.logits.bias'}
+
+
+def checkpoint_format(cfg):
+    return LMNET_FORMAT if projection_mode(cfg) == 'lmnet' else FORMAT
 
 
 def model_metadata(cfg):
@@ -18,18 +24,25 @@ def model_metadata(cfg):
 
 def input_metadata(cfg):
     data = cfg['mos_data_params']
-    return dict(channel_names=list(BASE_CHANNELS), in_channels=5,
+    metadata = dict(channel_names=list(BASE_CHANNELS), in_channels=5,
                 input_mode=data['input_mode'], normalization=normalization(cfg, data['input_mode']),
                 previous_offsets=sorted({int(v) for v in data['previous_offsets']}, reverse=True),
                 scan_rate_hz=float(data.get('scan_rate_hz', 10.)), projection=dict(cfg['model_params']),
                 model=model_metadata(cfg))
+    if projection_mode(cfg) == 'lmnet':
+        metadata['input_protocol'] = dict(version='lmnet_v1', projection_mode='lmnet',
+            min_range=0., max_range=None, finite=True, index_zero_valid=True,
+            missing_history='zeros_invalid_nominal_dt', quantization='author_floor_clamp')
+    return metadata
 
 
 def validate_mae_checkpoint(checkpoint):
-    if not isinstance(checkpoint, dict) or checkpoint.get('format') != FORMAT:
+    if not isinstance(checkpoint, dict) or checkpoint.get('format') not in {FORMAT, LMNET_FORMAT}:
         raise ValueError('Expected a versioned Temporal E2E MAE reconstruction checkpoint')
     if not isinstance(checkpoint.get('config'), dict) or not isinstance(checkpoint.get('metadata'), dict):
         raise ValueError('MAE checkpoint lacks configuration/metadata')
+    if checkpoint['format'] != checkpoint_format(checkpoint['config']):
+        raise ValueError('MAE checkpoint format disagrees with input protocol')
     if checkpoint['metadata'] != input_metadata(checkpoint['config']):
         raise ValueError('MAE checkpoint metadata disagrees with its configuration')
     if checkpoint['metadata']['input_mode'] != 'range_xyz_intensity' or checkpoint['metadata']['model']['in_channels'] != 5:
@@ -45,9 +58,17 @@ def load_mae_weights(model, path, cfg):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     source_meta = validate_mae_checkpoint(checkpoint)
     target_meta = input_metadata(cfg)
+    source_mode = projection_mode(checkpoint['config'])
+    target_mode = projection_mode(cfg)
+    if source_mode != target_mode:
+        raise ValueError(f'MAE transfer incompatible projection_mode: {source_mode} vs {target_mode}')
     for key in ('channel_names', 'in_channels', 'input_mode', 'normalization', 'model'):
         if source_meta[key] != target_meta[key]:
             raise ValueError(f'MAE transfer incompatible {key}: {source_meta[key]} vs {target_meta[key]}')
+    if source_mode == 'lmnet':
+        for key in ('projection', 'input_protocol', 'previous_offsets', 'scan_rate_hz'):
+            if source_meta[key] != target_meta[key]:
+                raise ValueError(f'MAE transfer incompatible {key}')
     if source_meta['previous_offsets'] != target_meta['previous_offsets']:
         warnings.warn(f"MAE transfer offsets differ: {source_meta['previous_offsets']} -> {target_meta['previous_offsets']}", UserWarning)
     source, target = checkpoint['model_state_dict'], model.state_dict()
@@ -68,7 +89,7 @@ def load_mae_weights(model, path, cfg):
     model.load_state_dict({**transfer, **{key: target[key] for key in HEAD}}, strict=True)
     if not all(p.requires_grad for p in model.parameters()):
         raise ValueError('Full MOS fine-tuning requires all parameters trainable')
-    report = dict(path=str(Path(path).resolve()), format=FORMAT, epoch=checkpoint['epoch'],
+    report = dict(path=str(Path(path).resolve()), format=checkpoint['format'], epoch=checkpoint['epoch'],
                   loaded_keys=len(transfer), excluded_keys=sorted(HEAD), metadata=source_meta)
     print(f"[MAE -> MOS] Loaded {len(transfer)} backbone tensors; new two-channel head; epoch={checkpoint['epoch']}", flush=True)
     return report
