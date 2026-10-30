@@ -15,6 +15,7 @@ class ProjectionConfig:
     max_range: float | None = None
     # Frame range_xyz projects without max_range; temporal features filter it first.
     filter_max_before_projection: bool = False
+    projection_mode: str = "legacy"
 
 
 def original_points_to_pixels(points_xyzi: np.ndarray, cfg: ProjectionConfig):
@@ -23,6 +24,12 @@ def original_points_to_pixels(points_xyzi: np.ndarray, cfg: ProjectionConfig):
     Binning mirrors ``utils_torch.spherical_projection`` exactly. Elevation outside
     the configured FoV is clamped by that function, not discarded here.
     """
+    if cfg.projection_mode == "lmnet":
+        from helper.mos_projection import lmnet_projection
+        result = lmnet_projection(points_xyzi, cfg.height, cfg.width, cfg.fov_up, cfg.fov_down)
+        return result.rows, result.cols, result.usable
+    if cfg.projection_mode != "legacy":
+        raise ValueError("Unknown projection mode")
     points = np.asarray(points_xyzi, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] < 3:
         raise ValueError(f"Expected [N,>=3] points, got {points.shape}")

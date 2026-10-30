@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 
 from utils_torch import spherical_projection
 from helper.mos_input import channel_count, normalization, normalize_channels
+from helper.mos_projection import projection_mode
 
 
 class MOSFrameDataset(Dataset):
@@ -53,6 +54,13 @@ class MOSFrameDataset(Dataset):
         self.min_moving_pixels = int(min_moving_pixels)
         self.allow_missing_labels = bool(allow_missing_labels)
         self.strict_residuals = bool(cfg.get("mos_data_params", {}).get("strict_residuals", False))
+        self.lmnet = projection_mode(cfg) == 'lmnet'
+        if self.lmnet:
+            from helper.mos_augmentation import augmentation_settings, TemporalMOSAugmentation
+            self.strict_residuals = True
+            if self.require_moving:
+                raise ValueError('LMNet requires all frames; require_moving must be false')
+            self.augmentation = TemporalMOSAugmentation(augmentation_settings(cfg.get('mos_augmentation'), self.input_mode), split)
         self.normalization = normalization(cfg, self.input_mode)
 
         if self.input_mode not in self.ALLOWED_INPUT_MODES:
@@ -87,6 +95,8 @@ class MOSFrameDataset(Dataset):
             "frames_with_moving": int(self._frames_with_moving),
             "filtered_out_frames": int(self._filtered_out_frames),
         }
+        if self.lmnet:
+            self.summary.update(frames_with_moving=None, label_stats_deferred=True)
 
         print(
             "[MOSFrameDataset] total_frames={total_frames} used_frames={used_frames} "
@@ -110,6 +120,9 @@ class MOSFrameDataset(Dataset):
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
+        if self.lmnet:
+            from helper.mos_online import lmnet_frame
+            return lmnet_frame(self, sample)
 
         x_channels: List[np.ndarray] = []
         channel_names: List[str] = []
@@ -266,7 +279,8 @@ class MOSFrameDataset(Dataset):
 
                 self._total_frames += 1
                 # Always read label stats so summary counters are valid even when require_moving=False.
-                st = self._get_cached_or_load_label_stats(mos_label_path)
+                st = ({'moving_pixels': 0} if self.lmnet else
+                      self._get_cached_or_load_label_stats(mos_label_path))
                 moving_pixels = int(st["moving_pixels"])
                 if moving_pixels > 0:
                     self._frames_with_moving += 1
@@ -467,7 +481,7 @@ class MOSFrameDataset(Dataset):
 
     def _load_mos_label(self, mos_label_path: str) -> np.ndarray:
         if not os.path.isfile(mos_label_path):
-            if self.allow_missing_labels:
+            if self.allow_missing_labels and not self.lmnet:
                 warnings.warn(
                     f"Missing MOS label file: {mos_label_path}. Using ignore-only label.", RuntimeWarning
                 )
@@ -478,6 +492,8 @@ class MOSFrameDataset(Dataset):
             )
 
         arr = np.load(mos_label_path)
+        if self.lmnet and not np.isin(arr, [-1, 0, 1]).all():
+            raise ValueError(f'Invalid LMNet MOS cache targets: {mos_label_path}')
         if arr.shape != (self.H, self.W):
             raise ValueError(
                 f"MOS label shape mismatch at {mos_label_path}: got {arr.shape}, expected {(self.H, self.W)}."

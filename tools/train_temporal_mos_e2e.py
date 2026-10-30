@@ -11,6 +11,8 @@ import random
 import shutil
 import sys
 import time
+import math
+import json
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -33,6 +35,8 @@ from helper.mos_input import channel_count, normalization
 from helper.mos_augmentation import augmentation_settings
 from helper.temporal_e2e_transfer import load_mae_weights
 from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
+from helper.mos_projection import projection_mode, REFERENCE_COMMIT
+from helper.mos_optimization import make_optimizer, make_scheduler, LMNetWarmup
 
 
 def distributed():
@@ -123,10 +127,14 @@ def read_config(path):
     cfg["mos_model_params"]["in_channels"] = expected
     normalization(cfg, mode)
     cfg["mos_augmentation"] = augmentation_settings(cfg.get("mos_augmentation"), mode)
-    if str(cfg["mos_train_params"].get("optimizer", "adamw")).lower() != "adamw":
-        raise ValueError("This path supports AdamW")
-    if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() != "cosine":
-        raise ValueError("This path supports cosine scheduling")
+    projection_mode(cfg)
+    if str(cfg["mos_train_params"].get("optimizer", "adamw")).lower() not in {'adamw', 'sgd'}:
+        raise ValueError("This path supports AdamW and SGD")
+    if str(cfg["mos_train_params"].get("scheduler", "cosine")).lower() not in {'cosine', 'lmnet'}:
+        raise ValueError("This path supports cosine and lmnet scheduling")
+    selection = cfg['mos_train_params'].get('checkpoint_metric', 'moving_iou')
+    if selection not in {'moving_iou', 'mean_iou'}:
+        raise ValueError('checkpoint_metric must be moving_iou or mean_iou')
     cfg["mos_train_params"]["loss"] = loss_settings(cfg["mos_train_params"].get("loss"))
     return path.resolve(), cfg
 
@@ -165,7 +173,16 @@ def make_loader(cfg, split, batch_size, workers, device):
     generator = torch.Generator().manual_seed(seed + (dist.get_rank() if distributed() else 0))
     return DataLoader(dataset, batch_size=batch_size, shuffle=split == "train" and sampler is None,
                       sampler=sampler, num_workers=workers,
-                      pin_memory=device.type == "cuda", generator=generator)
+                      pin_memory=device.type == "cuda", generator=generator,
+                      collate_fn=collate_mos)
+
+
+def collate_mos(batch):
+    from torch.utils.data import default_collate
+    if batch[0][3] is None:
+        values = default_collate([item[:3] for item in batch])
+        return (*values, None, default_collate([item[4] for item in batch]))
+    return default_collate(batch)
 
 
 def make_criterion(cfg, device):
@@ -192,7 +209,7 @@ def amp_settings(cfg, device):
 
 def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
               accumulation=1, amp=False, amp_dtype=torch.bfloat16, clip=5.0, max_batches=None,
-              diagnose_validation=False):
+              diagnose_validation=False, update_scheduler=None, sample_log=None):
     training = optimizer is not None
     if diagnose_validation and not training:
         print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
@@ -218,6 +235,8 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
     loss_batches = 0
     samples = 0
     total_seconds = 0.0
+    first_lr = optimizer.param_groups[0]['lr'] if training else None
+    last_lr, successful_updates = first_lr, 0
     limit = min(len(loader), max_batches) if max_batches else len(loader)
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -229,6 +248,12 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
             print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
                   "fetching first validation batch", flush=True)
         x, valid, dt, y, _meta = next(iterator)
+        if sample_log is not None:
+            for j, (seq_id, stem) in enumerate(zip(_meta['seq_id'], _meta['frame_stem'])):
+                sample_log.write(json.dumps(dict(sequence=seq_id, frame=stem,
+                    phase='train' if training else 'val',
+                    lr_before_batch=optimizer.param_groups[0]['lr'] if training else None,
+                    history_available=[bool(v[j]) for v in _meta.get('history_available', [])])) + '\n')
         if diagnose_validation and not training and index == 0:
             sample_ids = list(zip(_meta["seq_id"], _meta["frame_stem"]))
             print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
@@ -287,8 +312,14 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
                         model.parameters(), clip if clip > 0 else float("inf"),
                         error_if_nonfinite=not scaler.is_enabled(),
                     )
+                    old_scale = scaler.get_scale()
+                    used_lr = optimizer.param_groups[0]['lr']
                     scaler.step(optimizer)
                     scaler.update()
+                    if scaler.get_scale() >= old_scale:
+                        last_lr, successful_updates = used_lr, successful_updates + 1
+                    if update_scheduler is not None and scaler.get_scale() >= old_scale:
+                        update_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -330,6 +361,8 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
               "samples": samples,
               ("step_seconds_per_sample" if training else "inference_seconds_per_sample"): total_seconds / samples,
               "peak_vram_bytes": int(peak_vram)}
+    if update_scheduler is not None:
+        result.update(lr_first_update=first_lr, lr_last_update=last_lr, optimizer_updates=successful_updates)
     return result
 
 
@@ -351,7 +384,7 @@ def gradient_health(model):
 
 
 def dry_run_step(model, x, valid, dt, y, criterion, optimizer, scaler, device,
-                 amp_enabled, amp_dtype, max_attempts=16):
+                 amp_enabled, amp_dtype, max_attempts=16, clip=5.):
     for attempt in range(1, max_attempts + 1):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -381,7 +414,7 @@ def dry_run_step(model, x, valid, dt, y, criterion, optimizer, scaler, device,
             continue
         if health["inactive_modules"]:
             raise AssertionError(f"No nonzero gradients in modules: {health['inactive_modules']}")
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip if clip > 0 else float('inf'), error_if_nonfinite=True)
         scaler.step(optimizer)
         scaler.update()
         if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
@@ -396,7 +429,8 @@ def synthetic_dry_run(cfg, device):
     if primary():
         print("[dry-run] building temporal model", flush=True)
     model = wrap_distributed(build_mos_model(cfg).to(device), device)
-    height, width = 32, 64
+    height, width = ((int(cfg['model_params']['grid_height']), int(cfg['model_params']['grid_width']))
+                     if projection_mode(cfg) == 'lmnet' else (32, 64))
     t = len(cfg["mos_data_params"]["previous_offsets"]) + 1
     x = torch.randn(1, t, int(cfg["mos_model_params"]["in_channels"]), height, width, device=device)
     valid = torch.ones(1, t, height, width, dtype=torch.bool, device=device)
@@ -407,7 +441,7 @@ def synthetic_dry_run(cfg, device):
     y = torch.randint(0, 2, (1, height, width), device=device)
     y[:, :4] = -1
     criterion = make_criterion(cfg, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
+    optimizer = make_optimizer(model.parameters(), cfg['mos_train_params'])
     amp_enabled, amp_dtype = amp_settings(cfg, device)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
     model.train()
@@ -415,7 +449,8 @@ def synthetic_dry_run(cfg, device):
         print(f"[dry-run] forward/backward: T={t}, input={tuple(x.shape)}, "
               f"amp={amp_enabled}, dtype={amp_dtype}", flush=True)
     logits, loss, attempts = dry_run_step(model, x, valid, dt, y, criterion, optimizer, scaler,
-                                         device, amp_enabled, amp_dtype)
+                                         device, amp_enabled, amp_dtype,
+                                         clip=float(cfg['mos_train_params'].get('clip_grad_norm', 5)))
     if primary():
         print(f"Dry run passed: T={t}, logits={tuple(logits.shape)}, loss={loss.item():.5f}, "
               f"attempts={attempts}, scale={scaler.get_scale():g}", flush=True)
@@ -425,6 +460,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cfg_path", default="src/configs/mos_semanticKitti_temporal_e2e.yaml")
     parser.add_argument("--pretrained_path", help="Full Temporal E2E MAE checkpoint; replaces only the output head")
+    parser.add_argument('--resume', help='Resume model, optimizer, scheduler and RNG state at an epoch boundary')
     parser.add_argument("--log_root", help="Override mos_log_params.log_root for this run")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int)
@@ -471,6 +507,12 @@ def train(args, device):
     cfg["run_metadata"] = {"world_size": world_size, "batch_size_per_gpu": batch_size,
                            "effective_global_batch_size": batch_size * world_size * accumulation,
                            "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "cli_args": vars(args)}
+    if projection_mode(cfg) == 'lmnet':
+        cfg['run_metadata'].update(reference_commit=REFERENCE_COMMIT,
+            comparison_deviations=[name for name, differs in
+                [('epochs_100_instead_of_150', epochs != 150), ('batch_size', batch_size != 1),
+                 ('world_size', world_size != 1), ('gradient_accumulation', accumulation != 1),
+                 ('amp', bool(train_cfg.get('amp', False)))] if differs])
     amp_enabled, amp_dtype = amp_settings(cfg, device)
     if device.type == "cuda":
         print(f"rank={rank} device={device} gpu={torch.cuda.get_device_name(device)}", flush=True)
@@ -485,12 +527,11 @@ def train(args, device):
         cfg["pretraining_transfer"] = load_mae_weights(model, train_cfg["pretrained_path"], cfg)
     model = wrap_distributed(model.to(device), device)
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=float(train_cfg["learning_rate"]),
-                                  weight_decay=float(train_cfg["weight_decay"]))
+    optimizer = make_optimizer(params, train_cfg)
     if sum(p.numel() for p in params) != sum(p.numel() for group in optimizer.param_groups for p in group["params"]):
         raise RuntimeError("Trainable parameters missing from optimizer")
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=float(train_cfg["learning_rate_min"]))
+    limit = min(len(train_loader), args.max_batches) if args.max_batches else len(train_loader)
+    scheduler = make_scheduler(optimizer, train_cfg, math.ceil(limit / accumulation))
     criterion = make_criterion(cfg, device)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
     writer = None
@@ -511,18 +552,62 @@ def train(args, device):
                 print("TensorBoard unavailable; continuing with CSV")
         print(f"run={run_dir} params={sum(p.numel() for p in model.parameters())} trainable={sum(p.numel() for p in params)}")
         csv_path = csv_dir / "epochs.csv"
-    best_iou = -1.0
-    for epoch in range(1, epochs + 1):
+    if distributed():
+        locations = [str(run_dir) if primary() else None]
+        dist.broadcast_object_list(locations, src=0)
+        run_dir = Path(locations[0])
+    best_iou, best_moving, start_epoch = -1., -1., 1
+    if getattr(args, 'resume', None):
+        saved = torch.load(args.resume, map_location=device, weights_only=False)
+        if saved['config']['run_metadata']['world_size'] != world_size:
+            raise ValueError('Resume world_size mismatch')
+        # Require the same data/model/optimization protocol; log paths and final epoch count may change.
+        for key in ('model_params', 'mos_model_params', 'mos_data_params', 'mos_augmentation'):
+            if saved['config'].get(key) != cfg.get(key):
+                raise ValueError(f'Resume config mismatch: {key}')
+        for key in ('optimizer', 'scheduler', 'learning_rate', 'momentum', 'weight_decay',
+                    'warmup_epochs', 'lr_decay_per_epoch', 'batch_size', 'gradient_accumulation',
+                    'checkpoint_metric', 'loss', 'static_class_weight', 'moving_class_weight'):
+            if saved['config']['mos_train_params'].get(key) != train_cfg.get(key):
+                raise ValueError(f'Resume optimization mismatch: {key}')
+        unwrap_model(model).load_state_dict(saved['model_state_dict'], strict=True)
+        optimizer.load_state_dict(saved['optimizer_state_dict'])
+        scheduler.load_state_dict(saved['scheduler_state_dict'])
+        scaler.load_state_dict(saved['scaler_state_dict'])
+        start_epoch = saved['epoch'] + 1
+        best_iou, best_moving = saved['best_metric'], saved['best_moving_iou']
+        state = saved['rng_states'][rank]
+        random.setstate(state['python']); np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch'].cpu())
+        if device.type == 'cuda':
+            torch.cuda.set_rng_state(state['cuda'].cpu(), device)
+        train_loader.generator.set_state(state['loader'].cpu())
+    for epoch in range(start_epoch, epochs + 1):
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
+        sample_log = (open(run_dir / f'samples_rank{rank}.jsonl', 'a')
+                      if projection_mode(cfg) == 'lmnet' and train_cfg.get('write_sample_logs', True) else None)
         train = run_phase(model, train_loader, criterion, device, optimizer, scaler,
                           accumulation, amp_enabled, amp_dtype,
-                          float(train_cfg.get("clip_grad_norm", 5.0)), args.max_batches)
+                          float(train_cfg.get("clip_grad_norm", 5.0)), args.max_batches,
+                          update_scheduler=scheduler if isinstance(scheduler, LMNetWarmup) else None,
+                          sample_log=sample_log)
         val = run_phase(model, val_loader, criterion, device, max_batches=args.max_batches,
                         amp=amp_enabled, amp_dtype=amp_dtype,
-                        diagnose_validation=getattr(args, "diagnose_validation", False))
+                        diagnose_validation=getattr(args, "diagnose_validation", False), sample_log=sample_log)
+        if sample_log is not None:
+            sample_log.close()
         trained_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step()
+        if not isinstance(scheduler, LMNetWarmup):
+            scheduler.step()
+        rng_state = dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                         cuda=torch.cuda.get_rng_state(device) if device.type == 'cuda' else None,
+                         loader=train_loader.generator.get_state())
+        rng_states = [None] * world_size
+        if distributed():
+            dist.all_gather_object(rng_states, rng_state)
+        else:
+            rng_states = [rng_state]
         if not primary():
             continue
         row = {"epoch": epoch, "lr": trained_lr}
@@ -530,27 +615,35 @@ def train(args, device):
         row.update({f"val_{k}": v for k, v in val.items()})
         with csv_path.open("a", newline="", encoding="utf-8") as handle:
             csv_writer = csv.DictWriter(handle, fieldnames=row.keys())
-            if epoch == 1:
+            if epoch == start_epoch:
                 csv_writer.writeheader()
             csv_writer.writerow(row)
         if writer:
             for key, value in row.items():
                 if key != "epoch":
                     writer.add_scalar(key, value, epoch)
+        metric = train_cfg.get('checkpoint_metric', 'moving_iou')
+        improved = val[metric] > best_iou
+        moving_improved = val['moving_iou'] > best_moving
+        best_iou, best_moving = max(best_iou, val[metric]), max(best_moving, val['moving_iou'])
         payload = {"epoch": epoch, "model_state_dict": unwrap_model(model).state_dict(),
                    "optimizer_state_dict": optimizer.state_dict(), "config": cfg,
+                   'scheduler_state_dict': scheduler.state_dict(), 'scaler_state_dict': scaler.state_dict(),
+                   'best_metric': best_iou, 'best_moving_iou': best_moving, 'rng_states': rng_states,
+                   'checkpoint_metric': metric,
                    "input_normalization": normalization(cfg, cfg["mos_data_params"]["input_mode"]),
-                   "val_moving_iou": val["moving_iou"]}
+                   "val_moving_iou": val["moving_iou"], 'val_mean_iou': val['mean_iou']}
         torch.save(payload, checkpoint_dir / "last.pt")
-        if val["moving_iou"] > best_iou:
-            best_iou = val["moving_iou"]
+        if moving_improved:
             torch.save(payload, checkpoint_dir / "best_moving_iou.pt")
+        if improved and metric == 'mean_iou':
+            torch.save(payload, checkpoint_dir / 'best_mean_iou.pt')
         print(f"epoch={epoch} train_loss={train['loss']:.5f} val_loss={val['loss']:.5f} "
               f"val_moving_iou={val['moving_iou']:.5f} best={best_iou:.5f}")
     if writer:
         writer.close()
     if primary():
-        print(f"Best checkpoint: {checkpoint_dir / 'best_moving_iou.pt'}")
+        print(f"Best checkpoint: {checkpoint_dir / ('best_' + train_cfg.get('checkpoint_metric', 'moving_iou') + '.pt')}")
 
 
 if __name__ == "__main__":

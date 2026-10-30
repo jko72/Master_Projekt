@@ -48,7 +48,9 @@ def evaluate(model, loader, criterion, device, history_mode="normal", max_batche
             if index >= limit:
                 break
             x, valid = apply_history_mode(x, valid, history_mode)
-            x, valid, dt, y = (v.to(device) for v in (x, valid, dt, y))
+            x, valid, dt = (v.to(device) for v in (x, valid, dt))
+            if y is not None:
+                y = y.to(device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
@@ -56,18 +58,20 @@ def evaluate(model, loader, criterion, device, history_mode="normal", max_batche
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             seconds += time.perf_counter() - start
-            loss = criterion(logits, y)
+            loss = criterion(logits, y) if y is not None else logits.new_zeros(())
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite evaluation loss in batch {index}")
             n = x.shape[0]
             samples += n
             total_loss += float(loss) * n
-            add_counts(counts, compute_counts_from_pred_target(logits.argmax(1), y))
+            if y is not None:
+                add_counts(counts, compute_counts_from_pred_target(logits.argmax(1), y))
             if index == 0 or (index + 1) % 20 == 0 or index + 1 == limit:
                 print(f"eval {index + 1}/{limit}", flush=True)
     if not samples:
         raise ValueError("Evaluation loader produced no samples")
-    return {"loss": total_loss / samples, **metrics_from_counts(counts), **counts,
+    return {"loss": total_loss / samples if counts['valid_pixels'] else None,
+            **(metrics_from_counts(counts) if counts['valid_pixels'] else {}), **counts,
             "samples": samples, "inference_seconds_per_sample": seconds / samples,
             "peak_vram_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0}
 

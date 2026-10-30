@@ -471,15 +471,10 @@ def print_trainable_summary(model: torch.nn.Module):
         print(f"[PARAMS] non_encoder total={non_encoder_total}, trainable={non_encoder_trainable}")
 
 
-def _make_optimizer(optimizer_name: str, params, lr: float, weight_decay: float):
-    optimizer_name = str(optimizer_name).lower()
-    if optimizer_name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    if optimizer_name == "adam":
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
-    if optimizer_name == "sgd":
-        return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    raise ValueError(f"Unsupported optimizer='{optimizer_name}'. Currently supported: ['adamw', 'adam', 'sgd']")
+def _make_optimizer(optimizer_name: str, params, lr: float, weight_decay: float, momentum=.9):
+    from helper.mos_optimization import make_optimizer
+    return make_optimizer(params, dict(optimizer=optimizer_name, learning_rate=lr,
+                                       weight_decay=weight_decay, momentum=momentum))
 
 
 def get_group_name(group, idx):
@@ -735,6 +730,7 @@ def build_optimizer_with_param_groups(model: torch.nn.Module, cfg: Dict):
             params=params,
             lr=base_lr,
             weight_decay=weight_decay,
+            momentum=float(mtrain.get('momentum', .9)),
         )
         print("[OPTIMIZER] using single parameter group lr={0:g} params={1}".format(
             base_lr,
@@ -773,6 +769,7 @@ def build_optimizer_with_param_groups(model: torch.nn.Module, cfg: Dict):
         params=param_groups,
         lr=base_lr,
         weight_decay=weight_decay,
+        momentum=float(mtrain.get('momentum', .9)),
     )
     print("[OPTIMIZER] using separate parameter groups:")
     for group in optimizer.param_groups:
@@ -806,6 +803,9 @@ def is_encoder_frozen_for_epoch(epoch: int, freeze_encoder_epochs: int) -> bool:
 
 
 def print_dataset_class_stats(name: str, dataset: MOSFrameDataset):
+    if dataset.lmnet:
+        print(f'{name}_label_stats: online labels; no startup projection/statistics pass')
+        return
     stats = dataset.get_class_stats()
     print(
         f"{name}_label_stats  : "

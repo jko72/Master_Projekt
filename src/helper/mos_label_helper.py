@@ -74,12 +74,19 @@ def _project_point_indices(points_xyzi, cfg: Dict):
     Project points onto range-view grid with the same convention as utils_torch.spherical_projection.
     Returns a proj_idx image with indices into the ORIGINAL input array.
     """
+    from helper.mos_projection import projection_mode, lmnet_projection
     mp = cfg["model_params"]
+    if projection_mode(cfg) == "lmnet":
+        result = lmnet_projection(points_xyzi, int(mp['grid_height']), int(mp['grid_width']),
+                                  mp.get('FOV_UP', 3), mp.get('FOV_DOWN', -25))
+        ranges = np.full(result.indices.shape, -1, np.float32)
+        ranges[result.occupied] = result.ranges[result.indices[result.occupied]]
+        return result.indices, ranges
     mosp = cfg.get("mos_label_params", {})
     H = int(mp["grid_height"])
     W = int(mp["grid_width"])
     min_range = float(mosp.get("min_range", 0.0))
-    max_range = float(mosp.get("max_range", 80.0))
+    max_range = mosp.get("max_range", 80.0)
     theta_min, theta_max = _theta_range_from_cfg(cfg)
 
     points = np.asarray(points_xyzi, dtype=np.float32)
@@ -95,7 +102,9 @@ def _project_point_indices(points_xyzi, cfg: Dict):
     r = np.sqrt(x * x + y * y + z * z)
 
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(r)
-    valid &= (r > float(min_range)) & (r < float(max_range))
+    valid &= r > min_range
+    if max_range is not None:
+        valid &= r < float(max_range)
     if not np.any(valid):
         return proj_idx, proj_range
 

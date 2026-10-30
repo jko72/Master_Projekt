@@ -8,6 +8,8 @@ import csv
 import datetime
 import math
 import random
+from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
 import shutil
 import sys
@@ -24,7 +26,8 @@ import train_temporal_mos_e2e as mos
 from helper.mos_eval_utils import select_sequences
 from helper.mos_input import normalization
 from helper.mos_augmentation import augmentation_settings
-from helper.temporal_e2e_transfer import FORMAT, input_metadata, validate_mae_checkpoint
+from helper.temporal_e2e_transfer import FORMAT, input_metadata, validate_mae_checkpoint, checkpoint_format
+from helper.mos_projection import projection_mode
 from temporal_e2e_mae_dataset import TemporalE2EMAEDataset, mask_settings, masked_input
 from loss_temporal_e2e_mae import reconstruction_loss, reconstruction_settings
 
@@ -62,6 +65,7 @@ def read_config(path):
         raise ValueError('MAE image dimensions must be positive multiples of 16')
     mos.check_splits(data)
     cfg['mos_augmentation'] = augmentation_settings(cfg.get('mos_augmentation'), data['input_mode'])
+    projection_mode(cfg)
     mae = cfg['mae_params']
     if set(mae) - {'mask', 'loss'}:
         raise ValueError('Only mask and reconstruction loss are supported in mae_params')
@@ -73,6 +77,9 @@ def read_config(path):
                     clip_grad_norm=5., seed=42, amp=True, amp_dtype='bfloat16', deterministic=False,
                     optimizer='adamw', scheduler='warmup_cosine')
     cfg['mae_train_params'] = train = {**defaults, **train}
+    accumulation = train.get('gradient_accumulation', 1)
+    if type(accumulation) is not int or accumulation < 1:
+        raise ValueError('mae_train_params.gradient_accumulation must be a positive integer')
     for key in ('epochs', 'batch_size', 'num_workers', 'num_warmup_epochs', 'seed'):
         if type(train[key]) is not int or train[key] < (1 if key in ('epochs', 'batch_size') else 0):
             raise ValueError(f'mae_train_params.{key} has an invalid integer value')
@@ -134,6 +141,8 @@ def make_scheduler(optimizer, train):
 
 
 def phase(model, loader, cfg, device, optimizer=None, scaler=None, max_batches=None):
+    if optimizer is not None and cfg['mae_train_params'].get('gradient_accumulation', 1) > 1:
+        return accumulated_phase(model, loader, cfg, device, optimizer, scaler, max_batches)
     training = optimizer is not None
     model.train(training)
     if not training:
@@ -190,6 +199,86 @@ def phase(model, loader, cfg, device, optimizer=None, scaler=None, max_batches=N
     return results
 
 
+def accumulated_phase(model, loader, cfg, device, optimizer, scaler, max_batches=None):
+    """Exact masked-pixel objective across each CPU-buffered accumulation group.
+
+    Only one microbatch lives on the GPU. BatchNorm still uses microbatch
+    statistics; accumulation does not emulate a larger physical BatchNorm batch.
+    """
+    model.train()
+    amp, dtype = amp_settings(cfg, device)
+    train, spec = cfg['mae_train_params'], cfg['mae_params']['loss']
+    accumulation = train['gradient_accumulation']
+    iterator = iter(loader) if max_batches is None else islice(loader, max_batches)
+    totals = torch.zeros(9, device=device, dtype=torch.float64)
+    names = ('xyz', 'range', 'intensity')
+    channel_slices = (slice(0, 3), slice(3, 4), slice(4, 5))
+    steps = skipped = samples = batch_index = 0
+    world = dist.get_world_size() if mos.distributed() else 1
+    while True:
+        group = list(islice(iterator, accumulation))
+        if not group:
+            break
+        # Denominators are known before forward: predictions must be finite.
+        counts = torch.zeros(3, dtype=torch.float64, device=device)
+        for batch in group:
+            selected = batch['valid'][:, -1].bool() & batch['mask'].bool()
+            for j, channels in enumerate(channel_slices):
+                target = batch['target_current'][:, channels]
+                count = ((selected & torch.isfinite(target).all(1)).sum() * target.shape[1])
+                counts[j] += count.to(device)
+        if mos.distributed():
+            dist.all_reduce(counts)
+        if not (counts > 0).any():
+            raise ValueError('Accumulation group has no valid masked targets')
+        optimizer.zero_grad(set_to_none=True)
+        for index, batch in enumerate(group):
+            synchronize = index == len(group)-1
+            context = model.no_sync() if isinstance(model, mos.DDP) and not synchronize else nullcontext()
+            x, valid, dt, mask, target = [batch[k].to(device, non_blocking=True)
+                                         for k in ('x', 'valid', 'dt', 'mask', 'target_current')]
+            with context:
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp):
+                    pred = model(masked_input(x, mask), valid, dt)
+                    loss, stats = reconstruction_loss(pred, target, valid[:, -1], mask, spec)
+                if not torch.isfinite(pred).all() or not torch.isfinite(loss):
+                    raise FloatingPointError(f'Non-finite MAE prediction/loss at batch {batch_index}')
+                objective = sum(spec[n+'_weight'] * stats['sums'][n] * world /
+                                counts[j].clamp_min(1) for j, n in enumerate(names))
+                scaler.scale(objective).backward()
+            values = [stats['sums'][n].detach() for n in names]
+            values += [stats['counts'][n].detach() for n in names]
+            values += [stats['valid_pixels'], stats['masked_valid_pixels'], stats['pixels']]
+            totals += torch.tensor([float(v) for v in values], dtype=torch.float64, device=device)
+            samples += x.shape[0]
+            batch_index += 1
+            if mos.primary() and (batch_index == 1 or batch_index % 20 == 0):
+                print(f'[E2E-MAE train] batch={batch_index} loss={float(loss.detach()):.6f} accumulation={accumulation}', flush=True)
+        scaler.unscale_(optimizer)
+        clip = train['clip_grad_norm']
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip if clip else float('inf'),
+                                       error_if_nonfinite=not scaler.is_enabled())
+        old_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        if scaler.get_scale() < old_scale:
+            skipped += 1
+        else:
+            steps += 1
+    if mos.distributed():
+        dist.all_reduce(totals)
+        sample_tensor = torch.tensor(samples, device=device)
+        dist.all_reduce(sample_tensor)
+        samples = int(sample_tensor)
+    if totals[8] == 0 or totals[7] == 0:
+        raise ValueError('MAE phase contains no valid masked reconstruction targets')
+    results = {'loss_'+n: float(totals[j]/totals[j+3].clamp_min(1)) for j, n in enumerate(names)}
+    results['loss_total'] = sum(spec[n+'_weight']*results['loss_'+n] for n in names)
+    results.update(valid_ratio=float(totals[6]/totals[8]), masked_valid_ratio=float(totals[7]/totals[6].clamp_min(1)),
+                   optimizer_steps=steps, amp_skipped_steps=skipped, samples=samples)
+    return results
+
+
 def capture_rng(loaders):
     return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
                 cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
@@ -208,7 +297,7 @@ def restore_rng(state, loaders):
 
 def checkpoint_payload(model, optimizer, scheduler, scaler, cfg, epoch, best, rng):
     raw = mos.unwrap_model(model)
-    return dict(format=FORMAT, model_state_dict=raw.state_dict(),
+    return dict(format=checkpoint_format(cfg), model_state_dict=raw.state_dict(),
                 encoder_state_dict=raw.encoder.state_dict(), temporal_state_dict=raw.temporal.state_dict(),
                 decoder_state_dict=raw.decoder.state_dict(), optimizer_state_dict=optimizer.state_dict(),
                 scheduler_state_dict=scheduler.state_dict(), scaler_state_dict=scaler.state_dict(),
@@ -264,7 +353,7 @@ def history_diagnostics(model, batch, cfg, device):
 def train(args, device):
     source, cfg = read_config(args.cfg_path)
     t = cfg['mae_train_params']
-    for key in ('epochs', 'batch_size', 'num_workers'):
+    for key in ('epochs', 'batch_size', 'num_workers', 'gradient_accumulation'):
         override = getattr(args, key, None)
         if override is not None:
             if override < (0 if key == 'num_workers' else 1):
@@ -276,8 +365,13 @@ def train(args, device):
     world = dist.get_world_size() if mos.distributed() else 1
     cfg['run_metadata'] = dict(task='temporal_e2e_masked_reconstruction', world_size=world,
                                batch_size_per_gpu=t['batch_size'],
-                               effective_global_batch_size=t['batch_size']*world,
+                               effective_global_batch_size=t['batch_size']*world*t.get('gradient_accumulation', 1),
                                cli_args=vars(args))
+    if 'gradient_accumulation' in t:
+        cfg['run_metadata']['gradient_accumulation'] = t['gradient_accumulation']
+    if projection_mode(cfg) == 'lmnet':
+        cfg['run_metadata'].update(input_protocol='lmnet_v1', reconstruction_units='standardized_xyzri',
+            batchnorm_batch='microbatch', mask_patch=list(cfg['mae_params']['mask'][k] for k in ('patch_h','patch_w')))
     mos.seed_all(t['seed'] + rank, t['deterministic'])
     amp, dtype = amp_settings(cfg, device)
     model = mos.wrap_distributed(mos.build_mos_model(cfg).to(device), device)
@@ -374,6 +468,7 @@ def main():
     parser.add_argument('--epochs', type=int)
     parser.add_argument('--batch_size', type=int)
     parser.add_argument('--num_workers', type=int)
+    parser.add_argument('--gradient_accumulation', type=int, help='Optimizer accumulation steps; defaults to config or 1')
     parser.add_argument('--max_batches', type=int)
     parser.add_argument('--resume')
     parser.add_argument('--dry-run', action='store_true')

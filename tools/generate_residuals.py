@@ -63,6 +63,12 @@ def main():
     with open(args.cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
     cfg = _ensure_residual_defaults(cfg)
+    from helper.mos_cache import check_cache
+    from helper.mos_projection import projection_mode
+    if projection_mode(cfg) == 'lmnet' and (cfg['residual_params']['min_range'] != 2 or
+                                           cfg['residual_params']['max_range'] != 50 or
+                                           not cfg['residual_params']['normalize']):
+        raise ValueError('LMNet residual preparation requires strict 2<r<50 and normalization')
 
     rp = cfg["residual_params"]
     if not rp.get("enabled", True):
@@ -100,6 +106,7 @@ def main():
 
         for off in offsets:
             folder = rp["folder_template"].format(offset=off)
+            check_cache(os.path.join(seq_dir, folder), cfg, 'residual', seq_dir, off, create=True)
             os.makedirs(os.path.join(seq_dir, folder), exist_ok=True)
 
         for idx in range(n_frames):

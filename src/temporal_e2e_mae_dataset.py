@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from helper.mos_augmentation import TemporalMOSAugmentation, augmentation_settings
 from helper.temporal_e2e_input import TemporalE2EInputMixin
 from mos_dataset import MOSFrameDataset
+from helper.mos_projection import projection_mode
 
 
 def mask_settings(value):
@@ -76,6 +77,7 @@ class TemporalE2EMAEDataset(TemporalE2EInputMixin, Dataset):
         if split not in {'train', 'val'}:
             raise ValueError('MAE supports train and val only; test sequences must not be pretrained')
         self.cfg, self.split, self.epoch = cfg, split, 0
+        self.lmnet = projection_mode(cfg) == 'lmnet'
         data, mp = cfg['mos_data_params'], cfg['model_params']
         self.temporal_input_mode = data['input_mode']
         if self.temporal_input_mode != 'range_xyz_intensity':
@@ -97,11 +99,15 @@ class TemporalE2EMAEDataset(TemporalE2EInputMixin, Dataset):
             raise ValueError('Test sequence passed to MAE dataset')
         self.samples = []
         for seq_id, seq in self.sequence_map.items():
-            for i in range(max(self.offsets), min(len(seq['paths']), len(seq['poses']))):
+            if self.lmnet and len(seq['poses']) < len(seq['paths']):
+                raise ValueError(f'Missing current poses for sequence {seq_id}')
+            for i in range(0 if self.lmnet else max(self.offsets), min(len(seq['paths']), len(seq['poses']))):
                 indices = [i-off for off in self.offsets] + [i]
-                if not all(self._extract_scan_path(seq['paths'][j]) is not None for j in indices):
+                if not self.lmnet and not all(self._extract_scan_path(seq['paths'][j]) is not None for j in indices):
                     continue
                 path = self._extract_scan_path(seq['paths'][i])
+                if path is None:
+                    continue
                 self.samples.append(dict(seq_id=seq_id, frame_index=i, scan_path=path, frame_stem=Path(path).stem))
 
     def set_epoch(self, epoch):
@@ -111,7 +117,8 @@ class TemporalE2EMAEDataset(TemporalE2EInputMixin, Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        x, valid, dt, _, meta = self._load_temporal_input(self.samples[index])
+        load = self._load_lmnet_mae_input if self.lmnet else self._load_temporal_input
+        x, valid, dt, _, meta = load(self.samples[index])
         # Fixed validation masks permit comparisons of epochs/checkpoints.
         epoch = self.epoch if self.split == 'train' else 0
         generator = torch.Generator().manual_seed(self.seed + 1_000_003*epoch + 9_973*index)
