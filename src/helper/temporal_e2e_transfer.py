@@ -72,8 +72,12 @@ def load_mae_weights(model, path, cfg):
     if source_meta['previous_offsets'] != target_meta['previous_offsets']:
         warnings.warn(f"MAE transfer offsets differ: {source_meta['previous_offsets']} -> {target_meta['previous_offsets']}", UserWarning)
     source, target = checkpoint['model_state_dict'], model.state_dict()
-    if set(source) != set(target):
-        raise ValueError(f'MAE transfer key mismatch; missing={sorted(set(target)-set(source))}, unexpected={sorted(set(source)-set(target))}')
+    fresh_heads = HEAD | ({'movable_head.weight', 'movable_head.bias'} if getattr(model, 'auxiliary_movable', False) else set())
+    if getattr(model, 'auxiliary_task', None) == 'residual':
+        fresh_heads |= {'residual_head.weight', 'residual_head.bias'}
+    expected_keys = set(target) - (fresh_heads - HEAD)
+    if set(source) != expected_keys:
+        raise ValueError(f'MAE transfer key mismatch; missing={sorted(expected_keys-set(source))}, unexpected={sorted(set(source)-expected_keys)}')
     for key, tensor in source.items():
         if not torch.is_tensor(tensor):
             raise ValueError(f'MAE transfer non-tensor state: {key}')
@@ -85,11 +89,11 @@ def load_mae_weights(model, path, cfg):
     if model.decoder.logits.out_channels != 2:
         raise ValueError('MOS transfer target must have two output channels')
     transfer = {key: tensor for key, tensor in source.items() if key not in HEAD}
-    # Validate everything before mutating the target. Strictly retain only its new head.
-    model.load_state_dict({**transfer, **{key: target[key] for key in HEAD}}, strict=True)
+    # Validate everything before mutating the target. Retain exactly the fresh task heads.
+    model.load_state_dict({**transfer, **{key: target[key] for key in fresh_heads}}, strict=True)
     if not all(p.requires_grad for p in model.parameters()):
         raise ValueError('Full MOS fine-tuning requires all parameters trainable')
     report = dict(path=str(Path(path).resolve()), format=checkpoint['format'], epoch=checkpoint['epoch'],
-                  loaded_keys=len(transfer), excluded_keys=sorted(HEAD), metadata=source_meta)
+                  loaded_keys=len(transfer), excluded_keys=sorted(fresh_heads), metadata=source_meta)
     print(f"[MAE -> MOS] Loaded {len(transfer)} backbone tensors; new two-channel head; epoch={checkpoint['epoch']}", flush=True)
     return report

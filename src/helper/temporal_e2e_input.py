@@ -7,7 +7,7 @@ from temporal_mae_dataset import project_range_features
 
 
 class TemporalE2EInputMixin:
-    def _project_lmnet_temporal(self, sample, labels=None):
+    def _project_lmnet_temporal(self, sample, labels=None, return_clean=False):
         """Shared label-independent geometry for supervised MOS and MAE."""
         from helper.mos_projection import project_features
         from pathlib import Path
@@ -29,11 +29,43 @@ class TemporalE2EInputMixin:
         scans.append(self._read_points(sample['scan_path']))
         if labels is not None and len(labels) != len(scans[-1]):
             raise ValueError(f'Point/label length mismatch: {sample["scan_path"]}')
-        scans, labels = self.augmentation.raw_scans(scans, labels)
+        if return_clean:
+            scans, labels, details = self.augmentation.raw_scans(scans, labels, return_details=True)
+        else:
+            scans, labels = self.augmentation.raw_scans(scans, labels)
         projected = [project_features(points, self.H, self.W, self.theta_range,
                                       'intensity' in self.temporal_input_mode) for points in scans]
         features, masks, maps = zip(*projected)
-        return features, masks, maps, labels, paths, available
+        result = features, masks, maps, labels, paths, available
+        return (*result, details) if return_clean else result
+
+    def _load_lmnet_residual_input(self, sample):
+        from helper.mos_online import point_labels, is_test
+        from helper.mos_projection import project_targets, lmnet_projection
+        from helper.residual_helper import compute_residual_target
+        if is_test(sample):
+            # Only the established temporal input: no clean projections or targets.
+            x, valid, dt, _, meta = self._load_lmnet_mae_input(sample)
+            return x, valid, dt, None, None, meta
+        labels = point_labels(sample)
+        features, masks, maps, labels, paths, available, details = self._project_lmnet_temporal(
+            sample, labels, return_clean=True)
+        clean = [lmnet_projection(points, self.H, self.W,
+                 np.rad2deg(self.theta_range[1]), np.rad2deg(self.theta_range[0]))
+                 for points in details['clean_scans']]
+        target, target_valid, stats = compute_residual_target(
+            clean[-1], clean[0], current_input=maps[-1],
+            input_original_ids=details['current_original_ids'], history_available=available[0],
+            settings=self.auxiliary_settings['residual'], return_diagnostics=True)
+        # One range-view augmentation draw for MOS, regression and its validity.
+        targets = torch.stack((torch.from_numpy(project_targets(labels, maps[-1])).float(),
+                               torch.from_numpy(target), torch.from_numpy(target_valid).float()))
+        x, valid, dt, targets, meta = self._finish_lmnet_temporal(
+            sample, features, masks, paths, available, targets)
+        mask = (targets[2] > 0) & valid[-1]
+        auxiliary = dict(task='residual', target=targets[1].masked_fill(~mask, 0),
+                         valid_mask=mask, stats=stats)
+        return x, valid, dt, targets[0].long(), auxiliary, meta
 
     def _finish_lmnet_temporal(self, sample, features, masks, paths, available, y=None):
         spec = normalization(self.cfg, self.temporal_input_mode)
@@ -63,17 +95,26 @@ class TemporalE2EInputMixin:
         from helper.mos_online import point_labels, is_test
         from helper.mos_cache import check_cache
         from pathlib import Path
-        online = self.split == 'train' or self.cfg['mos_data_params'].get('online_validation_labels', False)
-        labels = point_labels(sample) if online and not is_test(sample) else None
+        auxiliary = getattr(self, 'include_movable', False)
+        online = auxiliary or self.split == 'train' or self.cfg['mos_data_params'].get('online_validation_labels', False)
+        labels = None
+        if online and not is_test(sample):
+            labels = point_labels(sample, include_movable=True) if auxiliary else point_labels(sample)
         features, masks, maps, labels, paths, available = self._project_lmnet_temporal(sample, labels)
         if is_test(sample):
             y = None
         elif online:
-            y = torch.from_numpy(project_targets(labels, maps[-1]))
+            y = torch.from_numpy(np.stack([project_targets(labels[:, j], maps[-1]) for j in range(2)])
+                                 if auxiliary else project_targets(labels, maps[-1]))
         else:
             check_cache(Path(sample['mos_label_path']).parent, self.cfg, 'labels', sample['seq_dir'])
             y = torch.from_numpy(self._load_mos_label(sample['mos_label_path']).astype(np.int64))
-        return self._finish_lmnet_temporal(sample, features, masks, paths, available, y)
+        result = self._finish_lmnet_temporal(sample, features, masks, paths, available, y)
+        if auxiliary:
+            x, valid, dt, targets, meta = result
+            mos, movable = (None, None) if targets is None else (targets[0], targets[1])
+            return x, valid, dt, mos, movable, meta
+        return result
 
     @staticmethod
     def _read_points(path):

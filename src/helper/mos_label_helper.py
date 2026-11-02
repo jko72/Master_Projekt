@@ -17,6 +17,22 @@ STATIC_LABELS = np.array(
     dtype=np.uint16,
 )
 
+# MF-MOS movable_learning_map, shifted from {ignore:0, non-movable:1,
+# movable:2} to this pipeline's {-1,0,1}. Preserve the on-rails asymmetry.
+MOVABLE_LABELS = np.array([10, 11, 13, 15, 18, 20, 30, 31, 32,
+                          251, 252, 253, 254, 255, 256, 257, 258, 259], dtype=np.uint16)
+NON_MOVABLE_LABELS = np.array([9, 16, 40, 44, 48, 49, 50, 51, 52,
+                              60, 70, 71, 72, 80, 81, 99], dtype=np.uint16)
+
+
+def map_semantickitti_to_movable(raw_labels) -> np.ndarray:
+    """Map raw uint32 (or semantic IDs) to -1 ignore, 0 non-movable, 1 movable."""
+    sem = np.asarray(raw_labels, dtype=np.uint32) & 0xFFFF
+    result = np.full(sem.shape, -1, dtype=np.int16)
+    result[np.isin(sem, NON_MOVABLE_LABELS)] = 0
+    result[np.isin(sem, MOVABLE_LABELS)] = 1
+    return result
+
 
 def load_semantickitti_labels(label_path) -> np.ndarray:
     """Load raw SemanticKITTI labels from .label file as uint32."""

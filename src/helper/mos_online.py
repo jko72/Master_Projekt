@@ -7,10 +7,14 @@ from helper.mos_projection import project_features, project_targets
 from helper.mos_input import normalize_feature_tensor
 
 
-def point_labels(sample):
+def point_labels(sample, include_movable=False):
     path = Path(sample['seq_dir']) / 'labels' / (sample['frame_stem'] + '.label')
     raw = np.fromfile(path, dtype=np.uint32)
-    return map_semantickitti_to_mos(raw & 0xFFFF)
+    mos = map_semantickitti_to_mos(raw & 0xFFFF)
+    if include_movable:
+        from helper.mos_label_helper import map_semantickitti_to_movable
+        return np.stack((mos, map_semantickitti_to_movable(raw)), axis=1)
+    return mos
 
 
 def is_test(sample):
