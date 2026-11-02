@@ -36,6 +36,7 @@ from helper.mos_augmentation import augmentation_settings
 from helper.temporal_e2e_transfer import load_mae_weights
 from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
 from helper.mos_projection import projection_mode, REFERENCE_COMMIT
+from helper.mos_auxiliary import auxiliary_settings, validate_auxiliary_config, attach_auxiliary_criterion, corrected_task_loss
 from helper.mos_optimization import make_optimizer, make_scheduler, LMNetWarmup
 
 
@@ -136,6 +137,8 @@ def read_config(path):
     if selection not in {'moving_iou', 'mean_iou'}:
         raise ValueError('checkpoint_metric must be moving_iou or mean_iou')
     cfg["mos_train_params"]["loss"] = loss_settings(cfg["mos_train_params"].get("loss"))
+    if 'mos_auxiliary' in cfg:
+        cfg['mos_auxiliary'] = validate_auxiliary_config(cfg)
     return path.resolve(), cfg
 
 
@@ -181,7 +184,7 @@ def collate_mos(batch):
     from torch.utils.data import default_collate
     if batch[0][3] is None:
         values = default_collate([item[:3] for item in batch])
-        return (*values, None, default_collate([item[4] for item in batch]))
+        return (*values, *([None] * (len(batch[0]) - 4)), default_collate([item[-1] for item in batch]))
     return default_collate(batch)
 
 
@@ -191,9 +194,11 @@ def make_criterion(cfg, device):
                            dtype=torch.float32, device=device)
     settings = loss_settings(train.get("loss"))
     if settings["type"] == "ce_lovasz":
-        return MOSCrossEntropyLovasz(weights, settings["lovasz_weight"],
-                                    settings["lovasz_classes"], settings["lovasz_per_image"])
-    return torch.nn.CrossEntropyLoss(weight=weights, ignore_index=-1)
+        criterion = MOSCrossEntropyLovasz(weights, settings["lovasz_weight"],
+                                         settings["lovasz_classes"], settings["lovasz_per_image"])
+    else:
+        criterion = torch.nn.CrossEntropyLoss(weight=weights, ignore_index=-1)
+    return attach_auxiliary_criterion(criterion, cfg, device)
 
 
 def amp_settings(cfg, device):
@@ -210,6 +215,7 @@ def amp_settings(cfg, device):
 def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
               accumulation=1, amp=False, amp_dtype=torch.bfloat16, clip=5.0, max_batches=None,
               diagnose_validation=False, update_scheduler=None, sample_log=None):
+    phase_start = time.perf_counter()
     training = optimizer is not None
     if diagnose_validation and not training:
         print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
@@ -229,6 +235,15 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
                 raise FloatingPointError("Non-finite model state before validation")
     forward_model = model if training else unwrap_model(model)
     counts = empty_counts()
+    aux_criterion = getattr(criterion, 'movable_criterion', None)
+    residual_criterion = getattr(criterion, 'residual_criterion', None)
+    residual_stats = None
+    if residual_criterion is not None:
+        from helper.mos_residual_auxiliary import ResidualStatistics
+        residual_stats = ResidualStatistics(criterion.residual_settings, device)
+    pending = []
+    aux_counts = empty_counts()
+    aux_ce_sum = aux_weight_sum = aux_lovasz_sum = 0.0
     total_loss = 0.0
     total_loss_weight = 0.0
     total_lovasz = 0.0
@@ -247,7 +262,27 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         if diagnose_validation and not training and index == 0:
             print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
                   "fetching first validation batch", flush=True)
-        x, valid, dt, y, _meta = next(iterator)
+        if residual_criterion is not None and training:
+            if index % accumulation == 0:
+                group_size = min(accumulation, limit-index)
+                # Prefetch targets only; graphs are built and freed one microbatch at a time.
+                pending = [next(iterator) for _ in range(group_size)]
+                group_count = torch.tensor(sum(int(b[4]['valid_mask'].sum()) for b in pending),
+                                           dtype=torch.int64, device=device)
+                if distributed():
+                    dist.all_reduce(group_count)
+            batch = pending[index % accumulation]
+        else:
+            batch = next(iterator)
+        if residual_criterion is not None:
+            x, valid, dt, y, residual, _meta = batch
+            residual_target = residual['target'].to(device, non_blocking=True)
+            residual_valid = residual['valid_mask'].to(device, non_blocking=True)
+        elif aux_criterion is not None:
+            x, valid, dt, y, y_movable, _meta = batch
+            y_movable = y_movable.to(device, non_blocking=True)
+        else:
+            x, valid, dt, y, _meta = batch
         if sample_log is not None:
             for j, (seq_id, stem) in enumerate(zip(_meta['seq_id'], _meta['frame_stem'])):
                 sample_log.write(json.dumps(dict(sequence=seq_id, frame=stem,
@@ -272,10 +307,21 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         with torch.set_grad_enabled(training), sync_context:
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=amp and device.type == "cuda"):
-                logits = forward_model(x, valid, dt)
+                if residual_criterion is not None:
+                    logits, residual_output = forward_model(x, valid, dt, return_aux=True)
+                    residual_components = residual_criterion.components(residual_output, residual_target, residual_valid)
+                elif aux_criterion is not None:
+                    logits, movable_logits = forward_model(x, valid, dt, return_aux=True)
+                    aux_components = loss_components(aux_criterion, movable_logits, y_movable)
+                else:
+                    logits = forward_model(x, valid, dt)
                 components = loss_components(criterion, logits, y)
                 loss_ce, loss_lovasz = components["loss_ce"], components["loss_lovasz"]
                 loss = components["loss_total"]
+                if residual_criterion is not None:
+                    loss = loss + criterion.auxiliary_loss_weight * residual_components["loss_total"]
+                if aux_criterion is not None:
+                    loss = loss + criterion.auxiliary_loss_weight * aux_components["loss_total"]
             if diagnose_validation and not training and index == 0:
                 print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
                       f"first validation forward complete: logits_finite={bool(torch.isfinite(logits).all())} "
@@ -292,20 +338,17 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
                     f"nonfinite_parameters={bad_parameters[:10]}"
                 )
             if training:
-                # CrossEntropyLoss(weight=...) divides by the local sum of class weights.
-                # Correct DDP's rank average to match a single global weighted batch.
-                loss_weight = criterion.weight[y[y != -1]].sum() if criterion.weight is not None else (y != -1).sum()
-                backward_loss = loss_ce
-                if distributed():
-                    global_weight = loss_weight.detach().clone()
-                    dist.all_reduce(global_weight)
-                    backward_loss = loss_ce * loss_weight * dist.get_world_size() / global_weight
-                # DDP already averages rank gradients. Lovasz is local and
-                # nonadditive: never apply CE's weight correction to it.
-                if isinstance(criterion, MOSCrossEntropyLovasz):
-                    backward_loss = backward_loss + criterion.lovasz_weight * loss_lovasz
+                backward_loss = corrected_task_loss(criterion, components, y)
+                if aux_criterion is not None:
+                    backward_loss = backward_loss + criterion.auxiliary_loss_weight * corrected_task_loss(
+                        aux_criterion, aux_components, y_movable)
                 group_size = min(accumulation, limit - (index // accumulation) * accumulation)
-                scaler.scale(backward_loss / group_size).backward()
+                backward_loss = backward_loss / group_size
+                if residual_criterion is not None:
+                    world_size = dist.get_world_size() if distributed() else 1
+                    backward_loss = backward_loss + criterion.auxiliary_loss_weight * (
+                        residual_components['loss_sum'] * world_size / group_count.clamp_min(1))
+                scaler.scale(backward_loss).backward()
                 if sync_step:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -329,6 +372,15 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         total_loss += float(loss_ce.detach()) * weight
         total_loss_weight += weight
         total_lovasz += float(loss_lovasz.detach())
+        if aux_criterion is not None:
+            aux_weight = float(aux_criterion.weight[y_movable[y_movable != -1]].sum())
+            aux_ce_sum += float(aux_components['loss_ce'].detach()) * aux_weight
+            aux_weight_sum += aux_weight
+            aux_lovasz_sum += float(aux_components['loss_lovasz'].detach())
+            add_counts(aux_counts, compute_counts_from_pred_target(movable_logits.detach().argmax(1), y_movable))
+        if residual_stats is not None:
+            residual_stats.update(residual_output, residual_target, residual_valid,
+                                  residual_components, residual.get('stats'))
         loss_batches += 1
         samples += n
         add_counts(counts, compute_counts_from_pred_target(logits.detach().argmax(1), y))
@@ -338,6 +390,16 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
             running_total = running_ce + getattr(criterion, "lovasz_weight", 0.0) * running_lovasz
             print(f"{'train' if training else 'val'} {index + 1}/{limit} "
                   f"loss={running_total:.5f} ce={running_ce:.5f} lovasz={running_lovasz:.5f}", flush=True)
+            if aux_criterion is not None:
+                running_aux_ce = aux_ce_sum / aux_weight_sum if aux_weight_sum else 0.0
+                running_aux = running_aux_ce + aux_criterion.lovasz_weight * aux_lovasz_sum / loss_batches
+                print(f"  movable_loss={running_aux:.5f} "
+                      f"multitask_loss={running_total + criterion.auxiliary_loss_weight * running_aux:.5f}", flush=True)
+            if residual_stats is not None:
+                running_count = float(residual_stats.sums[1])
+                running_aux = float(residual_stats.sums[0]) / max(running_count, 1)
+                print(f"  residual_loss={running_aux:.5f} valid_pixels={int(running_count)} "
+                      f"multitask_loss={running_total + criterion.auxiliary_loss_weight * running_aux:.5f}", flush=True)
     peak_vram = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     if distributed():
         keys = list(counts)
@@ -351,6 +413,13 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
         total_seconds, peak_vram = maxima.tolist()
         samples = int(samples)
+    if aux_criterion is not None and distributed():
+        keys = list(aux_counts)
+        totals = torch.tensor([aux_ce_sum, aux_weight_sum, aux_lovasz_sum, *[aux_counts[k] for k in keys]],
+                              dtype=torch.float64, device=device)
+        dist.all_reduce(totals)
+        aux_ce_sum, aux_weight_sum, aux_lovasz_sum = totals[:3].tolist()
+        aux_counts = {k: int(v) for k, v in zip(keys, totals[3:].tolist())}
     if samples == 0:
         raise ValueError("DataLoader produced no batches")
     mean_ce = total_loss / total_loss_weight
@@ -361,6 +430,28 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
               "samples": samples,
               ("step_seconds_per_sample" if training else "inference_seconds_per_sample"): total_seconds / samples,
               "peak_vram_bytes": int(peak_vram)}
+    if aux_criterion is not None:
+        aux_ce = aux_ce_sum / aux_weight_sum if aux_weight_sum else 0.0
+        aux_lovasz = aux_lovasz_sum / loss_batches
+        aux_total = aux_ce + aux_criterion.lovasz_weight * aux_lovasz
+        metrics = metrics_from_counts(aux_counts)
+        result.update(movable_loss_ce=aux_ce, movable_loss_lovasz=aux_lovasz,
+                      movable_loss_total=aux_total, movable_valid_pixels=aux_counts['valid_pixels'],
+                      movable_iou=metrics['moving_iou'], movable_f1=metrics['moving_f1'],
+                      movable_precision=metrics['moving_precision'], movable_recall=metrics['moving_recall'],
+                      multitask_loss_total=mean_total + criterion.auxiliary_loss_weight * aux_total,
+                      movable_non_movable_class_weight=float(aux_criterion.weight[0]),
+                      movable_class_weight=float(aux_criterion.weight[1]),
+                      mos_static_class_weight=float(criterion.weight[0]),
+                      mos_moving_class_weight=float(criterion.weight[1]),
+                      parameter_count=sum(p.numel() for p in model.parameters()))
+    if residual_stats is not None:
+        result.update(residual_stats.finish(mean_total, criterion.auxiliary_loss_weight),
+                      parameter_count=sum(p.numel() for p in model.parameters()))
+        elapsed = torch.tensor(time.perf_counter()-phase_start, dtype=torch.float64, device=device)
+        if distributed():
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        result['phase_seconds'] = float(elapsed)
     if update_scheduler is not None:
         result.update(lr_first_update=first_lr, lr_last_update=last_lr, optimizer_updates=successful_updates)
     return result
@@ -388,8 +479,18 @@ def dry_run_step(model, x, valid, dt, y, criterion, optimizer, scaler, device,
     for attempt in range(1, max_attempts + 1):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            logits = model(x, valid, dt)
-            loss = criterion(logits, y)
+            if hasattr(criterion, 'residual_criterion'):
+                logits, residual_output = model(x, valid, dt, return_aux=True)
+                residual_target = torch.zeros_like(y, dtype=torch.float32)
+                loss = criterion(logits, y) + criterion.auxiliary_loss_weight * criterion.residual_criterion(
+                    residual_output, residual_target, y != -1)
+            elif hasattr(criterion, 'movable_criterion'):
+                logits, movable_logits = model(x, valid, dt, return_aux=True)
+                # Synthetic targets exercise the same two-head path; real data has distinct labels.
+                loss = criterion(logits, y) + criterion.auxiliary_loss_weight * criterion.movable_criterion(movable_logits, y)
+            else:
+                logits = model(x, valid, dt)
+                loss = criterion(logits, y)
         if logits.shape != y.shape[:1] + (2,) + y.shape[1:] or not torch.isfinite(logits).all() or not torch.isfinite(loss):
             raise AssertionError("Synthetic forward produced an invalid shape or non-finite logits/loss")
         scaler.scale(loss).backward()
@@ -562,7 +663,7 @@ def train(args, device):
         if saved['config']['run_metadata']['world_size'] != world_size:
             raise ValueError('Resume world_size mismatch')
         # Require the same data/model/optimization protocol; log paths and final epoch count may change.
-        for key in ('model_params', 'mos_model_params', 'mos_data_params', 'mos_augmentation'):
+        for key in ('model_params', 'mos_model_params', 'mos_data_params', 'mos_augmentation', 'mos_auxiliary'):
             if saved['config'].get(key) != cfg.get(key):
                 raise ValueError(f'Resume config mismatch: {key}')
         for key in ('optimizer', 'scheduler', 'learning_rate', 'momentum', 'weight_decay',
@@ -622,6 +723,9 @@ def train(args, device):
             for key, value in row.items():
                 if key != "epoch":
                     writer.add_scalar(key, value, epoch)
+                    if key.startswith(('train_', 'val_')):
+                        phase, name = key.split('_', 1)
+                        writer.add_scalar(f'{phase}/{name}', value, epoch)
         metric = train_cfg.get('checkpoint_metric', 'moving_iou')
         improved = val[metric] > best_iou
         moving_improved = val['moving_iou'] > best_moving
@@ -631,6 +735,7 @@ def train(args, device):
                    'scheduler_state_dict': scheduler.state_dict(), 'scaler_state_dict': scaler.state_dict(),
                    'best_metric': best_iou, 'best_moving_iou': best_moving, 'rng_states': rng_states,
                    'checkpoint_metric': metric,
+                   "auxiliary_metadata": auxiliary_settings(cfg.get('mos_auxiliary')),
                    "input_normalization": normalization(cfg, cfg["mos_data_params"]["input_mode"]),
                    "val_moving_iou": val["moving_iou"], 'val_mean_iou': val['mean_iou']}
         torch.save(payload, checkpoint_dir / "last.pt")

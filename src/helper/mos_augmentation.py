@@ -128,17 +128,29 @@ class TemporalMOSAugmentation:
             return self.rotate(features, masks, y, shift)
         return features, masks, y
 
-    def raw_scans(self, scans, labels=None, parameters=None):
+    def raw_scans(self, scans, labels=None, parameters=None, return_details=False):
         """One geometry draw for all already aligned scans; deletion only current.
 
         parameters supports deterministic tests: flip, translation, drop_indices.
         Sampling follows parser.py/laserscan.py distributions, not its RNG stream.
         """
-        if not self.training or self.settings.get('mode') != 'lmnet':
+        if labels is not None:
+            labels = np.asarray(labels)
+            if labels.ndim not in (1, 2) or (labels.ndim == 2 and labels.shape[1] == 0):
+                raise ValueError('Labels must be [N] or [N,K>0]')
+            if len(labels) != len(scans[-1]):
+                raise ValueError('Point/label length mismatch')
+        def unchanged():
+            if return_details:
+                return scans, labels, dict(clean_scans=scans,
+                                          current_original_ids=np.arange(len(scans[-1])))
             return scans, labels
+
+        if not self.training or self.settings.get('mode') != 'lmnet':
+            return unchanged()
         if parameters is None:
             if float(torch.rand(())) >= .5:
-                return scans, labels
+                return unchanged()
             translate = float(torch.rand(())) < .5
             flip = float(torch.rand(())) < .5
             delta = np.array([float(torch.rand(()))*10-5, float(torch.rand(()))*6-3,
@@ -155,7 +167,11 @@ class TemporalMOSAugmentation:
             points[:, :3] += np.asarray(parameters['translation'], np.float32)
             transformed.append(points)
         drops = np.asarray(parameters['drop_indices'], np.int64)
+        clean_scans = list(transformed)
         transformed[-1] = np.delete(transformed[-1], drops, axis=0)
         if labels is not None:
-            labels = np.delete(labels, drops)
+            labels = np.delete(labels, drops, axis=0)
+        if return_details:
+            return transformed, labels, dict(clean_scans=clean_scans,
+                current_original_ids=np.delete(np.arange(len(clean_scans[-1])), drops, axis=0))
         return transformed, labels

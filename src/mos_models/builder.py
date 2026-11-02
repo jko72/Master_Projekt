@@ -7,9 +7,13 @@ from .salsanext_temporal_e2e import SalsaNextTemporalE2E
 
 
 def build_mos_model(cfg):
+    from helper.mos_auxiliary import validate_auxiliary_config
+    auxiliary = validate_auxiliary_config(cfg or {})
     params = (cfg or {}).get("mos_model_params", {}) or {}
 
     name = str(params.get("name", "unet_small")).lower()
+    if auxiliary['enabled'] and name != 'salsanext_temporal_e2e':
+        raise ValueError('Movable auxiliary requires salsanext_temporal_e2e')
     in_channels = int(params.get("in_channels", 2))
     num_classes = int(params.get("num_classes", 2))
     base_channels = int(params.get("base_channels", 32))
@@ -44,6 +48,7 @@ def build_mos_model(cfg):
             attention_heads=int(params.get("attention_heads", 8)),
             radius=int(params.get("radius", 1)),
             compare_channels=int(params.get("compare_channels", 64)),
+            auxiliary_task=auxiliary['task'] if auxiliary['enabled'] else None,
         )
 
     raise ValueError(f"Unknown MOS model name: {name}")

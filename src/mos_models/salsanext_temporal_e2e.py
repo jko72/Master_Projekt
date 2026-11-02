@@ -12,7 +12,8 @@ from .salsanext_parts import SalsaNextDecoder, SalsaNextEncoder
 
 class SalsaNextTemporalE2E(nn.Module):
     def __init__(self, in_channels=4, num_classes=2, dropout=0.1,
-                 attention_heads=8, radius=1, compare_channels=64):
+                 attention_heads=8, radius=1, compare_channels=64, auxiliary_movable=False,
+                 auxiliary_task=None):
         super().__init__()
         if in_channels not in {4, 5} or num_classes not in {2, 5} or (num_classes == 5 and in_channels != 5):
             raise ValueError("Temporal E2E requires XYZR/XYZRI MOS (2 outputs) or XYZRI reconstruction (5 outputs)")
@@ -21,9 +22,28 @@ class SalsaNextTemporalE2E(nn.Module):
         self.encoder = SalsaNextEncoder(in_channels, dropout)
         self.temporal = LocalHistoricalAttention(256, attention_heads, radius, compare_channels)
         self.decoder = SalsaNextDecoder(num_classes, dropout)
+        if auxiliary_movable and auxiliary_task not in (None, 'movable'):
+            raise ValueError('Only one auxiliary task can be enabled')
+        self.auxiliary_task = auxiliary_task or ('movable' if auxiliary_movable else None)
+        if self.auxiliary_task not in (None, 'movable', 'residual'):
+            raise ValueError('Unknown auxiliary task')
+        self.auxiliary_movable = self.auxiliary_task == 'movable'
+        if self.auxiliary_task is not None:
+            if num_classes != 2:
+                raise ValueError('Movable supervision requires the binary MOS model')
+            # Construct on CPU, preserving the surrounding CPU/CUDA RNG streams.
+            # The original backbone and subsequent augmentation draws stay identical.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(1729)
+                if self.auxiliary_movable:
+                    self.movable_head = nn.Conv2d(32, 2, kernel_size=1)
+                else:
+                    self.residual_head = nn.Conv2d(32, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor, dt: torch.Tensor,
-                return_diagnostics: bool = False):
+                return_diagnostics: bool = False, return_aux: bool = False):
+        if return_aux and self.auxiliary_task is None:
+            raise ValueError('return_aux requires enabled auxiliary supervision')
         if x.ndim != 5 or x.shape[1] < 2 or x.shape[2] != self.in_channels:
             raise ValueError(f"x must be [B,T>=2,{self.in_channels},H,W]")
         b, t, c, h, w = x.shape
@@ -47,7 +67,13 @@ class SalsaNextTemporalE2E(nn.Module):
         else:
             fused = result
         current_skips = tuple(s.reshape(b, t, *s.shape[1:])[:, -1] for s in skips)
-        logits = self.decoder(fused, current_skips)
+        if return_aux:
+            logits, features = self.decoder(fused, current_skips, return_features=True)
+            head = self.movable_head if self.auxiliary_movable else self.residual_head
+            output = (logits, head(features))
+        else:
+            logits = self.decoder(fused, current_skips)
+            output = logits
         if logits.shape != (b, self.num_classes, h, w):
             raise RuntimeError(f"Unexpected decoder output {tuple(logits.shape)}")
-        return (logits, diagnostics) if return_diagnostics else logits
+        return (output, diagnostics) if return_diagnostics else output

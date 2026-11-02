@@ -97,3 +97,55 @@ def residual_path_for_frame(seq_dir, frame_stem, offset, cfg) -> str:
     folder_template = cfg["residual_params"].get("folder_template", "residual_images_{offset}")
     folder = folder_template.format(offset=offset)
     return os.path.join(seq_dir, folder, f"{frame_stem}.npy")
+
+
+def projection_ranges(projection):
+    """Physical metres from an existing full-range LMNet projection."""
+    image = np.zeros(projection.indices.shape, np.float32)
+    image[projection.occupied] = projection.ranges[projection.indices[projection.occupied]]
+    return image
+
+
+def compute_residual_target(current_clean, history_clean, *, current_input=None,
+                            input_original_ids=None, history_available=True,
+                            settings=None, return_diagnostics=False):
+    """Online relative target and explicit mask; never changes legacy residuals.
+
+    All projections use the same full-range LMNet grid after shared geometry.
+    Range limits apply AFTER winner selection, only to target validity. An input
+    winner must retain the clean winner's ORIGINAL point ID after deletion.
+    """
+    spec = dict(min_range=2., max_range=50., epsilon=1e-6)
+    spec.update(settings or {})
+    current = projection_ranges(current_clean)
+    history = projection_ranges(history_clean)
+    if current.shape != history.shape:
+        raise ValueError('Residual projection grids must match')
+    clean_valid = (current_clean.occupied & history_clean.occupied &
+                   np.isfinite(current) & np.isfinite(history) &
+                   (current > spec['min_range']) & (current < spec['max_range']) &
+                   (history > spec['min_range']) & (history < spec['max_range']))
+    if not history_available:
+        clean_valid[:] = False
+    same_winner = current_clean.occupied.copy()
+    if current_input is not None:
+        if current_input.indices.shape != current.shape:
+            raise ValueError('Input and clean grids must match')
+        ids = np.asarray(input_original_ids)
+        if ids.ndim != 1 or len(ids) != len(current_input.usable) or not np.issubdtype(ids.dtype, np.integer):
+            raise ValueError('Expected original IDs for every surviving current point')
+        if (ids < 0).any() or (ids >= len(current_clean.usable)).any() or len(np.unique(ids)) != len(ids):
+            raise ValueError('Invalid original point IDs')
+        winner_ids = np.full(current.shape, -1, np.int64)
+        winner_ids[current_input.occupied] = ids[current_input.indices[current_input.occupied]]
+        same_winner = current_input.occupied & (winner_ids == current_clean.indices)
+    valid = clean_valid & same_winner
+    target = np.zeros(current.shape, np.float32)
+    target[valid] = np.abs(current[valid] - history[valid]) / np.maximum(current[valid], spec['epsilon'])
+    if return_diagnostics:
+        stats = dict(current_pixels=int(current_clean.occupied.sum()),
+                     history_pixels=int(history_clean.occupied.sum()),
+                     clean_range_valid_pixels=int(clean_valid.sum()),
+                     dropped_or_changed_winner_pixels=int((clean_valid & ~same_winner).sum()))
+        return target, valid, stats
+    return target, valid

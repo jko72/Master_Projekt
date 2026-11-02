@@ -217,7 +217,8 @@ class SalsaNextDecoder(nn.Module):
         self,
         bottleneck: torch.Tensor,
         skips: Sequence[torch.Tensor],
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ):
         if len(skips) != 4:
             raise ValueError(f"SalsaNextDecoder expects 4 skip tensors, got {len(skips)}")
         down0b, down1b, down2b, down3b = skips
@@ -227,7 +228,7 @@ class SalsaNextDecoder(nn.Module):
         up2e = self.up_block3(up3e, down1b)
         up1e = self.up_block4(up2e, down0b)
         logits = self.logits(up1e)
-        return logits
+        return (logits, up1e) if return_features else logits
 
 
 def adapt_input_conv_weight(pretrained_weight: torch.Tensor, target_in_channels: int, mode: str = "mean") -> torch.Tensor:

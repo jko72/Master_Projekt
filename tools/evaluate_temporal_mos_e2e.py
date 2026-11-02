@@ -99,6 +99,8 @@ def main():
     # Evaluation also supports --split=train: never augment evaluation inputs.
     eval_cfg = deepcopy(cfg)
     eval_cfg["mos_augmentation"] = {"enabled": False}
+    # Keep model construction strict while requesting the established MOS-only dataset tuple.
+    eval_cfg['mos_auxiliary'] = {'enabled': False}
     loader = make_loader(eval_cfg, args.split, args.batch_size, args.num_workers, device)
     result = evaluate(model, loader, make_criterion(cfg, device), device, args.history_mode, args.max_batches)
     result = {"split": args.split, "history_mode": args.history_mode,
