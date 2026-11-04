@@ -72,7 +72,14 @@ def load_mae_weights(model, path, cfg):
     if source_meta['previous_offsets'] != target_meta['previous_offsets']:
         warnings.warn(f"MAE transfer offsets differ: {source_meta['previous_offsets']} -> {target_meta['previous_offsets']}", UserWarning)
     source, target = checkpoint['model_state_dict'], model.state_dict()
-    fresh_heads = HEAD | ({'movable_head.weight', 'movable_head.bias'} if getattr(model, 'auxiliary_movable', False) else set())
+    fresh_heads = set(HEAD)
+    if getattr(model, 'movable_branch', 'shared_decoder') == 'current_bottleneck':
+        # These are the explicitly new semantic modules, not arbitrary missing
+        # backbone keys. Source keys/shapes/dtypes remain strictly validated.
+        fresh_heads |= {key for key in target if key.startswith(
+            ('semantic_adapter.', 'movable_head.', 'semantic_gate.'))}
+    elif getattr(model, 'auxiliary_movable', False):
+        fresh_heads |= {'movable_head.weight', 'movable_head.bias'}
     if getattr(model, 'auxiliary_task', None) == 'residual':
         fresh_heads |= {'residual_head.weight', 'residual_head.bias'}
     expected_keys = set(target) - (fresh_heads - HEAD)

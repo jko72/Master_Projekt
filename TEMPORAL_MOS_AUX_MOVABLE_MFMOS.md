@@ -339,14 +339,61 @@ python tools/evaluate_mos_benchmark.py \
   --output-dir /hpc/logs/mos/NEW_RUN/point08_knn5_aux_movable
 ```
 
-Der Point-Evaluator wurde nicht verändert. Er baut das Modell anhand der
-Checkpoint-Config und lädt es strikt. Der Default-Forward liefert nur MOS.
+Der Point-Evaluator baut das Modell anhand der Checkpoint-Config und lädt es
+strikt. Der Default-Forward liefert weiterhin nur MOS. Optional aktiviert
+`--movable-diagnostics` genau einen Forward mit `return_aux=True`, führt die
+MOS-Baseline unverändert (inklusive KNN) aus und wendet erst auf deren
+Punktvorhersage den Movable-Filter an. Die Baseline bleibt in
+`point_metrics.csv`; die zusätzlichen Ergebniszeilen stehen in
+`movable_diagnostics.csv`.
 Pose-/Mapping-/Threshold-/KNN- und `.label`-Exportlogik bleiben bestehen.
 Der Range-View-Evaluator deaktiviert ausschließlich für seinen Dataset-Aufbau
 den Auxiliary-Block; das Modell wird davor mit der vollständigen Originalconfig
 gebaut und strikt geladen. Auch `--split=train` bleibt augmentationsfrei.
 Separate Movable-Analysen verwenden ausdrücklich `return_aux=True` und sind
 kein Bestandteil der offiziellen MOS-Auswertung.
+
+### Nachgelagerte Movable-Diagnose (P1, eine GPU)
+
+Der Checkpoint wird aus seiner gespeicherten Config rekonstruiert. Ein
+Residual-Checkpoint, ein Modell ohne aktivierten Movable-Head oder fehlende
+originale `.label`-Ground-Truth wird deshalb vor der Auswertung abgewiesen.
+Die Diagnose nutzt die direkte Originalpunkt-zu-Pixel-Zuordnung für den
+kontinuierlichen Movable-Score, während MOS weiterhin mit KNN rückprojiziert
+wird. Punkte ohne gültigen Movable-Score bleiben unverändert.
+
+```bash
+CKPT=/hpc/logs/mos/mos_semanticKitti_temporal_e2e_lmnet_aux_movable/job-6967/MOS_temporal_e2e_lmnet_off8_aux_movable_mfmos_w1_20261031_190312/checkpoints/best_moving_iou.pt
+
+# Smoke-Test, eigener Output-Ordner
+python3 tools/evaluate_mos_benchmark.py --checkpoint "$CKPT" \
+  --dataset-root /hpc/SemanticKitti/dataset/sequences --sequences 08 --mode point \
+  --postprocess knn --knn-k 5 --knn-search 5 --knn-sigma 1.0 --knn-cutoff 1.0 \
+  --knn-chunk-size 32768 --movable-diagnostics --max-frames 10 \
+  --output-dir /hpc/logs/mos/movable_diag_smoke_$(date +%Y%m%d_%H%M%S)
+
+# Vollständige Val08-Auswertung (4.071 Scans), eigener Output-Ordner
+python3 tools/evaluate_mos_benchmark.py --checkpoint "$CKPT" \
+  --dataset-root /hpc/SemanticKitti/dataset/sequences --sequences 08 --mode point \
+  --postprocess knn --knn-k 5 --knn-search 5 --knn-sigma 1.0 --knn-cutoff 1.0 \
+  --knn-chunk-size 32768 --movable-diagnostics \
+  --output-dir /hpc/logs/mos/movable_diag_val08_$(date +%Y%m%d_%H%M%S)
+
+# Als P1-Job: immer den Submit-Wrapper verwenden, damit HPC_ROOT, Container-
+# Mounts und die Logpfade wie beim Training gesetzt werden.
+bash submit_evaluate_mos_movable_diagnostics_p1_1gpu.sh \
+  /home/koehlbrandt/hpc/logs/mos/mos_semanticKitti_temporal_e2e_lmnet_aux_movable/job-6967/MOS_temporal_e2e_lmnet_off8_aux_movable_mfmos_w1_20261031_190312/checkpoints/best_moving_iou.pt \
+  /hpc/logs/mos/movable_diag_val08_$USER
+```
+
+`movable_diagnostics.csv` enthält pro Schwelle `removed_mos_false_positives`
+und `lost_mos_true_positives` sowie `removed_aux_nonmovable_points` und
+`removed_aux_movable_points`. Ein hoher erster bei niedrigem zweiten Wert zeigt
+gezielt entfernte MOS-Falschpositive; ein hoher `lost_mos_true_positives` oder
+`removed_aux_movable_points` zeigt den Preis in echten Treffern. Die Konsole
+meldet zusätzlich die unveränderte Baseline, Schwelle 0,5 und den besten
+explorativen Val08-Sweep-Punkt. Diese Val08-Wahl vor einem unabhängigen Test
+festschreiben.
 
 ## 12. Automatisierte Tests und tatsächlich ausgeführte Checks
 
@@ -495,3 +542,451 @@ Geändert:
 `src/mos_models/salsanext_parts.py`, `src/mos_models/salsanext_temporal_e2e.py`,
 `src/mos_models/builder.py`, `tools/train_temporal_mos_e2e.py`,
 `tools/evaluate_temporal_mos_e2e.py`.
+
+## 15. Kompakter Current-Bottleneck-Zweig mit optionaler semantischer Rückkopplung
+
+Stand 04.11.2026. Diese Erweiterung wurde ausschließlich im bereits ausgecheckten
+HPC-Branch `hpc/p1-ddp-mos` auf Basis von `db4a8cb` implementiert. Es war kein
+Branchwechsel nötig. Im Repository und den geprüften übergeordneten Verzeichnissen
+wurde keine `AGENTS.md` gefunden. Vorhandene lokale Änderungen an der
+Movable-Diagnose, deren Tests und P1-Launchern wurden bewahrt.
+
+Verbindliche Vorlage nach ausdrücklicher Bestätigung des Nutzers ist die lokale
+`src/configs/mos_semanticKitti_temporal_e2e_lmnet_aux_movable.yaml`.
+Sie liegt nicht im Git-Tree des HPC-Branches, sondern ist lokal über
+`.git/info/exclude` ausgeschlossen. Ihr SHA256 vor und nach der Bearbeitung:
+
+```text
+af77d1f0e7c4ceb2cd7fd395da1e354ca215e43d066b71b3b9cb24662d6d9bca
+```
+
+Die Vorlage wurde nicht geändert. Die beiden neuen YAMLs wurden direkt aus ihr
+abgeleitet und bleiben wie die übrigen HPC-Konfigurationen lokal ausgeschlossen;
+sie wurden nicht gestaged oder gepusht. Es wurde keine andere Basiskonfiguration
+als Ersatz herangezogen.
+
+**Die früheren Abschnitte und Testergebnisse beschreiben die Legacy-Variante.**
+Für die neue kompakte Architektur wurden in dieser Implementierungsumgebung
+keine Tests, Dry-Runs, Forward-/Backward-Läufe oder Trainings ausgeführt und
+keine Jobs eingereicht. Die unten beschriebenen Ausführungsprüfungen sind nur
+vorbereitet und müssen auf dem HPC stattfinden.
+
+### Drei klar getrennte Modellkonfigurationen
+
+| Variante | `movable_branch` | `semantic_fusion` | Movable-Features | Direkte semantische MOS-Rückkopplung |
+|---|---|---|---|---|
+| Unveränderte Referenz / Legacy | `shared_decoder` oder fehlend | `none` oder fehlend | letzte 32 MOS-Decoderfeatures | keine |
+| Kompakte Ablation ohne Gate | `current_bottleneck` | `none` | aktueller Bottleneck und aktueller Viertelauflösungs-Skip | keine |
+| Kompakte Ablation mit Gate | `current_bottleneck` | `bottleneck_gate` | exakt derselbe kompakte Zweig | vor dem MOS-Decoder |
+
+`semantic_fusion: none` wählt nicht den Legacy-Head zurück, sondern schaltet
+bei `current_bottleneck` ausschließlich das Gate ab. Das bestehende
+`fusion: bottleneck_only` bezeichnet weiterhin die **zeitliche** Attention-Fusion.
+
+Neue vollständige Konfigurationen:
+
+```text
+src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_none.yaml
+src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_gate.yaml
+```
+
+Gemeinsamer Modellblock, zusätzlich zu allen bisherigen Referenzfeldern:
+
+```yaml
+mos_model_params:
+  # name, in_channels, num_classes, dropout, attention_heads, radius,
+  # compare_channels und fusion sind aus der vollständigen Vorlage übernommen.
+  movable_branch: current_bottleneck
+  semantic_fusion: none  # zweite YAML: bottleneck_gate
+```
+
+Die beiden Dateien unterscheiden sich ausschließlich in `semantic_fusion` und
+`mos_log_params.run_name`. Die Run-Namen lauten:
+
+```text
+MOS_temporal_e2e_lmnet_off8_movable_cb_none_mfmos_w1
+MOS_temporal_e2e_lmnet_off8_movable_cb_gate_mfmos_w1
+```
+
+Alle anderen Einstellungen bleiben identisch zur lokalen Vorlage, insbesondere
+Scratch (`pretrained_path: null`), Seed 42, Worker 0, die Splits, XYZRI,
+`paper_normalization`, Historie `[8]`, LMNet-Augmentation, 64×2048, Batch 8 pro
+GPU, Accumulation 1, zwei DDP-Ranks/global 16, SGD, Scheduler, 100 Epochen,
+MOS- und Movable-Gewichte sowie `checkpoint_metric: mean_iou`.
+
+### Datenfluss und tatsächliche Kanal-/Rastergrößen
+
+Die tatsächliche Encoderdefinition wurde geprüft: `res_block5` liefert 256
+Bottleneck-Kanäle bei H/16×W/16. `current_skips[2]` ist `down2b`, also das
+256-Kanal-Ergebnis von `res_block3` **vor** dessen Pooling bei H/4×W/4.
+Die Kanalzahlen für die neuen Projektionen werden aus den vorhandenen
+`encoder.res_block5.conv1.out_channels` und
+`encoder.res_block3.conv1.out_channels` gelesen, nicht aus einem angenommenen
+externen SalsaNext-Modell. Rastergrößen stammen aus den Tensor-Shapes.
+
+```text
+x[t-8], x[t] → ein gemeinsamer Encoder-Forward über B*T
+                      │
+                      ├─ encoded[:, -1] vor temporaler Attention
+                      │      → Conv1×1(256→64) + GELU = S_t
+                      │           ├─ bilinear auf current_skips[2].shape[-2:]
+                      │           │   + concat mit Conv1×1(256→32)(current_skips[2])
+                      │           │   → Conv3×3(96→32) + GELU
+                      │           │   → Conv1×1(32→2)
+                      │           │   → bilinear auf H×W = Movable-Logits
+                      │           └─ optional P = Conv1×1(64→256) → tanh-Gate
+                      │
+                      └─ bestehende Local Historical Attention = F_temporal
+                                 → optionales Gate mit S_t
+                                 → unveränderter MOS-Decoder und decoder.logits
+```
+
+Bei 64×2048 hat S_t die Form `[B,64,4,128]`, der ausgewählte Skip
+`[B,256,16,512]`, die semantische Logit-Zwischenstufe `[B,2,16,512]` und
+Movable nach Interpolation `[B,2,64,2048]`. Nur die zwei **rohen Logits** werden
+auf volle Auflösung interpoliert. Alle bilinearen Interpolationen verwenden
+`align_corners=False`. Es gibt keinen zweiten Encoder und keinen vollständigen
+zweiten SalsaNext-Decoder.
+
+Die zusätzlichen semantischen Module besitzen rechnerisch 52.418 Parameter.
+Das Gate ergänzt weitere 16.640 Parameter. Dies sind aus den Conv-Definitionen
+abgeleitete Größen, keine in dieser Umgebung ausgeführten Modellmessungen.
+Die tatsächliche Gesamtparameterzahl wird vom bestehenden Trainer ausgegeben
+und in `train_parameter_count`/`val_parameter_count` protokolliert.
+
+### Exakte Gate-Definition, Gradienten und Inferenz
+
+Mit der vorhandenen aktuellen Bottleneck-Maske M gilt:
+
+```text
+F_out = F_temporal + 0.1 * F_temporal * tanh(P(S_t)) * M
+```
+
+P wird einschließlich Bias mit null initialisiert. Der zusätzliche Term ist
+zunächst null, das Gate startet als Identität. Der erste MOS-Backward kann P
+trainieren. Der zusätzliche MOS-Gradient nach S_t ist bei exakt null gesetztem
+P zunächst null; bei nichttrivialen P-Gewichten kann er bis zum Semantikadapter
+fließen. Es gibt kein `detach()` an S_t.
+
+S_t ist dasselbe Tensorobjekt für Movable-Head und Gate. Der kompakte
+Movable-Loss trainiert den Semantikadapter, den aktuellen Skip-Pfad und den
+geteilten Encoder. Anders als beim Legacy-Head läuft sein direkter Gradient
+nicht durch die zeitliche Attention oder den MOS-Decoder. Diese werden durch
+MOS trainiert. Mit aktivem Gate erhält der Semantikadapter nach Entwicklung
+nichttrivialer Gate-Gewichte zusätzlich MOS-Gradienten.
+
+Adapter und kompakter Movable-Head werden in einem lokalen CPU-RNG-Kontext mit
+Seed 1729 erzeugt. Das optionale Gate verwendet einen getrennten Kontext mit
+Seed 1730 und wird danach auf null gesetzt. So sollen die gemeinsamen Gewichte,
+der vollständige neue Movable-Zweig und der nachfolgende RNG-Zustand zwischen
+den beiden Ablationen identisch sein. Der alte Legacy-Head behält seine bisherige
+Initialisierung und Parameterreihenfolge. Diese Eigenschaften werden von den
+vorbereiteten Prüfungen überprüft; sie wurden hier nicht ausgeführt.
+
+Die bisherigen APIs bleiben erhalten:
+
+```python
+mos = model(x, valid, dt)
+mos, movable = model(x, valid, dt, return_aux=True)
+(mos, movable), diagnostics = model(
+    x, valid, dt, return_aux=True, return_diagnostics=True)
+```
+
+Bei `none` gelangt F_temporal unmittelbar in den MOS-Decoder. Der gesamte
+Semantikpfad kann bei einem reinen MOS-Forward entfallen. Bei `bottleneck_gate`
+werden S_t und das Gate **auch in der regulären Inferenz** berechnet; nur der
+kompakte Movable-Decoder wird ohne `return_aux` übersprungen.
+
+Die primäre Ausgabe bleibt in allen Fällen `[B,2,H,W]` aus `decoder.logits`.
+Movable-Logits oder -Wahrscheinlichkeiten werden nicht in MOS-Logits multipliziert
+oder nachgelagert als Filter verwendet. Der normale Val08-Punktbenchmark nutzt
+die gespeicherte semantische Fusion durch den Modell-Forward selbst.
+Die bereits vorhandene explizite `--movable-diagnostics`-Funktion bleibt erhalten
+und lädt ebenfalls genau die gespeicherte Modellvariante. Deren zusätzliche
+Filterergebnisse sind eine separate Analyse; für die Hauptablation wird der
+normale Benchmark **ohne** diesen nachgelagerten Filter benutzt.
+
+### Validierung, Loss, DDP, Resume und Transfer
+
+`semantic_model_settings` in `src/helper/mos_auxiliary.py` validiert die beiden
+neuen Optionen zentral. Builder, normaler Trainer, Resume-Prüfung und der
+vorhandene Benchmark-Aufbau verwenden diesen Pfad. Unbekannte Werte werden
+abgelehnt. `current_bottleneck` verlangt ein binäres
+`salsanext_temporal_e2e` mit aktiviertem `mos_auxiliary.task: movable`;
+`bottleneck_gate` verlangt zusätzlich `current_bottleneck`. Legacy und Residual
+bleiben mit den fehlenden/neuen Legacy-Defaults unverändert nutzbar.
+
+Dataset, Mapping, Masken, `y_movable`, Collate und die bestehende Loss-/DDP-Logik
+wurden nicht geändert:
+
+```text
+L_Total = L_MOS + mos_auxiliary.loss_weight * L_Movable
+```
+
+Beide Aufgaben bleiben gewichtete CE + Lovasz. Der Optimierer wird weiterhin
+über alle trainierbaren Parameter gebaut; bestehende Parametergruppen werden
+nicht neu strukturiert. Im normalen Training wird `return_aux=True` verwendet,
+so dass die angelegten semantischen Parameter am Lossgraphen teilnehmen.
+
+Die tatsächlich aufgelösten Optionen werden unter
+`config.run_metadata.model_options` und im Checkpoint zusätzlich unter
+`model_options` gespeichert. Die vollständigen neuen Optionen stehen außerdem
+explizit in den beiden neuen YAMLs. Fehlende Legacy-Felder werden beim
+Resume-Vergleich als `shared_decoder` und `none` normalisiert. Alle anderen
+Modellparameter behalten ihren bisherigen exakten Vergleich. Ein Wechsel
+zwischen den Ablationen wird als Resume-Fehler abgelehnt.
+
+Striktes Laden bleibt vorgeschrieben. Legacy hat weiterhin ausschließlich die
+bisherigen Keys; die neue Architektur ergänzt `semantic_adapter.*`, verwendet
+einen strukturierten `movable_head.*` und optional `semantic_gate.*`. Dadurch
+kann ein Checkpoint nicht versehentlich mit der anderen Variante geladen werden.
+
+MAE→MOS behält alle bisherigen Format-, Metadaten-, Key-, Shape-, Dtype- und
+Finite-Prüfungen für den gemeinsamen Backbone. Nur die ausdrücklich neuen
+Semantikmodule und der MOS-Head dürfen frisch bleiben. Das vervollständigte
+State-Dict wird weiterhin `strict=True` geladen. Die neuen YAMLs verwenden
+für den kontrollierten Vergleich trotzdem ausschließlich Scratch.
+
+### Zwei echte Fullres-Smoke-Jobs vorbereiten
+
+Der vorhandene Launcher `train_mos_p2_2gpu.slurm` wurde gelesen und wiederverwendet:
+Partition P2, ein Knoten/eine Slurm-Task, zwei GPUs ohne Typbindung, 16 CPUs,
+64 GB Host-RAM, existierender Apptainer-Container und `/hpc`-Bind-Mount,
+Arbeitsverzeichnis `/hpc/LiDARSensorForecaster`, statischer Loopback-Rendezvous.
+Er startet genau einmal `python3 -m torch.distributed.run` mit zwei Prozessen,
+also einem Rank pro GPU. Es wird kein zusätzliches `srun` oder äußeres
+`torchrun` ergänzt. Nach Config, Logroot und Gerät werden sämtliche weiteren
+Trainer-Argumente unverändert weitergereicht. Launcheränderungen waren nicht nötig.
+
+Für beide Smoke-Jobs gelten dieselben Overrides: `--epochs 1 --max_batches 2`.
+Batchgröße bleibt 8 pro GPU, Worker 0, AMP false, Accumulation 1. Zwei Batches
+ergeben zwei Optimizer-Updates pro Rank. Der tatsächlich vorhandene
+`LMNetWarmup` unterstützt dies: zwei Updates pro Epoche, eine Warmup-Epoche,
+also zwei Warmup-Schritte; verwendete LRs rechnerisch 0.005 und 0.01.
+Es wird keine reguläre YAML für den Smoke verändert. Die Validierung enthält
+bei zwei Batches und zwei Ranks auch Frames jenseits der ersten acht Scans.
+
+**Nur vorbereitete Einreichung; diese Befehle wurden hier nicht ausgeführt:**
+
+```bash
+cd /home/koehlbrandt/hpc/LiDARSensorForecaster
+mkdir -p /home/koehlbrandt/hpc/logs/slurm
+
+sbatch --parsable --partition=p2 --nodes=1 --ntasks=1 --gres=gpu:2 \
+  --chdir=/home/koehlbrandt/hpc/LiDARSensorForecaster \
+  --export=ALL,HPC_ROOT=/home/koehlbrandt/hpc \
+  --job-name=mos_semanticKitti_temporal_e2e_lmnet_movable_cb_none_smoke \
+  --output=/home/koehlbrandt/hpc/logs/slurm/%x-%j.out \
+  --error=/home/koehlbrandt/hpc/logs/slurm/%x-%j.err \
+  /home/koehlbrandt/hpc/LiDARSensorForecaster/train_mos_p2_2gpu.slurm \
+  src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_none.yaml \
+  --epochs 1 --max_batches 2
+
+sbatch --parsable --partition=p2 --nodes=1 --ntasks=1 --gres=gpu:2 \
+  --chdir=/home/koehlbrandt/hpc/LiDARSensorForecaster \
+  --export=ALL,HPC_ROOT=/home/koehlbrandt/hpc \
+  --job-name=mos_semanticKitti_temporal_e2e_lmnet_movable_cb_gate_smoke \
+  --output=/home/koehlbrandt/hpc/logs/slurm/%x-%j.out \
+  --error=/home/koehlbrandt/hpc/logs/slurm/%x-%j.err \
+  /home/koehlbrandt/hpc/LiDARSensorForecaster/train_mos_p2_2gpu.slurm \
+  src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_gate.yaml \
+  --epochs 1 --max_batches 2
+```
+
+Die Jobs starten unabhängig aus Scratch; es wird weder `--resume` noch
+`--pretrained_path` übergeben. Sie dürfen unabhängig voneinander geplant werden;
+es wird keine Array-Unterstützung oder zusätzliche Clusterfunktion angenommen.
+
+Slurm-Logs liegen unter `hpc/logs/slurm/<Jobname>-<Job-ID>.out/.err`.
+Die getrennten Host-Run- und Checkpointpfade sind:
+
+```text
+/home/koehlbrandt/hpc/logs/mos/
+  mos_semanticKitti_temporal_e2e_lmnet_movable_cb_none/job-<ID_NONE>/
+    MOS_temporal_e2e_lmnet_off8_movable_cb_none_mfmos_w1_<STAMP>/
+      config.yaml
+      csv/epochs.csv
+      checkpoints/{last.pt,best_mean_iou.pt,best_moving_iou.pt}
+
+/home/koehlbrandt/hpc/logs/mos/
+  mos_semanticKitti_temporal_e2e_lmnet_movable_cb_gate/job-<ID_GATE>/
+    MOS_temporal_e2e_lmnet_off8_movable_cb_gate_mfmos_w1_<STAMP>/
+      config.yaml
+      csv/epochs.csv
+      checkpoints/{last.pt,best_mean_iou.pt,best_moving_iou.pt}
+```
+
+Im Container entspricht der Präfix `/home/koehlbrandt/hpc` dem Mount `/hpc`.
+
+Status und Exitcode, mit den von `sbatch --parsable` ausgegebenen IDs:
+
+```bash
+squeue -u "$USER" -o '%.18i %.9P %.70j %.8T %.10M %R'
+sacct -j ID_NONE,ID_GATE --format=JobID,JobName%70,State,ExitCode,Elapsed,AllocTRES%80
+```
+
+Abnahme erwartet `COMPLETED` und ExitCode `0:0`. Zusätzlich im jeweiligen
+`.out` prüfen: beide Rank-/GPU-Zeilen, `world_size=2`, korrekte `model_options`,
+Batch8/global16, erfolgreiche Train- und Val-Batches, endliche MOS-CE/Lovasz und
+Movable-CE/Lovasz, `optimizer_updates=2`, `checkpoint_written=.../last.pt`.
+Die bisherigen CSV-Felder für Movable-IoU/F1/Precision/Recall, Gesamtparameter,
+Peak-VRAM und Laufzeit bleiben erhalten. Die zusätzliche Epochenausgabe enthält
+beide Loss-Komponenten und Peak-VRAM für Train und Val.
+Die Trainingsvalidierung berechnet Auxiliary mit; die finale MOS-Inferenzmessung
+im Point-Benchmark fordert ausschließlich MOS an und berechnet beim Gate nur
+Adapter und Modulation zusätzlich.
+
+VRAM und Laufzeit wurden hier nicht gemessen. Beide regulären Konfigurationen
+bleiben bei Batch8/GPU. Falls auf dem HPC eine gemeinsame Anpassung nötig wird,
+muss sie für beide Ablationen identisch erfolgen; hier wurde keine einseitige
+Batch-/AMP-/Workeränderung vorgenommen.
+
+### Gezielte Abnahme auf einem zugewiesenen Compute-Node
+
+Vorbereitet, **nicht ausgeführt**:
+
+```text
+tests/test_temporal_mos_semantic_branch.py
+tools/check_temporal_mos_semantic_branch.py
+```
+
+Die neue Suite enthält 14 vorbereitete Prüfungen für Config-Gleichheit,
+Legacy-Defaults/Keys/RNG, ungültige Kombinationen im Builder/Trainer/Benchmark,
+identische gemeinsame Initialisierung, Viertelauflösung, einen Encoder- und
+Decoder-Forward, Ausgabeformen, `return_aux`/Diagnostik, lazy Movable-Auswertung,
+fehlenden MOS-Einfluss ohne Gate, dasselbe S_t für Head und Gate, aktuelle
+Semantik vor Attention, Gate-Maske, ersten Gate-Gradienten, MOS-Gradienten nach
+S_t bei nichttrivialem P, Movable-Gradienten in beiden Ablationen, striktes
+Benchmark-Laden/Roundtrip, Resume-Abgrenzung und MAE-Transfer.
+
+Die optional vorbereitete Zwei-GPU-NCCL-Prüfung macht je zwei synthetische
+Optimizer-Updates pro Variante und kontrolliert alle Parametergradienten und
+die Optimizer-Abdeckung. Ein Rank erhält beim zweiten Schritt ausschließlich
+ignorierte Movable-Targets. Dies benötigt zwei bereits zugewiesene GPUs und
+wird nicht aus einem äußeren `torchrun` gestartet.
+
+Im vorhandenen HPC-Container auf dem Compute-Node:
+
+```bash
+# Kein dritter vollständiger Trainingslauf: kleine synthetische Strukturchecks
+# und striktes Laden des bisherigen Movable-Checkpoints mit der Originalreferenz.
+python3 tools/check_temporal_mos_semantic_branch.py \
+  --device cuda --run-suite --two-gpu-ddp \
+  --legacy-checkpoint /hpc/logs/mos/mos_semanticKitti_temporal_e2e_lmnet_aux_movable/job-6967/MOS_temporal_e2e_lmnet_off8_aux_movable_mfmos_w1_20261031_190312/checkpoints/best_moving_iou.pt
+```
+
+Der Legacy-Pfad stammt aus der bereits vorhandenen lokalen Diagnoseanleitung;
+falls der Checkpoint anderswo liegt, den tatsächlichen Pfad einsetzen.
+`--reference-config` ist standardmäßig die unveränderte lokale Movable-YAML.
+Die Strukturchecks verwenden synthetisch 32×64; die beiden echten Trainings-Smokes
+verwenden die vollständige Referenzauflösung 64×2048.
+
+Alternativ ohne den realen Legacy-Checkpointcheck:
+
+```bash
+MOS_CHECK_DEVICE=cuda MOS_CHECK_DDP=1 python3 -m unittest discover \
+  -s tests -p 'test_temporal_mos_semantic_branch.py' -v
+```
+
+Ohne `--two-gpu-ddp` bzw. ohne `MOS_CHECK_DDP=1` wird nur der spezielle
+Zwei-GPU-Check übersprungen; die übrigen vorbereiteten Checks können auf einem
+Compute-Node mit einer GPU laufen. Es wird kein Job automatisch eingereicht.
+
+Nach den beiden Smoke-Jobs, jeweils mit dem tatsächlichen Containerpfad:
+
+```bash
+python3 tools/check_temporal_mos_semantic_branch.py --device cuda \
+  --checkpoint "$CKPT_NONE_LAST" --expect-fusion none \
+  --expect-world-size 2 --expect-min-updates 2
+python3 tools/check_temporal_mos_semantic_branch.py --device cuda \
+  --checkpoint "$CKPT_GATE_LAST" --expect-fusion bottleneck_gate \
+  --expect-world-size 2 --expect-min-updates 2
+```
+
+Diese Prüfung lädt den gespeicherten Modus über den echten Benchmark-Adapter
+strikt, vergleicht MOS mit/ohne `return_aux`, prüft einen temporären
+Checkpoint-Roundtrip und liest die tatsächlichen Train-/Val-Losses und
+Optimizer-Updates aus der CSV. Die JSON-Ausgabe enthält Modus, Parameterzahl,
+Worldsize und Updatezahl. Die Smoke-Checkpoints sind keine endgültigen
+wissenschaftlichen Ergebnisse.
+
+### Reguläre 100-Epochen-Läufe und Val08-Punktbenchmark
+
+Nach erfolgreicher HPC-Abnahme, vom Repository aus mit dem vorhandenen Wrapper:
+
+```bash
+bash submit_mos_p2_2gpu.sh \
+  src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_none.yaml
+bash submit_mos_p2_2gpu.sh \
+  src/configs/mos_semanticKitti_temporal_e2e_lmnet_movable_cb_gate.yaml
+```
+
+Keine Smoke-Overrides, kein Resume, kein MAE-Pretraining. Der Wrapper setzt
+P2, zwei GPUs, Repository-Arbeitsverzeichnis und Logpfade. Falls
+`P2_GPU_GRES` in der Umgebung bewusst gesetzt wurde, wird es wie bisher
+verwendet; ohne diese Variable bleibt `gpu:2` der vorhandene Default.
+
+Nach Abschluss beide `best_mean_iou.pt` separat mit demselben Protokoll auswerten:
+
+```bash
+python3 tools/evaluate_mos_benchmark.py \
+  --checkpoint "$CKPT_NONE_BEST_MEAN_IOU" \
+  --dataset-root /hpc/SemanticKitti/dataset/sequences \
+  --sequences 08 --mode point --postprocess knn \
+  --knn-k 5 --knn-search 5 --knn-sigma 1.0 --knn-cutoff 1.0 \
+  --moving-threshold 0.5 --device cuda \
+  --output-dir /hpc/logs/mos/semantic_cb_none_val08_$USER
+
+python3 tools/evaluate_mos_benchmark.py \
+  --checkpoint "$CKPT_GATE_BEST_MEAN_IOU" \
+  --dataset-root /hpc/SemanticKitti/dataset/sequences \
+  --sequences 08 --mode point --postprocess knn \
+  --knn-k 5 --knn-search 5 --knn-sigma 1.0 --knn-cutoff 1.0 \
+  --moving-threshold 0.5 --device cuda \
+  --output-dir /hpc/logs/mos/semantic_cb_gate_val08_$USER
+```
+
+Die Ausgabeverzeichnisse müssen neu sein; bestehende Benchmark-Ergebnisse werden
+nicht überschrieben. Keine `--max-frames`-Begrenzung für das Endergebnis und kein
+`--movable-diagnostics`-Filter im Hauptvergleich. Originalpunkte, Poseverarbeitung,
+Mapping und KNN bleiben unverändert. Primärer Vergleich: punktweise Moving-IoU,
+Moving-Precision und Moving-Recall der beiden aktuellen kompakten Zweige.
+
+### Wissenschaftliche Abgrenzung und Prüfstand
+
+MF-MOS nutzt einen separaten Semantic Branch und Motion-Guided-Feature-Fusion.
+Hier bleibt der gemeinsame Siamese-Encoder mit zeitlicher Bottleneck-Attention
+die Basis. Ein kleiner aktueller Semantikadapter plus Skip-Head ersetzt in den
+beiden Ablationen den Legacy-Auxiliary-Head; die optionale Rückkopplung ist eine
+einzelne begrenzte residuale Bottleneck-Modulation. Das ist eine kompakte
+MF-MOS-inspirierte Ablation, keine Architektur-Reproduktion von MF-MOS.
+
+Der Vergleich Legacy gegen den neuen Zweig ändert die semantische Architektur
+und ihren direkten Gradientenpfad. **Den isolierten Effekt der Rückkopplung
+misst dagegen `current_bottleneck+none` gegen
+`current_bottleneck+bottleneck_gate`**, mit identischem Movable-Zweig und
+identischen Trainingsbedingungen. Die tatsächlichen Point-Ergebnisse sind noch
+offen; es werden weder eine Verbesserung noch ein erfolgreicher Lauf behauptet.
+
+Statisch geprüft: Branch/Refs und lokaler Änderungsstand, vorhandene Dateien und
+Aufrufpfade, Encoderkanäle und Skip-Auflösung, Config-Textunterschiede,
+RNG-Kontexte, Gradientenpfade, Default-/State-Key-Erhaltung, strikte
+Transfer-/Resume-Pfade, gespeicherte Optionen, vorhandener Launcher und
+Update-Scheduler sowie `git diff --check`. Zusätzlich wurden die sieben
+geänderten/neuen Python-Quelltexte als reine Syntaxbäume geparst, ohne
+Projektmodule, PyTorch oder die vorbereiteten Prüfungen auszuführen.
+
+Noch auf dem HPC auszuführen: sämtliche neuen Struktur-/Gradienten-/NCCL-Checks,
+das strikte Laden des realen Legacy-Checkpoints, beide Fullres-Smokes,
+Checkpoint-Roundtrips, VRAM-/Laufzeitmessung, die regulären Trainings und die
+vollständige Val08-Punktauswertung. Alte Testergebnisse aus den vorigen Abschnitten
+sind kein Ausführungsnachweis für diese Erweiterung.
+
+Geänderte Kernpfade:
+`src/mos_models/salsanext_temporal_e2e.py`, `src/mos_models/builder.py`,
+`src/helper/mos_auxiliary.py`, `src/helper/temporal_e2e_transfer.py`,
+`tools/train_temporal_mos_e2e.py` und diese bestehende Dokumentation.
+Neu sind die beiden lokalen YAMLs, die vorbereitete Testsuite und das separate
+Compute-Node-Abnahmewerkzeug. Dataset, Collate, Lossimplementierung,
+Projektions-/Augmentationscode, Point-Benchmark und bestehende Launcher wurden
+in dieser Erweiterung nicht verändert.

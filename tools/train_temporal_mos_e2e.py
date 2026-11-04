@@ -36,7 +36,8 @@ from helper.mos_augmentation import augmentation_settings
 from helper.temporal_e2e_transfer import load_mae_weights
 from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_components, loss_settings
 from helper.mos_projection import projection_mode, REFERENCE_COMMIT
-from helper.mos_auxiliary import auxiliary_settings, validate_auxiliary_config, attach_auxiliary_criterion, corrected_task_loss
+from helper.mos_auxiliary import (auxiliary_settings, validate_auxiliary_config, attach_auxiliary_criterion,
+                                  corrected_task_loss, semantic_model_settings, normalized_semantic_model_params)
 from helper.mos_optimization import make_optimizer, make_scheduler, LMNetWarmup
 
 
@@ -139,7 +140,22 @@ def read_config(path):
     cfg["mos_train_params"]["loss"] = loss_settings(cfg["mos_train_params"].get("loss"))
     if 'mos_auxiliary' in cfg:
         cfg['mos_auxiliary'] = validate_auxiliary_config(cfg)
+    semantic_model_settings(cfg)
     return path.resolve(), cfg
+
+
+def validate_resume_model_params(saved_cfg, cfg):
+    """Missing and explicit legacy defaults are the same architecture.
+
+    Other model fields retain their existing exact comparison; neither a
+    different semantic branch nor the other ablation can be resumed silently.
+    """
+    semantic_model_settings(saved_cfg)
+    semantic_model_settings(cfg)
+    before = normalized_semantic_model_params(saved_cfg.get('mos_model_params'))
+    after = normalized_semantic_model_params(cfg.get('mos_model_params'))
+    if before != after:
+        raise ValueError('Resume config mismatch: mos_model_params (including movable_branch/semantic_fusion)')
 
 
 def seed_all(seed, deterministic=False):
@@ -608,6 +624,7 @@ def train(args, device):
     cfg["run_metadata"] = {"world_size": world_size, "batch_size_per_gpu": batch_size,
                            "effective_global_batch_size": batch_size * world_size * accumulation,
                            "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "cli_args": vars(args)}
+    cfg['run_metadata']['model_options'] = semantic_model_settings(cfg)
     if projection_mode(cfg) == 'lmnet':
         cfg['run_metadata'].update(reference_commit=REFERENCE_COMMIT,
             comparison_deviations=[name for name, differs in
@@ -621,6 +638,9 @@ def train(args, device):
         print(f"world_size={world_size} batch_size_per_gpu={batch_size} "
               f"effective_global_batch_size={batch_size * world_size * accumulation} "
               f"amp={amp_enabled} amp_dtype={amp_dtype}", flush=True)
+        print(f"model_options={cfg['run_metadata']['model_options']} "
+              f"auxiliary={auxiliary_settings(cfg.get('mos_auxiliary'))['task'] if cfg.get('mos_auxiliary', {}).get('enabled', False) else 'disabled'}",
+              flush=True)
     train_loader = make_loader(cfg, "train", batch_size, workers, device)
     val_loader = make_loader(cfg, "val", batch_size, workers, device)
     model = build_mos_model(cfg)
@@ -663,7 +683,8 @@ def train(args, device):
         if saved['config']['run_metadata']['world_size'] != world_size:
             raise ValueError('Resume world_size mismatch')
         # Require the same data/model/optimization protocol; log paths and final epoch count may change.
-        for key in ('model_params', 'mos_model_params', 'mos_data_params', 'mos_augmentation', 'mos_auxiliary'):
+        validate_resume_model_params(saved['config'], cfg)
+        for key in ('model_params', 'mos_data_params', 'mos_augmentation', 'mos_auxiliary'):
             if saved['config'].get(key) != cfg.get(key):
                 raise ValueError(f'Resume config mismatch: {key}')
         for key in ('optimizer', 'scheduler', 'learning_rate', 'momentum', 'weight_decay',
@@ -736,15 +757,23 @@ def train(args, device):
                    'best_metric': best_iou, 'best_moving_iou': best_moving, 'rng_states': rng_states,
                    'checkpoint_metric': metric,
                    "auxiliary_metadata": auxiliary_settings(cfg.get('mos_auxiliary')),
+                   "model_options": semantic_model_settings(cfg),
                    "input_normalization": normalization(cfg, cfg["mos_data_params"]["input_mode"]),
                    "val_moving_iou": val["moving_iou"], 'val_mean_iou': val['mean_iou']}
         torch.save(payload, checkpoint_dir / "last.pt")
+        print(f"checkpoint_written={checkpoint_dir / 'last.pt'}", flush=True)
         if moving_improved:
             torch.save(payload, checkpoint_dir / "best_moving_iou.pt")
         if improved and metric == 'mean_iou':
             torch.save(payload, checkpoint_dir / 'best_mean_iou.pt')
         print(f"epoch={epoch} train_loss={train['loss']:.5f} val_loss={val['loss']:.5f} "
               f"val_moving_iou={val['moving_iou']:.5f} best={best_iou:.5f}")
+        if hasattr(criterion, 'movable_criterion'):
+            print(f"[movable] epoch={epoch} optimizer_updates={train.get('optimizer_updates', 'n/a')} "
+                  f"train_ce={train['movable_loss_ce']:.6f} train_lovasz={train['movable_loss_lovasz']:.6f} "
+                  f"val_ce={val['movable_loss_ce']:.6f} val_lovasz={val['movable_loss_lovasz']:.6f} "
+                  f"train_multitask={train['multitask_loss_total']:.6f} val_multitask={val['multitask_loss_total']:.6f} "
+                  f"train_peak_vram_bytes={train['peak_vram_bytes']} val_peak_vram_bytes={val['peak_vram_bytes']}", flush=True)
     if writer:
         writer.close()
     if primary():
