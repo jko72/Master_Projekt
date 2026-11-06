@@ -20,7 +20,7 @@ from utils_torch import spherical_projection
 from evaluate_mos_benchmark import (SWEEP_THRESHOLDS, frame_features, index_sequences,
     load_adapter, load_poses, main, moving_prediction_from_probability,
     moving_probability_from_logits, select_best_threshold, single_frame_input,
-    temporal_input, threshold_sweep_rows)
+    temporal_input, threshold_sweep_rows, movable_gate_counts)
 from mos_dataset import MOSFrameDataset
 from mos_models import build_mos_model
 
@@ -212,6 +212,23 @@ class KNNPostprocessTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
+    def test_movable_gate_counts_preserve_confusion_invariants(self):
+        # FP is removed, TP is lost, missing score stays untouched, and ignored
+        # GT does not enter MOS counts.  The movable labels deliberately differ
+        # from MOS labels (a parked car may be static but movable).
+        pred = np.array([1, 1, 1, 1, 0], dtype=np.uint8)
+        target = np.array([0, 1, 0, -1, 1], dtype=np.int16)
+        score = np.array([.1, .2, .9, .1, np.nan], dtype=np.float32)
+        valid = np.array([True, True, True, True, False])
+        movable_gt = np.array([1, 1, 0, -1, 1], dtype=np.int16)
+        gated, removed, counts = movable_gate_counts(pred, target, score, valid, .5, movable_gt)
+        np.testing.assert_array_equal(gated, [0, 0, 1, 0, 0])
+        np.testing.assert_array_equal(removed, [True, True, False, True, False])
+        self.assertLessEqual(int(gated.sum()), int(pred.sum()))
+        self.assertEqual(counts["gated_fp_moving"], counts["baseline_fp_moving"] - counts["removed_mos_false_positives"])
+        self.assertEqual(counts["gated_tp_moving"], counts["baseline_tp_moving"] - counts["lost_mos_true_positives"])
+        self.assertEqual(counts["gated_fn_moving"], counts["baseline_fn_moving"] + counts["lost_mos_true_positives"])
+
     def test_half_threshold_matches_binary_argmax_including_ties(self):
         logits = torch.tensor([[[[2.0, -1.0, 0.0, 5.0]],
                                 [[1.0, 3.0, 0.0, -4.0]]]])

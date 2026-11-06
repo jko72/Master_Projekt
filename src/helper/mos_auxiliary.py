@@ -1,4 +1,4 @@
-"""Strict, opt-in MF-MOS-inspired movable supervision (no inference fusion)."""
+"""Optional task supervision and validated semantic bottleneck model options."""
 import math
 from numbers import Real
 
@@ -9,6 +9,40 @@ from helper.mos_lovasz_loss import MOSCrossEntropyLovasz, loss_settings
 
 MOVABLE_CONTENT = (0.9331685037721359, 0.047646460740965804)
 MOVABLE_WEIGHTS = (1.07047068699, 20.55648005566)
+
+
+def normalized_semantic_model_params(params):
+    """Copy model params with explicit legacy defaults for resume comparisons."""
+    result = dict(params or {})
+    result.setdefault('movable_branch', 'shared_decoder')
+    result.setdefault('semantic_fusion', 'none')
+    return result
+
+
+def semantic_model_settings(cfg):
+    """Central validation for builder, trainer and saved-config reconstruction.
+
+    `fusion` remains the existing temporal-fusion option. These two independent
+    options select the movable feature source and semantic MOS feedback only.
+    Legacy configurations add no modules and require no auxiliary supervision.
+    """
+    params = normalized_semantic_model_params(cfg.get('mos_model_params'))
+    branch, fusion = params['movable_branch'], params['semantic_fusion']
+    if branch not in ('shared_decoder', 'current_bottleneck'):
+        raise ValueError('mos_model_params.movable_branch must be shared_decoder or current_bottleneck')
+    if fusion not in ('none', 'bottleneck_gate'):
+        raise ValueError('mos_model_params.semantic_fusion must be none or bottleneck_gate')
+    if fusion == 'bottleneck_gate' and branch != 'current_bottleneck':
+        raise ValueError('semantic_fusion=bottleneck_gate requires movable_branch=current_bottleneck')
+    if branch == 'current_bottleneck':
+        auxiliary = validate_auxiliary_config(cfg)
+        if (params.get('name') != 'salsanext_temporal_e2e' or
+                int(params.get('num_classes', 2)) != 2 or not auxiliary['enabled'] or
+                auxiliary['task'] != 'movable'):
+            raise ValueError('current_bottleneck requires binary salsanext_temporal_e2e and enabled movable auxiliary supervision')
+        if params.get('fusion', 'bottleneck_only') != 'bottleneck_only':
+            raise ValueError('Temporal fusion must remain bottleneck_only')
+    return dict(movable_branch=branch, semantic_fusion=fusion)
 
 
 def auxiliary_settings(value=None):

@@ -7,8 +7,9 @@ from .salsanext_temporal_e2e import SalsaNextTemporalE2E
 
 
 def build_mos_model(cfg):
-    from helper.mos_auxiliary import validate_auxiliary_config
+    from helper.mos_auxiliary import validate_auxiliary_config, semantic_model_settings
     auxiliary = validate_auxiliary_config(cfg or {})
+    semantic = semantic_model_settings(cfg or {})
     params = (cfg or {}).get("mos_model_params", {}) or {}
 
     name = str(params.get("name", "unet_small")).lower()
@@ -49,6 +50,7 @@ def build_mos_model(cfg):
             radius=int(params.get("radius", 1)),
             compare_channels=int(params.get("compare_channels", 64)),
             auxiliary_task=auxiliary['task'] if auxiliary['enabled'] else None,
+            **semantic,
         )
 
     raise ValueError(f"Unknown MOS model name: {name}")
