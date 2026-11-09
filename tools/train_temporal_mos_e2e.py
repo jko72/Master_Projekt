@@ -39,6 +39,7 @@ from helper.mos_projection import projection_mode, REFERENCE_COMMIT
 from helper.mos_auxiliary import (auxiliary_settings, validate_auxiliary_config, attach_auxiliary_criterion,
                                   corrected_task_loss, semantic_model_settings, normalized_semantic_model_params)
 from helper.mos_optimization import make_optimizer, make_scheduler, LMNetWarmup
+from helper.temporal_offset_sampling import validate_temporal_offset_sampling, TemporalOffsetStatistics
 
 
 def distributed():
@@ -141,6 +142,7 @@ def read_config(path):
     if 'mos_auxiliary' in cfg:
         cfg['mos_auxiliary'] = validate_auxiliary_config(cfg)
     semantic_model_settings(cfg)
+    validate_temporal_offset_sampling(cfg)
     return path.resolve(), cfg
 
 
@@ -233,6 +235,7 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
               diagnose_validation=False, update_scheduler=None, sample_log=None):
     phase_start = time.perf_counter()
     training = optimizer is not None
+    offset_stats = TemporalOffsetStatistics(loader.dataset) if training else None
     if diagnose_validation and not training:
         print(f"[val-diagnostic] rank={dist.get_rank() if distributed() else 0} "
               "entering model.eval", flush=True)
@@ -299,11 +302,20 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
             y_movable = y_movable.to(device, non_blocking=True)
         else:
             x, valid, dt, y, _meta = batch
+        if offset_stats is not None and offset_stats.enabled:
+            offset_stats.update(_meta)
+            if primary() and index == 0:
+                print(f"[temporal-offset-sampling] x={tuple(x.shape)} valid={tuple(valid.shape)} "
+                      f"dt={dt.tolist()} offsets={_meta['sampled_previous_offset'].tolist()} "
+                      f"mos_targets={tuple(y.shape)} movable_targets={tuple(y_movable.shape) if aux_criterion is not None else None}",
+                      flush=True)
         if sample_log is not None:
             for j, (seq_id, stem) in enumerate(zip(_meta['seq_id'], _meta['frame_stem'])):
                 sample_log.write(json.dumps(dict(sequence=seq_id, frame=stem,
                     phase='train' if training else 'val',
                     lr_before_batch=optimizer.param_groups[0]['lr'] if training else None,
+                    **({'sampled_previous_offset': int(_meta['sampled_previous_offset'][j])}
+                       if 'sampled_previous_offset' in _meta else {}),
                     history_available=[bool(v[j]) for v in _meta.get('history_available', [])])) + '\n')
         if diagnose_validation and not training and index == 0:
             sample_ids = list(zip(_meta["seq_id"], _meta["frame_stem"]))
@@ -470,6 +482,10 @@ def run_phase(model, loader, criterion, device, optimizer=None, scaler=None,
         result['phase_seconds'] = float(elapsed)
     if update_scheduler is not None:
         result.update(lr_first_update=first_lr, lr_last_update=last_lr, optimizer_updates=successful_updates)
+    if offset_stats is not None and offset_stats.enabled:
+        result.update(offset_stats.finish(device))
+        if primary():
+            print(f"[temporal-offset-sampling] {json.dumps({k: result[k] for k in result if k.startswith('offset_') or k == 'missing_history_count'})}", flush=True)
     return result
 
 

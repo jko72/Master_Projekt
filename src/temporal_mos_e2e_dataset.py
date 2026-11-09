@@ -8,6 +8,7 @@ import torch
 from helper.mos_augmentation import augmentation_settings, TemporalMOSAugmentation
 from mos_dataset import MOSFrameDataset
 from helper.temporal_e2e_input import TemporalE2EInputMixin
+from helper.temporal_offset_sampling import validate_temporal_offset_sampling
 
 
 class TemporalMOSE2EDataset(TemporalE2EInputMixin, MOSFrameDataset):
@@ -33,6 +34,7 @@ class TemporalMOSE2EDataset(TemporalE2EInputMixin, MOSFrameDataset):
         self.include_movable = self.auxiliary_settings['enabled'] and self.auxiliary_settings['task'] == 'movable'
         self.include_residual = self.auxiliary_settings['enabled'] and self.auxiliary_settings['task'] == 'residual'
         data = cfg["mos_data_params"]
+        self.offset_sampling = validate_temporal_offset_sampling(cfg)
         offsets = data.get("previous_offsets", [3])
         self.offsets = sorted({int(v) for v in offsets}, reverse=True)
         if not self.offsets or any(v <= 0 for v in self.offsets):
@@ -66,11 +68,33 @@ class TemporalMOSE2EDataset(TemporalE2EInputMixin, MOSFrameDataset):
         self.samples = kept
         self.summary["used_frames"] = len(kept)
 
+    def _sample_previous_offset(self, sample):
+        """Draw once per sample from existing, same-sequence scans and poses."""
+        seq = self.sequence_map[sample['seq_id']]
+        choices, weights = [], []
+        for off, probability in zip(self.offset_sampling['offsets'], self.offset_sampling['probabilities']):
+            if self._lmnet_history_path(seq, sample['frame_index'] - off) is not None:
+                choices.append(off)
+                weights.append(probability)
+        if not choices:
+            return None
+        weights = torch.tensor(weights, dtype=torch.float64, device='cpu')
+        # Zero-weight-only subsets have no conditional distribution. Retain a
+        # real history using a uniform draw, rather than discard current frames.
+        if not weights.sum():
+            weights.fill_(1.)
+        return choices[int(torch.multinomial(weights / weights.sum(), 1))]
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
         if self.include_residual:
             return self._load_lmnet_residual_input(sample)
         if self.lmnet:
+            if self.split == 'train' and self.offset_sampling['enabled']:
+                offset = self._sample_previous_offset(sample)
+                return self._load_lmnet_temporal_input(
+                    sample, offsets=(self.offsets[0] if offset is None else offset,),
+                    empty_history=offset is None)
             return self._load_lmnet_temporal_input(sample)
         if self.include_movable:
             from helper.mos_online import point_labels, is_test

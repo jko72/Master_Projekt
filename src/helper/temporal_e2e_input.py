@@ -7,18 +7,32 @@ from temporal_mae_dataset import project_range_features
 
 
 class TemporalE2EInputMixin:
-    def _project_lmnet_temporal(self, sample, labels=None, return_clean=False):
+    def _lmnet_history_path(self, seq, index):
+        """A history needs both an existing scan and a finite same-sequence pose."""
+        from pathlib import Path
+        if index < 0 or index >= len(seq['paths']) or index >= len(seq['poses']):
+            return None
+        path = self._extract_scan_path(seq['paths'][index])
+        if path is None or not Path(path).is_file():
+            return None
+        try:
+            self._pose(seq, index)
+        except (ValueError, TypeError):
+            return None
+        return path
+
+    def _project_lmnet_temporal(self, sample, labels=None, return_clean=False, offsets=None, empty_history=False):
         """Shared label-independent geometry for supervised MOS and MAE."""
         from helper.mos_projection import project_features
-        from pathlib import Path
+        offsets = self.offsets if offsets is None else offsets
         seq = self.sequence_map[sample['seq_id']]
         i = sample['frame_index']
         current_pose = self._pose(seq, i)
         scans, paths, available = [], [], []
-        for off in self.offsets:
+        for off in offsets:
             j = i-off
-            path = self._extract_scan_path(seq['paths'][j]) if j >= 0 else None
-            present = path is not None and Path(path).is_file() and j < len(seq['poses'])
+            path = None if empty_history else self._lmnet_history_path(seq, j)
+            present = path is not None
             if present:
                 aligned = transform_points(self._read_points(path), np.linalg.solve(current_pose, self._pose(seq, j)))
                 scans.append(self.augmentation.drop_history(aligned))
@@ -67,7 +81,8 @@ class TemporalE2EInputMixin:
                          valid_mask=mask, stats=stats)
         return x, valid, dt, targets[0].long(), auxiliary, meta
 
-    def _finish_lmnet_temporal(self, sample, features, masks, paths, available, y=None):
+    def _finish_lmnet_temporal(self, sample, features, masks, paths, available, y=None, offsets=None):
+        offsets = self.offsets if offsets is None else offsets
         spec = normalization(self.cfg, self.temporal_input_mode)
         features, masks, y = self.augmentation.range_views(features, masks, y)
         x = torch.stack([normalize_feature_tensor(f, m, spec) for f, m in zip(features, masks)])
@@ -78,19 +93,21 @@ class TemporalE2EInputMixin:
                 valid[j].zero_()
         if y is not None:
             y = y.masked_fill(~valid[-1], -1)
-        dt = torch.tensor([-off/self.scan_rate_hz for off in self.offsets] + [0.], dtype=torch.float32)
+        dt = torch.tensor([-off/self.scan_rate_hz for off in offsets] + [0.], dtype=torch.float32)
         if not torch.isfinite(x).all():
             raise ValueError(f'Non-finite projection at {sample["scan_path"]}')
-        meta = dict(sample, history_paths=paths, previous_offsets=self.offsets,
+        meta = dict(sample, history_paths=paths, previous_offsets=list(offsets),
                     history_available=available, normalization=spec['mode'], projection_mode='lmnet',
                     channel_names=['x', 'y', 'z', 'range'] + (['intensity'] if x.shape[1] == 5 else []))
+        if len(offsets) == 1:
+            meta['sampled_previous_offset'] = offsets[0]
         return x, valid, dt, y, meta
 
     def _load_lmnet_mae_input(self, sample):
         features, masks, _, _, paths, available = self._project_lmnet_temporal(sample)
         return self._finish_lmnet_temporal(sample, features, masks, paths, available)
 
-    def _load_lmnet_temporal_input(self, sample):
+    def _load_lmnet_temporal_input(self, sample, offsets=None, empty_history=False):
         from helper.mos_projection import project_targets
         from helper.mos_online import point_labels, is_test
         from helper.mos_cache import check_cache
@@ -100,7 +117,8 @@ class TemporalE2EInputMixin:
         labels = None
         if online and not is_test(sample):
             labels = point_labels(sample, include_movable=True) if auxiliary else point_labels(sample)
-        features, masks, maps, labels, paths, available = self._project_lmnet_temporal(sample, labels)
+        features, masks, maps, labels, paths, available = self._project_lmnet_temporal(
+            sample, labels, offsets=offsets, empty_history=empty_history)
         if is_test(sample):
             y = None
         elif online:
@@ -109,7 +127,7 @@ class TemporalE2EInputMixin:
         else:
             check_cache(Path(sample['mos_label_path']).parent, self.cfg, 'labels', sample['seq_dir'])
             y = torch.from_numpy(self._load_mos_label(sample['mos_label_path']).astype(np.int64))
-        result = self._finish_lmnet_temporal(sample, features, masks, paths, available, y)
+        result = self._finish_lmnet_temporal(sample, features, masks, paths, available, y, offsets=offsets)
         if auxiliary:
             x, valid, dt, targets, meta = result
             mos, movable = (None, None) if targets is None else (targets[0], targets[1])
