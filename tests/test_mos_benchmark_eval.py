@@ -14,13 +14,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from helper.mos_benchmark_eval import (add_counts, point_counts, point_metrics,
     read_point_gt, validate_export, write_prediction, write_submission_zip)
-from helper.mos_knn_postprocess import knn_unproject_prediction
+from helper.mos_knn_postprocess import knn_unproject_prediction, knn_unproject_probability_sweep
 from helper.mos_point_projection import ProjectionConfig, original_points_to_pixels, unproject_prediction
 from utils_torch import spherical_projection
 from evaluate_mos_benchmark import (SWEEP_THRESHOLDS, frame_features, index_sequences,
     load_adapter, load_poses, main, moving_prediction_from_probability,
     moving_probability_from_logits, select_best_threshold, single_frame_input,
-    temporal_input, threshold_sweep_rows, movable_gate_counts)
+    temporal_input, threshold_sweep_rows, movable_gate_counts, online_lmnet_pixel_target)
 from mos_dataset import MOSFrameDataset
 from mos_models import build_mos_model
 
@@ -210,8 +210,35 @@ class KNNPostprocessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape"):
             knn_unproject_prediction(pred, ranges[:, :-1], self.point, self.cfg)
 
+    def test_probability_sweep_matches_individual_knn_predictions(self):
+        pred, ranges = self._images()
+        probability = np.where(pred == 1, .8, .2).astype(np.float32)
+        thresholds = [.1, .5, .9]
+        sweep, valid = knn_unproject_probability_sweep(
+            probability, thresholds, ranges, self.point, self.cfg, knn=5, search=3, sigma=1, cutoff=1,
+        )
+        for index, threshold in enumerate(thresholds):
+            expected, expected_valid = knn_unproject_prediction(
+                (probability > threshold).astype(np.uint8), ranges, self.point, self.cfg,
+                knn=5, search=3, sigma=1, cutoff=1,
+            )
+            np.testing.assert_array_equal(sweep[index], expected)
+            np.testing.assert_array_equal(valid, expected_valid)
+
 
 class ThresholdTests(unittest.TestCase):
+    def test_online_lmnet_pixel_target_uses_nearest_point_winner(self):
+        points = np.array([[4, 0, 0, .1], [8, 0, 0, .2], [0, 5, 0, .3]], np.float32)
+        target = np.array([1, 0, 1], np.int16)
+        cfg = {"model_params": {"grid_height": 8, "grid_width": 16, "FOV_UP": 3, "FOV_DOWN": -25,
+                                 "min_range": 0., "max_range": None}}
+        projected = online_lmnet_pixel_target(points, target, cfg)
+        rows, cols, valid = original_points_to_pixels(
+            points, ProjectionConfig(8, 16, 3, -25, projection_mode="lmnet"))
+        self.assertTrue(valid.all())
+        self.assertEqual(int(projected[rows[0], cols[0]]), 1)  # Near point wins over point 1.
+        self.assertEqual(int(projected[rows[2], cols[2]]), 1)
+
     def test_movable_gate_counts_preserve_confusion_invariants(self):
         # FP is removed, TP is lost, missing score stays untouched, and ignored
         # GT does not enter MOS counts.  The movable labels deliberately differ
@@ -385,7 +412,7 @@ class BenchmarkTests(unittest.TestCase):
             torch.save({"cfg": cfg, "model_state_dict": build_mos_model(cfg).state_dict()}, checkpoint)
             output = root / "sweep"
             main(["--checkpoint", str(checkpoint), "--dataset-root", str(root / "dataset"),
-                  "--sequences", "08", "--mode", "both", "--threshold-sweep",
+                  "--sequences", "08", "--mode", "both", "--threshold-sweep", "--postprocess", "knn",
                   "--output-dir", str(output), "--device", "cpu"])
             with (output / "threshold_sweep.csv").open(encoding="utf-8") as handle:
                 self.assertEqual(len(handle.readlines()), len(SWEEP_THRESHOLDS) + 1)
@@ -396,7 +423,7 @@ class BenchmarkTests(unittest.TestCase):
             with (output / "benchmark_eval_config.yaml").open(encoding="utf-8") as handle:
                 metadata = yaml.safe_load(handle)
             self.assertTrue(metadata["threshold_sweep"]["enabled"])
-            self.assertEqual(metadata["postprocessing"]["method"], "direct")
+            self.assertEqual(metadata["postprocessing"]["method"], "knn")
 
 
 if __name__ == "__main__":

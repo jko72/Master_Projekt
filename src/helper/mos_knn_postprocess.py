@@ -100,3 +100,84 @@ def knn_unproject_prediction(
         # Static wins ties or when no neighbors pass cutoff (LMNet's class-1 fallback).
         point_pred[orig] = (n_moving > n_static).to(torch.uint8).cpu().numpy()
     return point_pred, valid
+
+
+@torch.no_grad()
+def knn_unproject_probability_sweep(
+    moving_probability_hw: np.ndarray,
+    thresholds: tuple[float, ...] | list[float],
+    projected_range_hw: np.ndarray,
+    points_xyzi: np.ndarray,
+    cfg: ProjectionConfig,
+    *,
+    device: str | torch.device = "cpu",
+    knn: int = 5,
+    search: int = 5,
+    sigma: float = 1.0,
+    cutoff: float = 1.0,
+    chunk_size: int = 32768,
+) -> tuple[np.ndarray, np.ndarray]:
+    """KNN-unproject every probability threshold using one neighborhood search.
+
+    KNN neighbor selection depends only on ranges and geometry, never on the
+    binary class labels.  A threshold sweep can therefore share the expensive
+    unfold, distance and top-k computations across all candidates.
+    """
+    probability = np.asarray(moving_probability_hw, dtype=np.float32)
+    thresholds = np.asarray(thresholds, dtype=np.float32)
+    proj_range = np.asarray(projected_range_hw)
+    points = np.asarray(points_xyzi)
+    if probability.shape != (cfg.height, cfg.width) or proj_range.shape != probability.shape:
+        raise ValueError("Probability and raw range must both have shape [H,W]")
+    if probability.ndim != 2 or not np.isfinite(probability).all() or np.any((probability < 0) | (probability > 1)):
+        raise ValueError("Moving probability must be finite and within [0,1]")
+    if thresholds.ndim != 1 or not len(thresholds) or not np.isfinite(thresholds).all() or np.any((thresholds < 0) | (thresholds > 1)):
+        raise ValueError("Thresholds must be a non-empty sequence within [0,1]")
+    if search < 1 or search % 2 != 1 or not (1 <= knn <= search * search):
+        raise ValueError("Search must be odd and 1 <= knn <= search*search")
+    if not np.isfinite(sigma) or sigma <= 0 or chunk_size < 1:
+        raise ValueError("Sigma must be finite and positive; chunk_size must be positive")
+    if not np.isfinite(cutoff):
+        raise ValueError("Cutoff must be finite")
+
+    rows, cols, valid = original_points_to_pixels(points, cfg)
+    point_pred = np.zeros((len(thresholds), len(points)), dtype=np.uint8)
+    valid_index = np.flatnonzero(valid)
+    if len(valid_index) == 0:
+        return point_pred, valid
+
+    dev = torch.device(device)
+    ranges_image = torch.as_tensor(proj_range, dtype=torch.float32, device=dev)
+    probability_image = torch.as_tensor(probability, dtype=torch.float32, device=dev)
+    padding = search // 2
+    patches_range = F.unfold(ranges_image[None, None], search, padding=padding)[0]
+    patches_probability = F.unfold(probability_image[None, None], search, padding=padding)[0]
+    candidates = torch.as_tensor(thresholds, dtype=torch.float32, device=dev)[:, None, None]
+
+    coord = torch.arange(search, device=dev, dtype=torch.float32) - padding
+    yy, xx = torch.meshgrid(coord, coord, indexing="ij")
+    gaussian = torch.exp(-(xx.square() + yy.square()) / (2.0 * sigma**2))
+    gaussian /= gaussian.sum()
+    spatial_weight = (1.0 - gaussian.flatten())[:, None]
+    center = search * search // 2
+
+    for start in range(0, len(valid_index), chunk_size):
+        orig = valid_index[start:start + chunk_size]
+        flat_pixel = torch.as_tensor(
+            rows[orig].astype(np.int64) * cfg.width + cols[orig].astype(np.int64),
+            dtype=torch.long, device=dev,
+        )
+        depth = torch.as_tensor(np.linalg.norm(points[orig, :3].astype(np.float32), axis=1),
+                                dtype=torch.float32, device=dev)
+        nbr_range = patches_range[:, flat_pixel].clone()
+        nbr_range[~torch.isfinite(nbr_range) | (nbr_range <= 0)] = float("inf")
+        nbr_range[center] = depth
+        distance = (nbr_range - depth[None, :]).abs() * spatial_weight
+        knn_idx = distance.topk(knn, dim=0, largest=False, sorted=False).indices
+        selected_dist = distance.gather(0, knn_idx)
+        selected_probability = patches_probability[:, flat_pixel].gather(0, knn_idx)
+        accepted = (selected_dist <= cutoff) if cutoff > 0 else torch.isfinite(selected_dist)
+        moving = ((selected_probability[None] > candidates) & accepted[None]).sum(dim=1)
+        static = accepted.sum(dim=0)[None] - moving
+        point_pred[:, orig] = (moving > static).to(torch.uint8).cpu().numpy()
+    return point_pred, valid

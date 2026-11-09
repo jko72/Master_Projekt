@@ -112,6 +112,10 @@ class SemanticBranchTests(unittest.TestCase):
             reduced['mos_model_params'].pop('movable_branch')
             reduced['mos_model_params'].pop('semantic_fusion')
             reduced['mos_log_params']['run_name'] = reference['mos_log_params']['run_name']
+            # Local experiment profiles intentionally override runtime settings.
+            # The exact cross-ablation comparison below still checks these too.
+            for key in ('deterministic', 'epochs', 'num_workers'):
+                reduced['mos_train_params'][key] = reference['mos_train_params'][key]
             self.assertEqual(reduced, reference)
             self.assertIsNone(cfg['mos_train_params']['pretrained_path'])
         second['mos_model_params']['semantic_fusion'] = first['mos_model_params']['semantic_fusion']

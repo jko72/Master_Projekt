@@ -85,7 +85,8 @@ class SalsaNextTemporalE2E(nn.Module):
                 nn.init.zeros_(self.semantic_gate.bias)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor, dt: torch.Tensor,
-                return_diagnostics: bool = False, return_aux: bool = False):
+                return_diagnostics: bool = False, return_aux: bool = False,
+                disable_semantic_gate: bool = False):
         if return_aux and self.auxiliary_task is None:
             raise ValueError('return_aux requires enabled auxiliary supervision')
         if x.ndim != 5 or x.shape[1] < 2 or x.shape[2] != self.in_channels:
@@ -103,7 +104,7 @@ class SalsaNextTemporalE2E(nn.Module):
         _, f, fh, fw = encoded.shape
         encoded = encoded.reshape(b, t, f, fh, fw)
         semantic = None
-        if self.movable_branch == 'current_bottleneck' and (return_aux or self.semantic_fusion == 'bottleneck_gate'):
+        if self.movable_branch == 'current_bottleneck' and (return_aux or (self.semantic_fusion == 'bottleneck_gate' and not disable_semantic_gate)):
             # Current scan BEFORE temporal attention; same encoder forward.
             semantic = self.semantic_adapter(encoded[:, -1])
         scaled_valid = F.adaptive_max_pool2d(valid.reshape(b * t, 1, h, w).float(), (fh, fw)) > 0.5
@@ -114,7 +115,7 @@ class SalsaNextTemporalE2E(nn.Module):
             fused, diagnostics = result
         else:
             fused = result
-        if self.semantic_fusion == 'bottleneck_gate':
+        if self.semantic_fusion == 'bottleneck_gate' and not disable_semantic_gate:
             modulation = torch.tanh(self.semantic_gate(semantic))
             fused = fused + 0.1 * fused * modulation * scaled_valid[:, -1].to(fused.dtype)
         current_skips = tuple(s.reshape(b, t, *s.shape[1:])[:, -1] for s in skips)

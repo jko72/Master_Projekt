@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ from helper.mos_benchmark_eval import (TEST_SEQUENCES, add_counts, point_counts,
     point_metrics, read_point_gt, read_scan, validate_export, write_prediction,
     write_submission_zip)
 from helper.mos_eval_utils import compute_counts_from_pred_target, empty_counts, metrics_from_counts
-from helper.mos_knn_postprocess import knn_unproject_prediction
+from helper.mos_knn_postprocess import knn_unproject_prediction, knn_unproject_probability_sweep
 from helper.mos_point_projection import (ProjectionConfig, original_points_to_pixels,
     unproject_prediction)
 from helper.mos_label_helper import map_semantickitti_to_movable
@@ -246,6 +247,22 @@ def load_adapter(path, device):
     return model, cfg, payload
 
 
+def semantic_gate_ablation_metadata(model, disable=False):
+    """Validate the runtime option AFTER load_adapter has strictly loaded weights."""
+    from mos_models.salsanext_temporal_e2e import SalsaNextTemporalE2E
+    fusion = getattr(model, "semantic_fusion", "none")
+    supported = (isinstance(model, SalsaNextTemporalE2E)
+                 and fusion == "bottleneck_gate" and hasattr(model, "semantic_gate"))
+    if supported and any(not torch.isfinite(parameter).all() for parameter in model.semantic_gate.parameters()):
+        raise ValueError("Checkpoint semantic_gate contains non-finite parameters")
+    if disable and not supported:
+        raise ValueError("--disable-semantic-gate requires a strictly loaded SalsaNextTemporalE2E "
+                         "checkpoint with semantic_fusion=bottleneck_gate and semantic_gate")
+    return dict(supported=supported, checkpoint_fusion=fusion,
+                gate_enabled=bool(supported and not disable), disable_semantic_gate=bool(disable),
+                mode="runtime_forward_bypass", checkpoint_unchanged=True)
+
+
 def save_csv(path, rows):
     if not rows:
         return
@@ -275,6 +292,24 @@ def moving_probability_from_logits(logits: torch.Tensor):
     if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 2:
         raise ValueError("Expected logits shaped [1,2,H,W]")
     return torch.softmax(logits, dim=1)[0, 1].cpu().numpy()
+
+
+def online_lmnet_pixel_target(points, point_target, cfg):
+    """Project original SemanticKITTI MOS point labels into the LMNet range view.
+
+    LMNet training generates these targets online instead of reading a cached
+    ``mos_labels/*.npy`` image.  Benchmark pixel metrics must use the same
+    nearest-point-wins projection to remain comparable with training.
+    """
+    from helper.mos_projection import lmnet_projection, project_targets
+
+    mp = cfg["model_params"]
+    projection = lmnet_projection(
+        points, int(mp["grid_height"]), int(mp["grid_width"]),
+        float(mp.get("FOV_UP", 3)), float(mp.get("FOV_DOWN", -25)),
+        min_range=float(mp.get("min_range", 0)), max_range=mp.get("max_range"),
+    )
+    return project_targets(point_target, projection)
 
 
 def movable_scores_for_points(movable_probability_hw, points, projection, projected_range):
@@ -385,6 +420,8 @@ def select_best_threshold(rows):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--disable-semantic-gate", action="store_true",
+                        help="Bypass only the trained semantic bottleneck gate at runtime")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--sequences", nargs="+", default=["08"])
@@ -430,8 +467,6 @@ def main(argv=None):
             parser.error("--threshold-sweep is restricted to validation sequence 08")
         if args.mode != "both":
             parser.error("--threshold-sweep requires --mode both for pixel and point metrics")
-        if args.postprocess != "direct":
-            parser.error("--threshold-sweep currently supports only --postprocess direct")
         if args.export_predictions or args.submission_zip:
             parser.error("--threshold-sweep does not export predictions or submissions")
     if args.movable_diagnostics:
@@ -462,6 +497,8 @@ def main(argv=None):
     indexed = index_sequences(root, ids)
     device = torch.device(args.device)
     model, cfg, payload = load_adapter(args.checkpoint, device)
+    gate_metadata = semantic_gate_ablation_metadata(model, args.disable_semantic_gate)
+    forward_options = {"disable_semantic_gate": True} if args.disable_semantic_gate else {}
     if args.movable_diagnostics:
         from helper.mos_auxiliary import validate_auxiliary_config
         auxiliary = validate_auxiliary_config(cfg)
@@ -471,8 +508,7 @@ def main(argv=None):
             parser.error("--movable-diagnostics requires a movable auxiliary checkpoint; residual checkpoints are unsupported")
     from helper.mos_projection import projection_mode
     from helper.mos_cache import check_cache
-    if projection_mode(cfg) == 'lmnet' and (args.threshold_sweep or args.moving_threshold != .5):
-        parser.error('LMNet primary evaluation requires fixed threshold 0.5, no sweep')
+    lmnet = projection_mode(cfg) == 'lmnet'
     name = cfg["mos_model_params"]["name"]
     temporal = name in {"salsanext_temporal_mos", "salsanext_temporal_e2e"}
     e2e = name == "salsanext_temporal_e2e"
@@ -485,16 +521,18 @@ def main(argv=None):
         temporal, projection_mode(cfg))
     poses = {seq: load_poses(root / seq, len(scans)) for seq, scans in indexed.items()} if temporal else {}
     for seq, scans in indexed.items():
-        if args.mode in {'pixel', 'both'}:
+        if args.mode in {'pixel', 'both'} and not lmnet:
             check_cache(root / seq / cfg['mos_data_params'].get('mos_label_folder', 'mos_labels'),
                         cfg, 'labels', root / seq)
-        if args.mode in {"point", "both"} and any(not (root / seq / "labels" / f"{p.stem}.label").is_file() for p in scans):
+        needs_original_labels = args.mode in {"point", "both"} or (lmnet and args.mode in {"pixel", "both"})
+        if needs_original_labels and any(not (root / seq / "labels" / f"{p.stem}.label").is_file() for p in scans):
             if not args.export_predictions or seq not in TEST_SEQUENCES:
                 raise FileNotFoundError(f"Original point GT missing for {seq}; use --export-predictions with --mode point for test 11..21")
             print(f"{seq}: no public GT; export only, no point metric")
         if args.movable_diagnostics and any(not (root / seq / "labels" / f"{p.stem}.label").is_file() for p in scans):
             raise FileNotFoundError(f"--movable-diagnostics requires original .label ground truth: {root / seq / 'labels'}")
-        if args.mode in {"pixel", "both"} and any(not (root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{p.stem}.npy").is_file() for p in scans):
+        if (args.mode in {"pixel", "both"} and not lmnet
+                and any(not (root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{p.stem}.npy").is_file() for p in scans)):
             raise FileNotFoundError(f"Pixel GT missing for {seq}; use --mode point")
     if args.output_dir.exists():
         raise FileExistsError(f"Output directory already exists: {args.output_dir}")
@@ -532,7 +570,7 @@ def main(argv=None):
                         model_input = single_result
                     inputs = (model_input,)
                 if args.movable_diagnostics:
-                    output = model(*(part.to(device) for part in inputs), return_aux=True)
+                    output = model(*(part.to(device) for part in inputs), return_aux=True, **forward_options)
                     if not isinstance(output, tuple) or len(output) != 2:
                         raise ValueError("Movable checkpoint did not return (mos_logits, movable_logits)")
                     logits, movable_logits = output
@@ -540,7 +578,7 @@ def main(argv=None):
                         raise ValueError(f"Unexpected movable-head output shape: {tuple(movable_logits.shape)}")
                     movable_probability = moving_probability_from_logits(movable_logits)
                 else:
-                    logits = model(*(part.to(device) for part in inputs))
+                    logits = model(*(part.to(device) for part in inputs), **forward_options)
                 if logits.shape != (1, 2, projection.height, projection.width):
                     raise ValueError(f"Unexpected model output shape: {tuple(logits.shape)}")
                 # Softmax is computed once. A threshold of 0.5 with strict
@@ -588,7 +626,8 @@ def main(argv=None):
                         add_counts(movable_totals[threshold], counts)
                 pixel_target = None
                 if args.mode in {"pixel", "both"}:
-                    pixel_target = np.load(root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{scan.stem}.npy")
+                    pixel_target = (online_lmnet_pixel_target(points, point_target, cfg) if lmnet else np.load(
+                        root / seq / cfg["mos_data_params"].get("mos_label_folder", "mos_labels") / f"{scan.stem}.npy"))
                     if pixel_target.shape != pred_hw.shape or not np.isin(pixel_target, [-1, 0, 1]).all():
                         raise ValueError(f"Invalid pixel GT: {seq}/{scan.stem}")
                     if e2e:
@@ -599,9 +638,19 @@ def main(argv=None):
                         seq_pixel[key] += counts[key]
                 if args.threshold_sweep:
                     # No second model pass: each candidate uses these already computed probabilities.
-                    for threshold in SWEEP_THRESHOLDS:
+                    knn_sweep_predictions = None
+                    if args.postprocess == "knn":
+                        knn_sweep_predictions, _ = knn_unproject_probability_sweep(
+                            moving_probability, SWEEP_THRESHOLDS, projected_range, points, projection, device=device,
+                            knn=args.knn_k, search=args.knn_search, sigma=args.knn_sigma,
+                            cutoff=args.knn_cutoff, chunk_size=args.knn_chunk_size,
+                        )
+                    for threshold_index, threshold in enumerate(SWEEP_THRESHOLDS):
                         threshold_hw = moving_prediction_from_probability(moving_probability, threshold)
-                        threshold_point, _ = unproject_prediction(threshold_hw, points, projection)
+                        if args.postprocess == "knn":
+                            threshold_point = knn_sweep_predictions[threshold_index]
+                        else:
+                            threshold_point, _ = unproject_prediction(threshold_hw, points, projection)
                         add_counts(sweep_point[threshold], point_counts(threshold_point, point_target))
                         threshold_counts = compute_counts_from_pred_target(
                             torch.from_numpy(threshold_hw), torch.from_numpy(pixel_target),
@@ -692,7 +741,13 @@ def main(argv=None):
         print(f"movable diagnostic exploratory best={movable_best['movable_threshold']:.3f} "
               f"IoU={movable_best['gated_point_moving_iou']:.9f}")
     git_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    metadata = {"checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": payload.get("epoch"),
+    checkpoint_hash = hashlib.sha256()
+    with args.checkpoint.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            checkpoint_hash.update(block)
+    metadata = {"checkpoint_sha256": checkpoint_hash.hexdigest(),
+        "semantic_gate_ablation": gate_metadata, "checkpoint_model_config": cfg,
+        "checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": payload.get("epoch"),
         "checkpoint_train_sequences": cfg["mos_data_params"].get("train_sequences"),
         "eval_sequences": ids, "sequence_07_role": next((role for role in ('train', 'val', 'test')
             if '07' in {str(s).zfill(2) for s in cfg['mos_data_params'].get(role+'_sequences', [])}), 'unused'),
