@@ -263,6 +263,51 @@ def semantic_gate_ablation_metadata(model, disable=False):
                 mode="runtime_forward_bypass", checkpoint_unchanged=True)
 
 
+TEMPORAL_ABLATIONS = ('none', 'mask_history', 'bypass_temporal')
+
+
+def temporal_ablation_metadata(model, mode='none', disable_semantic_gate=False):
+    """Describe a runtime intervention after strict loading, without touching weights."""
+    from mos_models.salsanext_temporal_e2e import SalsaNextTemporalE2E
+    if mode not in TEMPORAL_ABLATIONS:
+        raise ValueError(f'Unknown temporal ablation: {mode}')
+    supported = isinstance(model, SalsaNextTemporalE2E)
+    if mode != 'none' and not supported:
+        raise ValueError('--temporal-ablation requires a strictly loaded SalsaNextTemporalE2E checkpoint')
+    if mode != 'none' and disable_semantic_gate:
+        raise ValueError('--disable-semantic-gate cannot be combined with a temporal ablation')
+    return dict(mode=mode, checkpoint_unchanged=True, historical_inputs_masked=mode == 'mask_history',
+                temporal_module_executed=supported and mode != 'bypass_temporal',
+                semantic_gate_unchanged=not disable_semantic_gate)
+
+
+def apply_temporal_ablation(inputs, mode='none'):
+    """Mask only copies of historical features/occupancy immediately before forward."""
+    if mode not in TEMPORAL_ABLATIONS:
+        raise ValueError(f'Unknown temporal ablation: {mode}')
+    if mode != 'mask_history':
+        return inputs
+    if len(inputs) != 3 or inputs[0].ndim != 5 or inputs[0].shape[1] < 2:
+        raise ValueError('mask_history requires temporal E2E inputs (x[B,T,C,H,W], valid, dt)')
+    x, valid, dt = inputs
+    x, valid = x.clone(), valid.clone()
+    x[:, :-1] = 0
+    valid[:, :-1] = False
+    return x, valid, dt
+
+
+def temporal_gamma_metadata(model):
+    """Read the loaded attention scale; never modify parameters or RNG state."""
+    gamma = getattr(getattr(model, 'temporal', None), 'gamma', None)
+    if gamma is None:
+        return None
+    gamma = gamma.detach().float().cpu()
+    if not torch.isfinite(gamma).all():
+        raise ValueError('Checkpoint temporal.gamma contains non-finite values')
+    return dict(gamma_mean=float(gamma.mean()), gamma_mean_abs=float(gamma.abs().mean()),
+                gamma_min=float(gamma.min()), gamma_max=float(gamma.max()))
+
+
 def save_csv(path, rows):
     if not rows:
         return
@@ -422,6 +467,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--disable-semantic-gate", action="store_true",
                         help="Bypass only the trained semantic bottleneck gate at runtime")
+    parser.add_argument('--temporal-ablation', choices=TEMPORAL_ABLATIONS, default='none',
+                        help='Inference-only history masking or complete temporal attention bypass')
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--sequences", nargs="+", default=["08"])
@@ -453,6 +500,11 @@ def main(argv=None):
                         help="Optional SemanticKITTI API checkout overriding the vendored official validator")
     parser.add_argument("--max-frames", type=int, help="Smoke test only; disables export")
     args = parser.parse_args(argv)
+    if args.temporal_ablation != 'none':
+        if args.disable_semantic_gate:
+            parser.error('--disable-semantic-gate cannot be combined with --temporal-ablation != none')
+        if args.threshold_sweep or args.moving_threshold != 0.5 or args.movable_diagnostics:
+            parser.error('Temporal ablations require fixed --moving-threshold 0.5 without threshold sweep or movable diagnostics')
     ids = [str(s).zfill(2) for s in args.sequences]
     if len(set(ids)) != len(ids):
         parser.error("Duplicate sequence IDs")
@@ -498,7 +550,11 @@ def main(argv=None):
     device = torch.device(args.device)
     model, cfg, payload = load_adapter(args.checkpoint, device)
     gate_metadata = semantic_gate_ablation_metadata(model, args.disable_semantic_gate)
+    temporal_metadata = temporal_ablation_metadata(model, args.temporal_ablation, args.disable_semantic_gate)
+    gamma_metadata = temporal_gamma_metadata(model)
     forward_options = {"disable_semantic_gate": True} if args.disable_semantic_gate else {}
+    if args.temporal_ablation == 'bypass_temporal':
+        forward_options['disable_temporal_fusion'] = True
     if args.movable_diagnostics:
         from helper.mos_auxiliary import validate_auxiliary_config
         auxiliary = validate_auxiliary_config(cfg)
@@ -569,6 +625,7 @@ def main(argv=None):
                     else:
                         model_input = single_result
                     inputs = (model_input,)
+                inputs = apply_temporal_ablation(inputs, args.temporal_ablation)
                 if args.movable_diagnostics:
                     output = model(*(part.to(device) for part in inputs), return_aux=True, **forward_options)
                     if not isinstance(output, tuple) or len(output) != 2:
@@ -599,6 +656,8 @@ def main(argv=None):
                 point_postprocess_seconds += postprocess_seconds
                 coverage.append({"sequence": seq, "frame": scan.stem, "n_points": len(points),
                     'history_available': ([index >= off for off in sorted(cfg['mos_data_params'].get('previous_offsets', []), reverse=True)] if e2e else []),
+                    'history_used': ([bool(mask.any()) and args.temporal_ablation != 'bypass_temporal'
+                                      for mask in inputs[1][0, :-1]] if e2e else []),
                     "invalid_points": int((~valid).sum()), "fallback_points": int((~valid).sum()),
                     "coverage_rate": float(valid.mean()) if len(valid) else 0.0,
                     "postprocess_seconds": postprocess_seconds})
@@ -747,6 +806,8 @@ def main(argv=None):
             checkpoint_hash.update(block)
     metadata = {"checkpoint_sha256": checkpoint_hash.hexdigest(),
         "semantic_gate_ablation": gate_metadata, "checkpoint_model_config": cfg,
+        "temporal_ablation": temporal_metadata, "temporal_attention_gamma": gamma_metadata,
+        "history_reference_offsets": cfg['mos_data_params'].get('previous_offsets', []) if e2e else [],
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": payload.get("epoch"),
         "checkpoint_train_sequences": cfg["mos_data_params"].get("train_sequences"),
         "eval_sequences": ids, "sequence_07_role": next((role for role in ('train', 'val', 'test')
